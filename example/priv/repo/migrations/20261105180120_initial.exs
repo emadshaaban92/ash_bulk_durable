@@ -124,10 +124,58 @@ defmodule Example.Repo.Migrations.Initial do
              where: "(status IN ('queued', 'running', 'completed_with_errors'))"
            )
 
+    create table(:memberships, primary_key: false) do
+      add :id, :uuid, null: false, default: fragment("uuid_generate_v7()"), primary_key: true
+      add :roles, {:array, :text}, null: false, default: []
+      add :user_id, :uuid, null: false
+      add :organization_id, :uuid, null: false
+    end
+
+    create unique_index(:memberships, [:user_id, :organization_id],
+             name: "memberships_user_organization_index"
+           )
+
+    create table(:organizations, primary_key: false) do
+      add :id, :uuid, null: false, default: fragment("uuid_generate_v7()"), primary_key: true
+    end
+
+    alter table(:memberships) do
+      modify :organization_id,
+             references(:organizations,
+               column: :id,
+               name: "memberships_organization_id_fkey",
+               type: :uuid,
+               prefix: "public"
+             )
+    end
+
+    alter table(:organizations) do
+      add :code, :text, null: false
+      add :name, :text, null: false
+    end
+
+    create unique_index(:organizations, [:code], name: "organizations_code_index")
+
     create table(:users, primary_key: false) do
       add :id, :uuid, null: false, default: fragment("uuid_generate_v7()"), primary_key: true
+    end
+
+    alter table(:memberships) do
+      modify :user_id,
+             references(:users,
+               column: :id,
+               name: "memberships_user_id_fkey",
+               type: :uuid,
+               prefix: "public"
+             )
+    end
+
+    alter table(:users) do
       add :name, :text, null: false
-      add :email, :text, null: false
+      add :email, :citext, null: false
+      add :phone, :text
+      add :platform_roles, {:array, :text}, null: false, default: []
+      add :organization_roles, {:array, :text}, null: false, default: []
 
       add :inserted_at, :utc_datetime_usec,
         null: false,
@@ -136,15 +184,63 @@ defmodule Example.Repo.Migrations.Initial do
       add :updated_at, :utc_datetime_usec,
         null: false,
         default: fragment("(now() AT TIME ZONE 'utc')")
+
+      add :organization_id,
+          references(:organizations,
+            column: :id,
+            name: "users_organization_id_fkey",
+            type: :uuid,
+            prefix: "public"
+          )
     end
 
     create unique_index(:users, [:email], name: "users_email_index")
   end
 
   def down do
+    drop constraint(:users, "users_organization_id_fkey")
+
     drop_if_exists unique_index(:users, [:email], name: "users_email_index")
 
+    alter table(:users) do
+      remove :organization_id
+      remove :updated_at
+      remove :inserted_at
+      remove :organization_roles
+      remove :platform_roles
+      remove :phone
+      remove :email
+      remove :name
+    end
+
+    drop constraint(:memberships, "memberships_organization_id_fkey")
+
+    drop constraint(:memberships, "memberships_user_id_fkey")
+
+    alter table(:memberships) do
+      modify :user_id, :uuid
+    end
+
     drop table(:users)
+
+    drop_if_exists unique_index(:organizations, [:code], name: "organizations_code_index")
+
+    alter table(:organizations) do
+      remove :name
+      remove :code
+    end
+
+    alter table(:memberships) do
+      modify :organization_id, :uuid
+    end
+
+    drop table(:organizations)
+
+    drop_if_exists unique_index(:memberships, [:user_id, :organization_id],
+                     name: "memberships_user_organization_index"
+                   )
+
+    drop table(:memberships)
 
     drop_if_exists unique_index(:bulk_actions, [:user_id],
                      name: "bulk_actions_one_unresolved_per_user_index"

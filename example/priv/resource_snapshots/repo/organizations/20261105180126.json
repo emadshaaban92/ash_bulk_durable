@@ -21,7 +21,7 @@
       "references": null,
       "scale": null,
       "size": null,
-      "source": "name",
+      "source": "code",
       "type": "text"
     },
     {
@@ -33,32 +33,8 @@
       "references": null,
       "scale": null,
       "size": null,
-      "source": "email",
+      "source": "name",
       "type": "text"
-    },
-    {
-      "allow_nil?": false,
-      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "inserted_at",
-      "type": "utc_datetime_usec"
-    },
-    {
-      "allow_nil?": false,
-      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "updated_at",
-      "type": "utc_datetime_usec"
     }
   ],
   "base_filter": null,
@@ -67,19 +43,19 @@
   "custom_indexes": [],
   "custom_statements": [],
   "has_create_action": true,
-  "hash": "E2669A6E6648AFBBF67DF1913D89DDBCBFB73555ADBD2527EFA7F7A59BBE7D6D",
+  "hash": "4C4E4D3CBAB2F53C7447FA359B2698CE29DF67D2AFA7ED2E88E5EAFC92A2312E",
   "identities": [
     {
       "all_tenants?": false,
       "base_filter": null,
-      "index_name": "users_email_index",
+      "index_name": "organizations_code_index",
       "keys": [
         {
           "type": "atom",
-          "value": "email"
+          "value": "code"
         }
       ],
-      "name": "email",
+      "name": "code",
       "nils_distinct?": true,
       "where": null
     }
@@ -91,6 +67,6 @@
   },
   "repo": "Elixir.Example.Repo",
   "schema": null,
-  "table": "users",
+  "table": "organizations",
   "temporal": null
 }

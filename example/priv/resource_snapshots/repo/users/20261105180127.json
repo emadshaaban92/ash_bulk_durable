@@ -13,7 +13,7 @@
       "type": "uuid"
     },
     {
-      "allow_nil?": true,
+      "allow_nil?": false,
       "default": "nil",
       "generated?": false,
       "precision": null,
@@ -21,44 +21,86 @@
       "references": null,
       "scale": null,
       "size": null,
-      "source": "order_id",
-      "type": "uuid"
-    },
-    {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "organization_id",
-      "type": "uuid"
-    },
-    {
-      "allow_nil?": false,
-      "default": "false",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "refreshed",
-      "type": "boolean"
-    },
-    {
-      "allow_nil?": false,
-      "default": "\"active\"",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "status",
+      "source": "name",
       "type": "text"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "email",
+      "type": "citext"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "phone",
+      "type": "text"
+    },
+    {
+      "allow_nil?": false,
+      "default": "[]",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "platform_roles",
+      "type": [
+        "array",
+        "text"
+      ]
+    },
+    {
+      "allow_nil?": false,
+      "default": "[]",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "organization_roles",
+      "type": [
+        "array",
+        "text"
+      ]
+    },
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "inserted_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "updated_at",
+      "type": "utc_datetime_usec"
     },
     {
       "allow_nil?": true,
@@ -81,16 +123,16 @@
           "global": null,
           "strategy": null
         },
-        "name": "bookings_asset_id_fkey",
+        "name": "users_organization_id_fkey",
         "on_delete": null,
         "on_update": null,
         "primary_key?": true,
         "schema": "public",
-        "table": "assets"
+        "table": "organizations"
       },
       "scale": null,
       "size": null,
-      "source": "asset_id",
+      "source": "organization_id",
       "type": "uuid"
     }
   ],
@@ -100,44 +142,30 @@
   "custom_indexes": [],
   "custom_statements": [],
   "has_create_action": true,
-  "hash": "E8A1E022F5AD3A9EB57CA95F4C9153231D79F721CDECE49C3F660E0019268391",
+  "hash": "1B6776FCFDB1A4905E100A00432D478718705D69EC42A1494745966E4B774A90",
   "identities": [
     {
-      "all_tenants?": false,
+      "all_tenants?": true,
       "base_filter": null,
-      "index_name": "bookings_active_on_asset_index",
+      "index_name": "users_email_index",
       "keys": [
         {
           "type": "atom",
-          "value": "asset_id"
+          "value": "email"
         }
       ],
-      "name": "active_on_asset",
+      "name": "email",
       "nils_distinct?": true,
-      "where": "status = 'active'"
-    },
-    {
-      "all_tenants?": false,
-      "base_filter": null,
-      "index_name": "bookings_order_index",
-      "keys": [
-        {
-          "type": "atom",
-          "value": "order_id"
-        }
-      ],
-      "name": "order",
-      "nils_distinct?": true,
-      "where": "status != 'cancelled'"
+      "where": null
     }
   ],
   "multitenancy": {
-    "attribute": null,
-    "global": null,
-    "strategy": null
+    "attribute": "organization_id",
+    "global": true,
+    "strategy": "attribute"
   },
   "repo": "Elixir.Example.Repo",
   "schema": null,
-  "table": "bookings",
+  "table": "users",
   "temporal": null
 }

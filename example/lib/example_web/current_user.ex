@@ -10,7 +10,6 @@ defmodule ExampleWeb.CurrentUser do
 
   def on_mount(:default, _params, session, socket) do
     user = user(session)
-    if user, do: Gettext.put_locale(ExampleWeb.Gettext, to_string(user.locale))
 
     {:cont, assign(socket, :scope, Scope.new(actor: user))}
   end

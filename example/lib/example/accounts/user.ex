@@ -29,12 +29,6 @@ defmodule Example.Accounts.User do
     attribute :email, :ci_string, allow_nil?: false, public?: true
     attribute :phone, :string, public?: true
 
-    attribute :locale, :atom,
-      allow_nil?: false,
-      default: :en,
-      public?: true,
-      constraints: [one_of: [:en, :ar]]
-
     attribute :platform_roles, {:array, :atom}, allow_nil?: false, default: [], public?: true
     # What an actor's policies read, for the organization they act in now.
     # `Example.BulkActions.Owner` fills it for the one a worker acts in.
@@ -71,7 +65,7 @@ defmodule Example.Accounts.User do
     end
 
     update :update_profile do
-      accept [:name, :phone, :locale]
+      accept [:name, :phone]
     end
 
     update :promote_to_super do

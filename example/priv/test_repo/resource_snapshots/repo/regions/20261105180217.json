@@ -21,6 +21,18 @@
       "references": null,
       "scale": null,
       "size": null,
+      "source": "code",
+      "type": "text"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
       "source": "name",
       "type": "text"
     },
@@ -33,62 +45,8 @@
       "references": null,
       "scale": null,
       "size": null,
-      "source": "email",
-      "type": "citext"
-    },
-    {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "phone",
+      "source": "native_name",
       "type": "text"
-    },
-    {
-      "allow_nil?": false,
-      "default": "\"en\"",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "locale",
-      "type": "text"
-    },
-    {
-      "allow_nil?": false,
-      "default": "[]",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "platform_roles",
-      "type": [
-        "array",
-        "text"
-      ]
-    },
-    {
-      "allow_nil?": false,
-      "default": "[]",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "organization_roles",
-      "type": [
-        "array",
-        "text"
-      ]
     },
     {
       "allow_nil?": false,
@@ -131,20 +89,20 @@
         "match_type": null,
         "match_with": null,
         "multitenancy": {
-          "attribute": null,
-          "global": null,
-          "strategy": null
+          "attribute": "organization_id",
+          "global": true,
+          "strategy": "attribute"
         },
-        "name": "users_organization_id_fkey",
-        "on_delete": null,
+        "name": "regions_inserted_by_id_fkey",
+        "on_delete": "restrict",
         "on_update": null,
         "primary_key?": true,
         "schema": "public",
-        "table": "organizations"
+        "table": "users"
       },
       "scale": null,
       "size": null,
-      "source": "organization_id",
+      "source": "inserted_by_id",
       "type": "uuid"
     }
   ],
@@ -154,30 +112,58 @@
   "custom_indexes": [],
   "custom_statements": [],
   "has_create_action": true,
-  "hash": "B4F57A597AAC2A83FF9059DDAFD18FD8CF436F1F82321CA7377C0437A06CD743",
+  "hash": "B8B222F4AE874BE9587C3E25DB14940E75FFEA32C52A9071B38FC82F019831B1",
   "identities": [
     {
-      "all_tenants?": true,
+      "all_tenants?": false,
       "base_filter": null,
-      "index_name": "users_email_index",
+      "index_name": "regions_code_index",
       "keys": [
         {
           "type": "atom",
-          "value": "email"
+          "value": "code"
         }
       ],
-      "name": "email",
+      "name": "code",
+      "nils_distinct?": true,
+      "where": null
+    },
+    {
+      "all_tenants?": false,
+      "base_filter": null,
+      "index_name": "regions_name_index",
+      "keys": [
+        {
+          "type": "atom",
+          "value": "name"
+        }
+      ],
+      "name": "name",
+      "nils_distinct?": true,
+      "where": null
+    },
+    {
+      "all_tenants?": false,
+      "base_filter": null,
+      "index_name": "regions_native_name_index",
+      "keys": [
+        {
+          "type": "atom",
+          "value": "native_name"
+        }
+      ],
+      "name": "native_name",
       "nils_distinct?": true,
       "where": null
     }
   ],
   "multitenancy": {
-    "attribute": "organization_id",
-    "global": true,
-    "strategy": "attribute"
+    "attribute": null,
+    "global": null,
+    "strategy": null
   },
   "repo": "Elixir.Example.Repo",
   "schema": null,
-  "table": "users",
+  "table": "regions",
   "temporal": null
 }

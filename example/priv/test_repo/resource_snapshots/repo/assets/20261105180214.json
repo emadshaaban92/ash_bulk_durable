@@ -21,7 +21,7 @@
       "references": null,
       "scale": null,
       "size": null,
-      "source": "name",
+      "source": "serial_number",
       "type": "text"
     },
     {
@@ -33,32 +33,8 @@
       "references": null,
       "scale": null,
       "size": null,
-      "source": "email",
+      "source": "batch_number",
       "type": "text"
-    },
-    {
-      "allow_nil?": false,
-      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "inserted_at",
-      "type": "utc_datetime_usec"
-    },
-    {
-      "allow_nil?": false,
-      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "updated_at",
-      "type": "utc_datetime_usec"
     }
   ],
   "base_filter": null,
@@ -67,19 +43,23 @@
   "custom_indexes": [],
   "custom_statements": [],
   "has_create_action": true,
-  "hash": "E8B690BA6925990F11401A7586319FDB045F595D6CE52FF6142666BBBE1B6D8E",
+  "hash": "549ECAD41E16B1D0EEE2DB96CCE6CBBFA09354B273999F7209140C7CAC0E9D48",
   "identities": [
     {
       "all_tenants?": false,
       "base_filter": null,
-      "index_name": "authors_email_index",
+      "index_name": "assets_serial_and_batch_index",
       "keys": [
         {
           "type": "atom",
-          "value": "email"
+          "value": "serial_number"
+        },
+        {
+          "type": "atom",
+          "value": "batch_number"
         }
       ],
-      "name": "email",
+      "name": "serial_and_batch",
       "nils_distinct?": true,
       "where": null
     }
@@ -91,6 +71,6 @@
   },
   "repo": "Elixir.Example.Repo",
   "schema": null,
-  "table": "authors",
+  "table": "assets",
   "temporal": null
 }
