@@ -1,7 +1,7 @@
 defmodule Example.BulkActions.FileHandler do
   @moduledoc """
-  Takes a `Example.Types.StoredFile` field from a sheet: the cell names a file,
-  and the column asks for a companion ZIP holding them. The cell becomes a
+  Takes a `Example.Types.StoredFile` field from a sheet, or an array of them:
+  the cell names files in a companion ZIP, separated by `|`. It becomes a
   reference `Example.BulkActions.FileResolver` resolves when the row runs; an
   empty cell sends nothing.
   """
@@ -15,6 +15,7 @@ defmodule Example.BulkActions.FileHandler do
 
   @impl AshBulkDurable.Sheet.FieldHandler
   def handles?(%Field{field: %{type: StoredFile}}), do: true
+  def handles?(%Field{field: %{type: {:array, StoredFile}}}), do: true
   def handles?(%Field{}), do: false
 
   @impl AshBulkDurable.Sheet.FieldHandler
@@ -22,13 +23,23 @@ defmodule Example.BulkActions.FileHandler do
 
   @impl AshBulkDurable.Sheet.FieldHandler
   def input_value(%Field{} = field, raw_value, _context) do
-    case String.trim(to_string(raw_value)) do
-      "" -> :skip
-      filename -> {:ok, {:resolve, FileResolver, %{field: field.field.name, filename: filename}}}
+    names = raw_value |> to_string() |> String.split("|", trim: true) |> Enum.map(&String.trim/1)
+
+    case Enum.reject(names, &(&1 == "")) do
+      [] -> :skip
+      filenames -> {:ok, {:resolve, FileResolver, reference(field, filenames)}}
     end
   end
 
   @impl AshBulkDurable.Sheet.FieldHandler
-  def to_cell(_field, {:resolve, FileResolver, %{filename: filename}}), do: filename
+  def to_cell(_field, {:resolve, FileResolver, %{filenames: filenames}}),
+    do: Enum.join(filenames, "|")
+
   def to_cell(_field, value), do: AshBulkDurable.Sheet.FieldHandler.cell(value)
+
+  defp reference(%Field{field: %{name: name, type: {:array, _type}}}, filenames),
+    do: %{field: name, filenames: filenames, many?: true}
+
+  defp reference(%Field{field: %{name: name}}, filenames),
+    do: %{field: name, filenames: filenames, many?: false}
 end

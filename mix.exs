@@ -9,8 +9,10 @@ defmodule AshBulkDurable.MixProject do
       app: :ash_bulk_durable,
       version: @version,
       elixir: "~> 1.19",
+      elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
+      aliases: aliases(),
       name: "AshBulkDurable",
       description: "Run any Ash action over many rows durably, with per-row failures to correct",
       package: package(),
@@ -25,6 +27,17 @@ defmodule AshBulkDurable.MixProject do
     ]
   end
 
+  def cli do
+    [preferred_envs: ["ash.codegen": :test]]
+  end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_env), do: ["lib"]
+
+  defp aliases do
+    [test: ["ash.setup --quiet", "test"]]
+  end
+
   defp deps do
     [
       {:ash, "~> 3.37 and >= 3.37.1"},
@@ -36,6 +49,9 @@ defmodule AshBulkDurable.MixProject do
       {:nimble_csv, "~> 1.3"},
       {:briefly, "~> 0.5"},
       {:telemetry, "~> 1.2"},
+
+      # The resources the tests run, whose policies need a solver.
+      {:simple_sat, "~> 0.1", only: :test},
 
       # Tooling.
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},

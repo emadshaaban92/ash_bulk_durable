@@ -126,6 +126,14 @@ Oban's Lifeline plugin should run too: a job orphaned by a dead node stays
 `[:ash_bulk_durable, :bulk_action | :staged_files_download | :phase1 | :chunk]`
 spans, and `[:ash_bulk_durable, :worker_attempt, :start]`.
 
+## Contributing
+
+`mix test` needs PostgreSQL 16+. It connects to `db` as `admin`/`admin` unless
+`DATABASE_HOST`, `DATABASE_USER` and `DATABASE_PASSWORD` say otherwise, and
+sets up its own database from `priv/test_repo`. The engine's tests run here, on
+the resources in `test/support`, and need no Phoenix. The screens' tests run in
+`example/`.
+
 ## License
 
 MIT

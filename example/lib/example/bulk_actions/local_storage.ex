@@ -45,6 +45,9 @@ defmodule Example.BulkActions.LocalStorage do
     File.cp(source, target)
   end
 
+  @doc "Whether an object sits at `key`."
+  def exists?(key), do: File.exists?(path(key))
+
   @doc "Writes `body` at `key`."
   def put_object(key, body) do
     target = path(key)

@@ -17,9 +17,13 @@ $ mix setup
 $ mix phx.server     # http://localhost:4000
 ```
 
-`mix test` runs the same flows without a browser.
+`mix test` runs the same flows without a browser. The resources it adds, such
+as `Example.Test.Region`, live in `test/support`, with their tables in
+`priv/test_repo`: shapes the example's own books and authors don't have.
 
-There's no sign-in: `ExampleWeb.CurrentUser` picks the first seeded user.
+There's no sign-in: `ExampleWeb.CurrentUser` picks the first seeded user, an
+admin of the seeded organization. Set a user's `locale` to `:ar` to read the page
+in Arabic.
 
 Try this sheet with Book → Create, looking the author up by email:
 
@@ -77,9 +81,18 @@ backend. `ExampleWeb.Bulk.Utils` is the one place to plug in your own labels.
 
 ## Files in a sheet
 
-`Example.Types.StoredFile` marks a field as a file.
-`Example.BulkActions.FileHandler` claims that field: its cell names a file and
-the column asks for a companion ZIP. `FileResolver` extracts the file through
-`AshBulkDurable.Sheet.BoundedZip` when the row runs. Use `BoundedZip` for any
-archive a user supplies: it holds extraction to a byte budget, whatever the
-archive claims about itself.
+`Example.Types.StoredFile` marks a field as a file, or `{:array, StoredFile}` as
+several. `Example.BulkActions.FileHandler` claims that field: its cell names
+files, separated by `|`, and the column asks for a companion ZIP. `FileResolver`
+extracts them through `AshBulkDurable.Sheet.BoundedZip` when the row runs, and
+extracts them again if a sweep took them while the row waited for a correction.
+Use `BoundedZip` for any archive a user supplies: it holds extraction to a byte
+budget, whatever the archive claims about itself.
+
+## Organizations
+
+A bulk action runs where its owner acted when submitting it.
+`Example.BulkActions.Owner` rebuilds that scope for the worker: the user as they
+are now, holding their roles in that organization, and reaching nothing there
+if they've left it. `User` is multitenant by organization, so a read in that
+scope finds that organization's people.

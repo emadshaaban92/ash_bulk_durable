@@ -107,3 +107,10 @@ msgstr ""
 
 msgid "must be equal to %{number}"
 msgstr ""
+
+## What Ash says of a field, raised at run time.
+msgid "is required"
+msgstr ""
+
+msgid "could not be found"
+msgstr ""

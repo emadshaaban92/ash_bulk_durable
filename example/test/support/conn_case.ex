@@ -28,11 +28,11 @@ defmodule ExampleWeb.ConnCase do
       import Plug.Conn
       import Phoenix.ConnTest
       import ExampleWeb.ConnCase
+      import ExampleWeb.TestHelpers
     end
   end
 
   setup tags do
-    Example.DataCase.setup_sandbox(tags)
-    {:ok, conn: Phoenix.ConnTest.build_conn()}
+    ExampleWeb.TestHelpers.common_setup_with_conn(tags)
   end
 end

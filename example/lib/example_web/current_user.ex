@@ -9,7 +9,10 @@ defmodule ExampleWeb.CurrentUser do
   alias Example.Scope
 
   def on_mount(:default, _params, session, socket) do
-    {:cont, assign(socket, :scope, %Scope{current_user: user(session)})}
+    user = user(session)
+    if user, do: Gettext.put_locale(ExampleWeb.Gettext, to_string(user.locale))
+
+    {:cont, assign(socket, :scope, Scope.new(actor: user))}
   end
 
   defp user(%{"user_id" => id}), do: Ash.get!(User, id, authorize?: false)

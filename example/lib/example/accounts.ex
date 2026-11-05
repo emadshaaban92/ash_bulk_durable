@@ -3,6 +3,8 @@ defmodule Example.Accounts do
   use Ash.Domain
 
   resources do
+    resource Example.Accounts.Organization
+    resource Example.Accounts.Membership
     resource Example.Accounts.User
   end
 end

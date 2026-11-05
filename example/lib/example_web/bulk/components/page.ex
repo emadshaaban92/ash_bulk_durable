@@ -38,6 +38,14 @@ defmodule ExampleWeb.Bulk.Components.Page do
   def bulk_page(assigns) do
     ~H"""
     <%= cond do %>
+      <% not Phoenix.LiveView.connected?(@socket) -> %>
+        <%!--
+          The list of what the reader may run is asked of their policies once
+          the socket connects, so the first paint holds neither form nor panel.
+        --%>
+        <div class="flex items-center justify-center p-12 text-base-content/60">
+          <span class="loading loading-spinner loading-sm me-2" /> {gettext("Loading bulk action…")}
+        </div>
       <% @bulk_action -> %>
         <ProgressPanel.progress_panel
           bulk_action={@bulk_action}

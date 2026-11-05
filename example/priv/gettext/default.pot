@@ -1,0 +1,559 @@
+## This file is a PO Template file.
+##
+## "msgid"s here are often extracted from source code.
+## Add new messages manually only if they're dynamic
+## messages that can't be statically extracted.
+##
+## Run "mix gettext.extract" to bring this file up to
+## date. Leave "msgstr"s empty as changing them here has no
+## effect: edit them in PO (.po) files instead.
+#
+msgid ""
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:357
+#, elixir-autogen, elixir-format
+msgid "%{count} error found"
+msgid_plural "%{count} errors found"
+msgstr[0] ""
+msgstr[1] ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:286
+#, elixir-autogen, elixir-format
+msgid "%{count} failed row will be permanently abandoned and the uploaded files deleted. Download the errors sheet first if you might run it again later — it can be uploaded as a new bulk action."
+msgid_plural "%{count} failed rows will be permanently abandoned and the uploaded files deleted. Download the errors sheet first if you might run them again later — it can be uploaded as a new bulk action."
+msgstr[0] ""
+msgstr[1] ""
+
+#: lib/example_web/bulk/live_view.ex:503
+#, elixir-autogen, elixir-format
+msgid "%{count} row didn't match the original bulk action. No rows were changed."
+msgid_plural "%{count} rows didn't match the original bulk action. No rows were changed."
+msgstr[0] ""
+msgstr[1] ""
+
+#: lib/example_web/bulk/components/page.ex:336
+#, elixir-autogen, elixir-format
+msgid "%{count} row uploaded"
+msgid_plural "%{count} rows uploaded"
+msgstr[0] ""
+msgstr[1] ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:295
+#, elixir-autogen, elixir-format
+msgid "%{done} of %{total} rows done"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:97
+#, elixir-autogen, elixir-format
+msgid "%{done} of %{total} rows done. %{failed} need attention — fix them in the errors sheet and re-upload to retry."
+msgstr ""
+
+#: lib/example_web/bulk/error_message.ex:91
+#, elixir-autogen, elixir-format
+msgid "%{field}: %{message}"
+msgstr ""
+
+#: lib/example_web/bulk/components/field_mapping_panel.ex:213
+#, elixir-autogen, elixir-format
+msgid "%{format} for %{field}"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:392
+#, elixir-autogen, elixir-format
+msgid "A companion file couldn't be downloaded from storage."
+msgstr ""
+
+#: lib/example_web/bulk/error_message.ex:43
+#, elixir-autogen, elixir-format
+msgid "A file uploaded with this bulk action couldn't be read, so nothing was saved for this row."
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:389
+#, elixir-autogen, elixir-format
+msgid "A row failed, so the bulk action stopped before any rows were written."
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:384
+#, elixir-autogen, elixir-format
+msgid "A row failed, so the whole bulk action was rolled back (\"Apply all rows or none\" was on)."
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:280
+#, elixir-autogen, elixir-format
+msgid "Abandon failed rows"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:81
+#, elixir-autogen, elixir-format
+msgid "Action"
+msgstr ""
+
+#: lib/example_web/components/core_components.ex:375
+#, elixir-autogen, elixir-format
+msgid "Actions"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:137
+#, elixir-autogen, elixir-format
+msgid "Apply all rows or none"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:475
+#, elixir-autogen, elixir-format
+msgid "Atomic mode is unavailable for bulk actions over %{max} rows — larger ones run in best-effort mode."
+msgstr ""
+
+#: lib/example_web/components/layouts.ex:98
+#: lib/example_web/components/layouts.ex:113
+#, elixir-autogen, elixir-format
+msgid "Attempting to reconnect"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:252
+#, elixir-autogen, elixir-format
+msgid "Bulk Action Instructions"
+msgstr ""
+
+#: lib/example_web/bulk/live_view.ex:167
+#, elixir-autogen, elixir-format
+msgid "Bulk Actions"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:63
+#, elixir-autogen, elixir-format
+msgid "Bulk action"
+msgstr ""
+
+#: lib/example_web/bulk/components/field_mapping_panel.ex:170
+#, elixir-autogen, elixir-format
+msgid "CSV column"
+msgstr ""
+
+#: lib/example_web/bulk/components/field_mapping_panel.ex:179
+#, elixir-autogen, elixir-format
+msgid "CSV columns"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:270
+#, elixir-autogen, elixir-format
+msgid "Choose Lookup By:"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:261
+#, elixir-autogen, elixir-format
+msgid "Choose the type of data to act on"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:267
+#, elixir-autogen, elixir-format
+msgid "Choose what to do with the data (Create, Update, Activate, etc.)"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:113
+#: lib/example_web/bulk/components/page.ex:114
+#, elixir-autogen, elixir-format
+msgid "Clear file"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:166
+#, elixir-autogen, elixir-format
+msgid "Close"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:356
+#, elixir-autogen, elixir-format
+msgid "Completed with errors"
+msgstr ""
+
+#: lib/example_web/bulk/live_view.ex:511
+#, elixir-autogen, elixir-format
+msgid "Couldn't apply the corrections. Please try again."
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:185
+#, elixir-autogen, elixir-format
+msgid "Couldn't prepare the errors sheet."
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:293
+#, elixir-autogen, elixir-format
+msgid "Data Requirements:"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:140
+#, elixir-autogen, elixir-format
+msgid "Dismiss"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:180
+#, elixir-autogen, elixir-format
+msgid "Download"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:271
+#, elixir-autogen, elixir-format
+msgid "Download errors sheet"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:299
+#, elixir-autogen, elixir-format
+msgid "Ensure data matches the selected resource type"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:315
+#, elixir-autogen, elixir-format
+msgid "Error"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:161
+#, elixir-autogen, elixir-format
+msgid "Errors sheet"
+msgstr ""
+
+#: lib/example_web/bulk/live_view.ex:381
+#: lib/example_web/bulk/live_view.ex:391
+#: lib/example_web/bulk/live_view.ex:398
+#, elixir-autogen, elixir-format
+msgid "Failed to start the bulk action."
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:100
+#, elixir-autogen, elixir-format
+msgid "File"
+msgstr ""
+
+#: lib/example_web/bulk/components/field_mapping_panel.ex:232
+#, elixir-autogen, elixir-format
+msgid "File needed"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:336
+#, elixir-autogen, elixir-format
+msgid "File:"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:297
+#, elixir-autogen, elixir-format
+msgid "First row should contain column headers"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:271
+#, elixir-autogen, elixir-format
+msgid "For updates, select which field to look up existing records by (Name, Code, etc.)"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:257
+#, elixir-autogen, elixir-format
+msgid "How to run a bulk action:"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:140
+#, elixir-autogen, elixir-format
+msgid "If any row fails, nothing is changed."
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:57
+#, elixir-autogen, elixir-format
+msgid "Loading bulk action…"
+msgstr ""
+
+#: lib/example_web/bulk/components/field_mapping_panel.ex:56
+#, elixir-autogen, elixir-format
+msgid "Look up the row by"
+msgstr ""
+
+#: lib/example_web/bulk/components/field_mapping_panel.ex:158
+#: lib/example_web/bulk/components/page.ex:92
+#, elixir-autogen, elixir-format
+msgid "Lookup by"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:280
+#, elixir-autogen, elixir-format
+msgid "Map Fields:"
+msgstr ""
+
+#: lib/example_web/bulk/components/field_mapping_panel.ex:224
+#, elixir-autogen, elixir-format
+msgid "Mapped"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:280
+#, elixir-autogen, elixir-format
+msgid "Match your file columns to the system fields"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:298
+#, elixir-autogen, elixir-format
+msgid "Maximum file size: 30MB"
+msgstr ""
+
+#: lib/example_web/bulk/live_view.ex:558
+#, elixir-autogen, elixir-format
+msgid "Missing required file uploads: %{names}"
+msgstr ""
+
+#: lib/example_web/bulk/components/field_mapping_panel.ex:68
+#, elixir-autogen, elixir-format
+msgid "New values written to the row once it's found."
+msgstr ""
+
+#: lib/example_web/bulk/components/field_mapping_panel.ex:255
+#, elixir-autogen, elixir-format
+msgid "Optional"
+msgstr ""
+
+#: lib/example_web/bulk/components/field_mapping_panel.ex:240
+#, elixir-autogen, elixir-format
+msgid "Partial"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:174
+#, elixir-autogen, elixir-format
+msgid "Preparing errors sheet…"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:285
+#, elixir-autogen, elixir-format
+msgid "Preview & Submit:"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:373
+#, elixir-autogen, elixir-format
+msgid "Ready to submit"
+msgstr ""
+
+#: lib/example_web/bulk/live_view.ex:481
+#, elixir-autogen, elixir-format
+msgid "Reopened %{count} row for retry."
+msgid_plural "Reopened %{count} rows for retry."
+msgstr[0] ""
+msgstr[1] ""
+
+#: lib/example_web/bulk/components/field_mapping_panel.ex:248
+#, elixir-autogen, elixir-format
+msgid "Required"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:71
+#, elixir-autogen, elixir-format
+msgid "Resource"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:187
+#, elixir-autogen, elixir-format
+msgid "Retry"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:244
+#, elixir-autogen, elixir-format
+msgid "Retry failed rows"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:214
+#, elixir-autogen, elixir-format
+msgid "Retry with corrections"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:285
+#, elixir-autogen, elixir-format
+msgid "Review the data preview and click Submit"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:314
+#, elixir-autogen, elixir-format
+msgid "Row"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:416
+#, elixir-autogen, elixir-format
+msgid "Row %{row}: %{message}"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:353
+#, elixir-autogen, elixir-format
+msgid "Running"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:81
+#, elixir-autogen, elixir-format
+msgid "Running as a single all-or-nothing transaction…"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:353
+#, elixir-autogen, elixir-format
+msgid "Running…"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:266
+#, elixir-autogen, elixir-format
+msgid "Select Action:"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:261
+#, elixir-autogen, elixir-format
+msgid "Select Resource:"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:321
+#, elixir-autogen, elixir-format
+msgid "Select a lookup field above to identify existing records."
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:165
+#, elixir-autogen, elixir-format
+msgid "Select a resource and action above to preview the fields you'll need to provide."
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:312
+#, elixir-autogen, elixir-format
+msgid "Select an action above to continue."
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:277
+#, elixir-autogen, elixir-format
+msgid "Select your CSV or Excel file containing the data"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:328
+#, elixir-autogen, elixir-format
+msgid "Showing %{shown} of %{total} failed rows — download the errors sheet for the rest."
+msgstr ""
+
+#: lib/example_web/components/layouts.ex:105
+#, elixir-autogen, elixir-format
+msgid "Something went wrong!"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:132
+#, elixir-autogen, elixir-format
+msgid "Start again with same settings"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:304
+#, elixir-autogen, elixir-format
+msgid "Start by selecting a resource and action above, then upload your file to begin."
+msgstr ""
+
+#: lib/example_web/bulk/live_view.ex:548
+#, elixir-autogen, elixir-format
+msgid "Still uploading: %{names}. Please wait for the upload to finish before submitting."
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:150
+#, elixir-autogen, elixir-format
+msgid "Submit"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:296
+#, elixir-autogen, elixir-format
+msgid "Supported formats: CSV, Excel (.xlsx)"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:398
+#, elixir-autogen, elixir-format
+msgid "The bulk action couldn't be prepared. Please check your data and try again."
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:401
+#: lib/example_web/bulk/components/progress_panel.ex:405
+#, elixir-autogen, elixir-format
+msgid "The bulk action failed."
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:379
+#, elixir-autogen, elixir-format
+msgid "The bulk action stopped before finishing. To run what's left, download the errors sheet and upload it under Retry with corrections. Rows already saved won't run again."
+msgstr ""
+
+#: lib/example_web/bulk/error_message.ex:36
+#, elixir-autogen, elixir-format
+msgid "This row hit an unexpected error, so nothing was saved for it."
+msgstr ""
+
+#: lib/example_web/bulk/error_message.ex:39
+#, elixir-autogen, elixir-format
+msgid "This row took too long to prepare, so nothing was saved for it."
+msgstr ""
+
+#: lib/example_web/bulk/components/field_mapping_panel.ex:67
+#, elixir-autogen, elixir-format
+msgid "Update these fields"
+msgstr ""
+
+#: lib/example_web/bulk/components/page.ex:276
+#, elixir-autogen, elixir-format
+msgid "Upload Data:"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:227
+#, elixir-autogen, elixir-format
+msgid "Upload corrections to retry"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:258
+#, elixir-autogen, elixir-format
+msgid "Upload your fixed CSV and click Retry failed rows to run only the failed rows again."
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:252
+#, elixir-autogen, elixir-format
+msgid "Upload your fixed CSV and click Retry failed rows to run the whole bulk action again."
+msgstr ""
+
+#: lib/example_web/bulk/components/field_mapping_panel.ex:57
+#, elixir-autogen, elixir-format
+msgid "Used to find the existing row in the database."
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:84
+#, elixir-autogen, elixir-format
+msgid "Waiting to start…"
+msgstr ""
+
+#: lib/example_web/components/layouts.ex:90
+#, elixir-autogen, elixir-format
+msgid "We can't find the internet"
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:395
+#, elixir-autogen, elixir-format
+msgid "What this bulk action held no longer exists, so it can't run."
+msgstr ""
+
+#: lib/example_web/bulk/live_view.ex:492
+#, elixir-autogen, elixir-format
+msgid "What this bulk action ran no longer exists, so it can't be retried. Abandon its failed rows to start a new one."
+msgstr ""
+
+#: lib/example_web/bulk/error_message.ex:49
+#, elixir-autogen, elixir-format
+msgid "What this row held no longer exists, so nothing was saved for it."
+msgstr ""
+
+#: lib/example_web/bulk/live_view.ex:377
+#, elixir-autogen, elixir-format
+msgid "You have an unfinished bulk action. Finish, retry, or abandon it before starting another."
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:178
+#, elixir-autogen, elixir-format
+msgid "Your errors sheet is ready."
+msgstr ""
+
+#: lib/example_web/bulk/components/progress_panel.ex:193
+#: lib/example_web/components/core_components.ex:81
+#, elixir-autogen, elixir-format
+msgid "close"
+msgstr ""
+
+#: lib/example_web/bulk/error_message.ex:61
+#, elixir-autogen, elixir-format
+msgid "no match found"
+msgstr ""
+
+#: lib/example_web/bulk/error_message.ex:64
+#, elixir-autogen, elixir-format
+msgid "no result in %{resource} matches %{criteria}"
+msgstr ""
