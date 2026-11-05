@@ -134,6 +134,38 @@ defmodule AshBulkDurable.Core.WorkerTest do
     def finish(nil), do: :ok
   end
 
+  defmodule MovingResolver do
+    @moduledoc """
+    Resolves a value to itself, and the first time it resolves after
+    `hook/1`, runs the hook first, given the resolver context: a test steps
+    in as another run between this run reading its `:pending` rows and
+    flipping them. Kept in `:persistent_term`, since phase 1 resolves in its
+    own tasks.
+    """
+    @behaviour AshBulkDurable.Core.Resolver
+
+    @key {__MODULE__, :hook}
+
+    def hook(fun), do: :persistent_term.put(@key, fun)
+    def clear, do: :persistent_term.erase(@key)
+
+    @impl true
+    def prepare(_args, _context), do: {:ok, nil}
+
+    @impl true
+    def resolve(value, nil, context) do
+      # `erase/1` is true for one caller only.
+      with fun when is_function(fun, 1) <- :persistent_term.get(@key, nil),
+           true <- :persistent_term.erase(@key),
+           do: fun.(context)
+
+      {:ok, value}
+    end
+
+    @impl true
+    def finish(nil), do: :ok
+  end
+
   defmodule UnpreparableResolver do
     @moduledoc "A resolver whose chunk can't be readied, as a corrupt companion ZIP."
     @behaviour AshBulkDurable.Core.Resolver
@@ -969,6 +1001,271 @@ defmodule AshBulkDurable.Core.WorkerTest do
       # Nothing was resolved, let alone written.
       assert Enum.map(list_rows(bulk_action.id), & &1.status) == [:pending, :pending, :failed]
       assert regions_from(suffix, user) == []
+    end
+  end
+
+  # Another run of the same bulk action writes a row between this run reading
+  # it and flipping it. The flip is refused, the transaction holding it rolls
+  # back, and this run stops without a verdict of its own.
+  describe "a row moved on under another run" do
+    # Runs `fun` once, in the run's own process, when its first chunk starts:
+    # after it read the chunk, before it writes it.
+    defp at_first_chunk(bulk_action, fun) do
+      handler = "at-first-chunk-#{bulk_action.id}"
+
+      :telemetry.attach(
+        handler,
+        [:ash_bulk_durable, :chunk, :start],
+        fn _event, _measurements, %{bulk_action_id: id}, _config ->
+          if id == bulk_action.id do
+            :telemetry.detach(handler)
+            fun.()
+          end
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+    end
+
+    defp move_in_resolve(fun) do
+      on_exit(&MovingResolver.clear/0)
+      MovingResolver.hook(fun)
+    end
+
+    # The bulk action as this run's `mark_running` left it: no verdict.
+    defp assert_no_verdict(bulk_action) do
+      fresh = reload(bulk_action)
+      assert fresh.status == :running
+      assert fresh.result == nil
+      assert fresh.finished_at == nil
+      assert fresh.rows_done == 0
+    end
+
+    defp perform_as_current(bulk_action) do
+      Worker
+      |> build_job(%{"bulk_action_id" => bulk_action.id})
+      |> Map.put(:id, bulk_action.oban_job_id)
+      |> perform_job()
+    end
+
+    test "phase 1, per row: the current job's resolve is refused and it snoozes",
+         %{super_user: user} do
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(1, suffix, MovingResolver),
+          user_id: user.id,
+          chunk_size: 1
+        )
+
+      [row] = list_rows(bulk_action.id)
+
+      move_in_resolve(fn _context ->
+        Ash.Seed.update!(row, %{status: :resolved, resolved_data: %{"native_name" => "other"}})
+      end)
+
+      log =
+        capture_log(fn -> assert {:snooze, 30} = perform_as_current(bulk_action) end)
+
+      assert log =~ "a stale run wrote a row first"
+
+      assert [%{status: :resolved, resolved_data: %{"native_name" => "other"}}] =
+               list_rows(bulk_action.id)
+
+      assert_no_verdict(bulk_action)
+      assert regions_from(suffix, user) == []
+    end
+
+    test "phase 1, all or nothing: a superseded job's resolve is refused and it cancels",
+         %{super_user: user} do
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(2, suffix, MovingResolver),
+          user_id: user.id,
+          chunk_size: 2,
+          mode: :all_or_nothing
+        )
+
+      [row | _] = list_rows(bulk_action.id)
+
+      move_in_resolve(fn _context ->
+        Ash.Seed.update!(row, %{status: :failed, error: "other run"})
+      end)
+
+      log =
+        capture_log(fn ->
+          assert {:cancel, :superseded} =
+                   perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+        end)
+
+      assert log =~ "is superseded"
+
+      [r1, r2] = list_rows(bulk_action.id)
+      assert r1.status == :failed
+      assert [%{message: "other run"}] = r1.error
+      assert r2.status in [:pending, :resolved]
+      assert_no_verdict(bulk_action)
+      assert regions_from(suffix, user) == []
+    end
+
+    test "phase 2, per row: the chunk rolls back with no recovery, and a job of a finished bulk action cancels",
+         %{super_user: user} do
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(2, suffix), user_id: user.id, chunk_size: 2)
+
+      [r1, r2] = list_rows(bulk_action.id)
+
+      # The other run applied row 2 and finished the bulk action.
+      at_first_chunk(bulk_action, fn ->
+        Ash.Seed.update!(r2, %{status: :succeeded, record_id: "other"})
+        Ash.Seed.update!(reload(bulk_action), %{status: :completed})
+      end)
+
+      log =
+        capture_log(fn -> assert {:cancel, :superseded} = perform_as_current(bulk_action) end)
+
+      assert log =~ "is superseded"
+
+      # Row 1's target write and flip shared the refused flip's transaction.
+      assert regions_from(suffix, user) == []
+
+      assert [%{id: id1, status: :resolved}, %{status: :succeeded, record_id: "other"}] =
+               list_rows(bulk_action.id)
+
+      assert id1 == r1.id
+
+      fresh = reload(bulk_action)
+      assert fresh.status == :completed
+      assert fresh.result == nil
+      assert fresh.rows_done == 0
+    end
+
+    test "phase 2, all or nothing: the transaction rolls back, no rollback verdict, and the current job snoozes",
+         %{super_user: user} do
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(2, suffix),
+          user_id: user.id,
+          chunk_size: 2,
+          mode: :all_or_nothing
+        )
+
+      [_r1, r2] = list_rows(bulk_action.id)
+
+      at_first_chunk(bulk_action, fn ->
+        Ash.Seed.update!(r2, %{status: :succeeded, record_id: "other"})
+      end)
+
+      log =
+        capture_log(fn -> assert {:snooze, 30} = perform_as_current(bulk_action) end)
+
+      assert log =~ "a stale run wrote a row first"
+
+      assert regions_from(suffix, user) == []
+
+      assert [%{status: :resolved}, %{status: :succeeded, record_id: "other"}] =
+               list_rows(bulk_action.id)
+
+      assert_no_verdict(bulk_action)
+    end
+
+    test "phase 2, per row: a refused flip to :failed in row-by-row recovery stops the run",
+         %{super_user: user} do
+      suffix = System.unique_integer([:positive])
+
+      # Row 2's code is taken, so the chunk rolls back and recovery runs the
+      # rows one at a time.
+      Ash.create!(Region, %{code: "B2-#{suffix}", name: "X#{suffix}", native_name: "Y#{suffix}"},
+        actor: user,
+        authorize?: false
+      )
+
+      bulk_action =
+        create_bulk_action!(region_rows(2, suffix), user_id: user.id, chunk_size: 2)
+
+      [_r1, r2] = list_rows(bulk_action.id)
+
+      # The `:run` batches end, outside their transactions, in this order: the
+      # chunk, then recovery's row 1 and row 2. After row 2's, and before the
+      # worker marks it failed, the other run applies it.
+      handler = "after-row-2-#{bulk_action.id}"
+      short_name = Ash.Domain.Info.short_name(AshBulkDurable.Test.BulkActions)
+      counter = :counters.new(1, [])
+
+      :telemetry.attach(
+        handler,
+        [:ash, short_name, :bulk_update, :stop],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:action] == :run do
+            :counters.add(counter, 1, 1)
+
+            if :counters.get(counter, 1) == 3 do
+              :telemetry.detach(handler)
+              Ash.Seed.update!(r2, %{status: :succeeded, record_id: "other"})
+            end
+          end
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      log =
+        capture_log(fn ->
+          assert {:cancel, :superseded} =
+                   perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+        end)
+
+      assert log =~ "is superseded"
+
+      # Row 1 committed in its own batch before; row 2 keeps the other run's write.
+      assert [%{status: :succeeded}, %{status: :succeeded, record_id: "other", error: nil}] =
+               list_rows(bulk_action.id)
+
+      fresh = reload(bulk_action)
+      assert fresh.status == :running
+      assert fresh.result == nil
+      assert fresh.finished_at == nil
+      assert fresh.rows_done == 1
+    end
+
+    test "the staged temporary files are deleted when the run stops", %{super_user: user} do
+      put_config(:storage, AshBulkDurable.TestStorage)
+      start_supervised!(AshBulkDurable.TestStorage)
+      key = "bulk-staging/#{user.id}/abc/companions/logo.zip"
+      AshBulkDurable.TestStorage.put(key, "zip")
+
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(1, suffix, MovingResolver),
+          user_id: user.id,
+          chunk_size: 1,
+          staged_files: %{"logo" => key}
+        )
+
+      [row] = list_rows(bulk_action.id)
+      test_pid = self()
+
+      move_in_resolve(fn context ->
+        send(test_pid, {:staged, context.staged_files})
+        Ash.Seed.update!(row, %{status: :resolved})
+      end)
+
+      capture_log(fn ->
+        assert {:cancel, :superseded} =
+                 perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      end)
+
+      assert_received {:staged, %{"logo" => path}}
+      refute File.exists?(path)
+      # The staged object itself stays, as for any run without a verdict.
+      assert key in AshBulkDurable.TestStorage.keys()
     end
   end
 end

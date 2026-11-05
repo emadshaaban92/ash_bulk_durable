@@ -154,6 +154,71 @@ defmodule AshBulkDurable.Core.Resource.RowTest do
     end
   end
 
+  # Each flip matches the row only while its status is one it may leave, so
+  # one run can't overwrite a row another run of the same bulk action wrote.
+  describe "a row status flip is a compare-and-set" do
+    @flips [
+      resolve: {[:pending], [:resolved, :succeeded, :failed]},
+      mark_succeeded: {[:resolved], [:pending, :succeeded, :failed]},
+      mark_failed: {[:pending, :resolved], [:succeeded, :failed]},
+      forget_resolutions: {[:pending, :resolved], [:succeeded, :failed]}
+    ]
+
+    setup ctx do
+      [row] = [resolved(0)] |> create_bulk_action!() |> list_rows()
+      %{row: Ash.Seed.update!(row, %{resolved_data: %{"photo" => %{"key" => "x"}}}), ctx: ctx}
+    end
+
+    for {action, {allowed, refused}} <- @flips do
+      for status <- allowed do
+        test "#{action} is allowed from #{status}", %{row: row, ctx: ctx} do
+          row = Ash.Seed.update!(row, %{status: unquote(status)})
+          assert {:ok, _flipped} = flip(row, unquote(action), ctx)
+        end
+      end
+
+      for status <- refused do
+        test "#{action} is refused from #{status}, leaving the row as it is",
+             %{row: row, ctx: ctx} do
+          row = Ash.Seed.update!(row, %{status: unquote(status)})
+
+          assert {:error, %Ash.Error.Invalid{errors: errors}} =
+                   flip(row, unquote(action), ctx)
+
+          assert [%Ash.Error.Changes.StaleRecord{resource: Row}] = errors
+          assert stored(Ash.get!(Row, row.id, authorize?: false)) == stored(row)
+        end
+      end
+    end
+  end
+
+  defp stored(row), do: Map.take(row, [:status, :resolved_data, :error, :record_id])
+
+  defp flip(row, :resolve, ctx) do
+    settings = %AshBulkDurable.Core.Runner.Settings{
+      resource: AshBulkDurable.Test.Region,
+      action_name: :create,
+      action_type: :create,
+      mode: :per_row,
+      scope: AshBulkDurable.Test.Scope.new(actor: ctx.super_user)
+    }
+
+    Ash.update(row, %{},
+      action: :resolve,
+      authorize?: false,
+      context: %{ash_bulk_durable: %{settings: settings, resolvers: %{}}}
+    )
+  end
+
+  defp flip(row, :mark_succeeded, _ctx),
+    do: Ash.update(row, %{record_id: "late"}, action: :mark_succeeded, authorize?: false)
+
+  defp flip(row, :mark_failed, _ctx),
+    do: Ash.update(row, %{error: "late"}, action: :mark_failed, authorize?: false)
+
+  defp flip(row, :forget_resolutions, _ctx),
+    do: Ash.update(row, %{names: ["photo"]}, action: :forget_resolutions, authorize?: false)
+
   # What the resolve phase resolved survives a correction only where the
   # reference behind it is unchanged.
   describe ":reopen_with_corrections" do

@@ -36,6 +36,9 @@ defmodule AshBulkDurable.Core.Worker do
   - Per-row chunk rollback → row-by-row recovery (rows succeed or
     fail individually); the bulk action lands in `:completed_with_errors` if
     any row landed `:failed`.
+  - A row status flip refused because another run of the bulk action already
+    moved the row on (`RowMovedOnError`, see below) → the run stops, writing
+    no verdict.
 
   A row that raises, or outruns `:row_resolve_timeout` in phase 1, fails like
   one that returns an error, in either phase and either mode. Only a raise from the worker's own reads and writes propagates
@@ -70,6 +73,21 @@ defmodule AshBulkDurable.Core.Worker do
   It does the same for a later attempt of a job the bulk action no longer
   names. A retry enqueues a new job while an attempt of the old one can still
   be waiting, and two would drive the same rows.
+
+  ## Overlapping runs
+
+  Two runs can still overlap: an old attempt still running after a retry
+  queued a new job, or a run declared `worker_lost` while it was alive. Each
+  row status flip is a compare-and-set (`AshBulkDurable.Core.Changes.RequireStatus`),
+  so the run that comes second to a row is refused, and the transaction
+  holding the refused flip rolls back with whatever it wrote. The run then
+  stops without writing anything more, and no verdict: if the bulk action is
+  terminal or names another job, this job is superseded and cancels;
+  otherwise this job is the current run, a stale one got to the row first,
+  and it snoozes for 30 seconds, then resumes from the rows' status like any
+  other attempt. Snoozing gives the attempt back, so a run that keeps
+  colliding never exhausts its attempts and is never failed as `worker_lost`
+  for that.
   """
   # The queue is host-configurable at enqueue time through the
   # `AshBulkDurable.Core.config/2` seam (see `AshBulkDurable.Core.Changes.EnqueueWorker`),
@@ -87,6 +105,8 @@ defmodule AshBulkDurable.Core.Worker do
     StoredTerm
   }
 
+  alias AshBulkDurable.Core.Worker.RowMovedOnError
+
   require Ash.Query
   require Logger
 
@@ -100,7 +120,33 @@ defmodule AshBulkDurable.Core.Worker do
     if terminal?(bulk_action.status) or superseded?(job, bulk_action) do
       :ok
     else
-      attempt(bulk_action, job, attempt)
+      try do
+        attempt(bulk_action, job, attempt)
+      rescue
+        error in RowMovedOnError -> row_moved_on(job, error)
+      end
+    end
+  end
+
+  # The run's transaction has rolled back and the heartbeat stopped; it
+  # writes no verdict of its own.
+  defp row_moved_on(job, %RowMovedOnError{bulk_action_id: bulk_action_id}) do
+    bulk_action = fetch_bulk_action!(bulk_action_id)
+
+    if terminal?(bulk_action.status) or bulk_action.oban_job_id != job.id do
+      Logger.warning(
+        "bulk action #{bulk_action_id}: a row moved on under another run; " <>
+          "job #{job.id} is superseded and stops"
+      )
+
+      {:cancel, :superseded}
+    else
+      Logger.warning(
+        "bulk action #{bulk_action_id}: a stale run wrote a row first; " <>
+          "job #{job.id} stops and snoozes"
+      )
+
+      {:snooze, 30}
     end
   end
 
@@ -144,16 +190,20 @@ defmodule AshBulkDurable.Core.Worker do
     settings = Runner.settings(bulk_action, scope, %{})
     forget_lost_resolutions(bulk_action, settings)
 
-    {staged_paths_for_cleanup, terminal_bulk_action} =
+    terminal_bulk_action =
       case download_staged_files_with_telemetry(bulk_action, settings) do
         {:ok, staged_paths} ->
-          {staged_paths, run_rows(bulk_action, %{settings | staged_files: staged_paths})}
+          # A run stopped by a row that moved on raises past this.
+          try do
+            run_rows(bulk_action, %{settings | staged_files: staged_paths})
+          after
+            delete_local_staged_tmp(staged_paths)
+          end
 
         {:error, reason} ->
-          {%{}, run_without_staged_files(bulk_action, settings, reason)}
+          run_without_staged_files(bulk_action, settings, reason)
       end
 
-    delete_local_staged_tmp(staged_paths_for_cleanup)
     maybe_delete_staging(terminal_bulk_action)
     :ok
   end
@@ -253,7 +303,9 @@ defmodule AshBulkDurable.Core.Worker do
     |> Ash.read!(authorize?: false)
     |> then(&Runner.lost_resolutions(settings, &1))
     |> Enum.each(fn {row, names} ->
-      Ash.update!(row, %{names: names}, action: :forget_resolutions, authorize?: false)
+      row
+      |> Ash.update(%{names: names}, action: :forget_resolutions, authorize?: false)
+      |> row_flipped!(bulk_action.id)
     end)
   end
 
@@ -524,11 +576,13 @@ defmodule AshBulkDurable.Core.Worker do
     do: {:cont, {status, failed}}
 
   defp reduce_resolution({:error, err}, row, _status, failed, true) do
+    raise_if_moved_on!(err, row.bulk_action_id)
     mark_row_failed(row, err)
     {:halt, {:atomic_phase1_failed, {row.row_index, err}, failed + 1}}
   end
 
   defp reduce_resolution({:error, err}, row, status, failed, false) do
+    raise_if_moved_on!(err, row.bulk_action_id)
     mark_row_failed(row, err)
     {:cont, {status, failed + 1}}
   end
@@ -685,7 +739,10 @@ defmodule AshBulkDurable.Core.Worker do
         Ash.Notifier.notify(result.notifications)
         :ok
 
+      # A refused flip rolled the batch back like a row failure would, but
+      # it is not one: another run wrote the row, so this one stops.
       _ ->
+        raise_if_moved_on!(result.errors || [], bulk_action.id)
         {:error, first_error(result)}
     end
   end
@@ -740,11 +797,35 @@ defmodule AshBulkDurable.Core.Worker do
   # path — target write + `:succeeded` flip + `rows_done` bump — lives in the
   # `:run` action's after_batch (`AshBulkDurable.Core.Changes.RunRow`).
   defp mark_row_failed(row, err) do
-    Ash.update!(row, %{error: err},
-      action: :mark_failed,
-      authorize?: false
-    )
+    row
+    |> Ash.update(%{error: err}, action: :mark_failed, authorize?: false)
+    |> row_flipped!(row.bulk_action_id)
   end
+
+  # A row status flip another run's write refused stops the run; any other
+  # error raises as `Ash.update!/3` would.
+  defp row_flipped!({:ok, row}, _bulk_action_id), do: row
+
+  defp row_flipped!({:error, error}, bulk_action_id) do
+    raise_if_moved_on!(error, bulk_action_id)
+    raise Ash.Error.to_error_class(error)
+  end
+
+  defp raise_if_moved_on!(error, bulk_action_id) do
+    if row_moved_on?(error), do: raise(RowMovedOnError, bulk_action_id: bulk_action_id)
+    :ok
+  end
+
+  # True only for the row resource's own `StaleRecord`: a status flip's
+  # compare-and-set refused (`RequireStatus`). A target's `StaleRecord` is an
+  # ordinary row failure.
+  defp row_moved_on?(%Ash.Error.Changes.StaleRecord{resource: resource}),
+    do: resource == row_resource()
+
+  defp row_moved_on?(%Ash.Changeset{errors: errors}), do: row_moved_on?(errors)
+  defp row_moved_on?(%{errors: errors}) when is_list(errors), do: row_moved_on?(errors)
+  defp row_moved_on?(errors) when is_list(errors), do: Enum.any?(errors, &row_moved_on?/1)
+  defp row_moved_on?(_error), do: false
 
   # ── Telemetry ────────────────────────────────────────────────────
 

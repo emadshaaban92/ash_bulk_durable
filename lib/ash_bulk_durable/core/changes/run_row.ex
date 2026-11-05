@@ -35,8 +35,10 @@ defmodule AshBulkDurable.Core.Changes.RunRow do
     # transaction.
     {results, succeeded} =
       Enum.map_reduce(pairs, 0, fn {changeset, row}, succeeded ->
-        case run_row(settings, row) do
-          {:ok, record} -> {{:ok, mark_succeeded(row, record)}, succeeded + 1}
+        with {:ok, record} <- run_row(settings, row),
+             {:ok, row} <- mark_succeeded(row, record) do
+          {{:ok, row}, succeeded + 1}
+        else
           {:error, error} -> {{:error, on_row(changeset, error)}, succeeded}
         end
       end)
@@ -57,12 +59,15 @@ defmodule AshBulkDurable.Core.Changes.RunRow do
   # row's is what ties the error to its row.
   defp on_row(changeset, error), do: Ash.Changeset.add_error(changeset, error)
 
+  # The flip is a compare-and-set (`RequireStatus`): a row another run
+  # already wrote refuses it, and that refusal fails the row like a target
+  # error, so the batch rolls back and the worker can tell it apart.
   defp mark_succeeded(row, record) do
     row
     |> Ash.Changeset.for_update(:mark_succeeded, %{record_id: record_id(record)},
       authorize?: false
     )
-    |> Ash.update!(authorize?: false)
+    |> Ash.update(authorize?: false)
   end
 
   # Query-encoded, so a part holding a separator can't run into the next one.

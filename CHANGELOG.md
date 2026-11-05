@@ -14,3 +14,9 @@
   on a prefixed host the cron failed every live bulk action.
 - The engine's tests at the root, the screens' tests in `example/`, and CI over
   both.
+- Row status flips are compare-and-set: `:resolve`, `:mark_succeeded`,
+  `:mark_failed` and `:forget_resolutions` match a row only while its status
+  is one they may move it from, and are refused as `StaleRecord` otherwise. A
+  run whose row moved on under another run of the same bulk action stops
+  without writing anything more: a superseded job cancels, the current one
+  retries.
