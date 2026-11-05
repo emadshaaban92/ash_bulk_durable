@@ -297,7 +297,7 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
           name: :resolve,
           accept: [],
           require_atomic?: false,
-          changes: [change]
+          changes: [require_status([:pending]), change]
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)
@@ -326,7 +326,7 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
           accept: [],
           require_atomic?: false,
           arguments: [names_arg],
-          changes: [forget]
+          changes: [require_status([:pending, :resolved]), forget]
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)
@@ -360,7 +360,7 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
           accept: [],
           require_atomic?: false,
           arguments: [record_id_arg],
-          changes: [set_status, set_record_id]
+          changes: [require_status([:resolved]), set_status, set_record_id]
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)
@@ -394,7 +394,7 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
           accept: [],
           require_atomic?: false,
           arguments: [error_arg],
-          changes: [set_status, set_error]
+          changes: [require_status([:pending, :resolved]), set_status, set_error]
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)
@@ -460,6 +460,15 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)
     end
+  end
+
+  # A status flip is a compare-and-set: it matches the row only while the row
+  # is still in one of `statuses`, so a run can't overwrite what another run
+  # of the same bulk action already wrote (`Ash.Error.Changes.StaleRecord`).
+  defp require_status(statuses) do
+    Transformer.build_entity!(Dsl, [:actions, :update], :change,
+      change: {AshBulkDurable.Core.Changes.RequireStatus, statuses: statuses}
+    )
   end
 
   # ── Postgres ─────────────────────────────────────────────────────────────
