@@ -142,6 +142,8 @@ defmodule Example.Repo.Migrations.InitialExtensions1 do
     SET search_path = ''
     VOLATILE;
     """)
+
+    execute("CREATE EXTENSION IF NOT EXISTS \"citext\"")
   end
 
   def down do
@@ -150,5 +152,7 @@ defmodule Example.Repo.Migrations.InitialExtensions1 do
     execute(
       "DROP FUNCTION IF EXISTS uuid_generate_v7(), ash_raise_error(jsonb), ash_raise_error(jsonb, ANYCOMPATIBLE), ash_elixir_and(BOOLEAN, ANYCOMPATIBLE), ash_elixir_and(ANYCOMPATIBLE, ANYCOMPATIBLE), ash_elixir_or(ANYCOMPATIBLE, ANYCOMPATIBLE), ash_elixir_or(BOOLEAN, ANYCOMPATIBLE), ash_trim_whitespace(text[]), ash_required(ANYCOMPATIBLE, jsonb)"
     )
+
+    # execute("DROP EXTENSION IF EXISTS \"citext\"")
   end
 end

@@ -22,8 +22,7 @@ as `Example.Test.Region`, live in `test/support`, with their tables in
 `priv/test_repo`: shapes the example's own books and authors don't have.
 
 There's no sign-in: `ExampleWeb.CurrentUser` picks the first seeded user, an
-admin of the seeded organization. Set a user's `locale` to `:ar` to read the page
-in Arabic.
+admin of the seeded organization.
 
 Try this sheet with Book → Create, looking the author up by email:
 
@@ -77,7 +76,9 @@ Rename the `ExampleWeb` modules, then:
    your store's own and change the `uploader:` name in `presign_companion/2`.
 
 The page uses Tailwind and daisyUI classes, and strings go through your Gettext
-backend. `ExampleWeb.Bulk.Utils` is the one place to plug in your own labels.
+backend. The example ships no translations: `mix gettext.extract` in your app
+picks up the page's strings with your own. `ExampleWeb.Bulk.Utils` is the one
+place to plug in your own labels.
 
 ## Files in a sheet
 

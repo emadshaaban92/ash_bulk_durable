@@ -21,23 +21,71 @@
       "references": null,
       "scale": null,
       "size": null,
-      "source": "name",
+      "source": "isbn",
       "type": "text"
     },
     {
       "allow_nil?": false,
-      "default": "1",
+      "default": "nil",
       "generated?": false,
       "precision": null,
       "primary_key?": false,
       "references": null,
       "scale": null,
       "size": null,
-      "source": "version",
+      "source": "title",
+      "type": "text"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "pages",
       "type": "bigint"
     },
     {
       "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "cover",
+      "type": "text"
+    },
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "inserted_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "updated_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": false,
       "default": "nil",
       "generated?": false,
       "precision": null,
@@ -57,16 +105,16 @@
           "global": null,
           "strategy": null
         },
-        "name": "branches_region_id_fkey",
+        "name": "books_author_id_fkey",
         "on_delete": "restrict",
         "on_update": null,
         "primary_key?": true,
         "schema": "public",
-        "table": "regions"
+        "table": "authors"
       },
       "scale": null,
       "size": null,
-      "source": "region_id",
+      "source": "author_id",
       "type": "uuid"
     }
   ],
@@ -76,19 +124,19 @@
   "custom_indexes": [],
   "custom_statements": [],
   "has_create_action": true,
-  "hash": "4E9676BA393751D9846A1F5093F838C9BC8E99C1F0384A6298B9EFEE4E1ADE62",
+  "hash": "A41766E8AE207731FEEBC18525EECE1A2B046FC4F2BA1F41FB208D0F92BB48A0",
   "identities": [
     {
       "all_tenants?": false,
       "base_filter": null,
-      "index_name": "branches_name_index",
+      "index_name": "books_isbn_index",
       "keys": [
         {
           "type": "atom",
-          "value": "name"
+          "value": "isbn"
         }
       ],
-      "name": "name",
+      "name": "isbn",
       "nils_distinct?": true,
       "where": null
     }
@@ -100,6 +148,6 @@
   },
   "repo": "Elixir.Example.Repo",
   "schema": null,
-  "table": "branches",
+  "table": "books",
   "temporal": null
 }

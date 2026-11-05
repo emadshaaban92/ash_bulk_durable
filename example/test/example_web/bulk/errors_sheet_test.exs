@@ -45,21 +45,18 @@ defmodule ExampleWeb.Bulk.ErrorsSheetTest do
   end
 
   describe "build/1" do
-    test "words a stored exception as a form words it, in the reader's language" do
+    test "words a stored exception as a form words it" do
       bulk_action = create_bulk_action!()
       [row, _pending] = rows(bulk_action.id)
 
       error = Ash.Error.Changes.Required.exception(field: :name, type: :attribute)
       Ash.update!(row, %{error: error}, action: :mark_failed, authorize?: false)
 
-      Gettext.put_locale("ar")
-      on_exit(fn -> Gettext.put_locale("en") end)
-
       [header | [[id, last_error | _cells] | _rest]] = decode(bulk_action)
 
       assert Enum.take(header, 2) == ["row_id", "last_error"]
       assert id == row.id
-      assert last_error == "الاسم: مطلوب"
+      assert last_error == "Name: is required"
     end
 
     test "words what a row raised as one sentence, keeping the raise's own text off the sheet" do
@@ -69,12 +66,9 @@ defmodule ExampleWeb.Bulk.ErrorsSheetTest do
       error = Ash.Error.to_ash_error(RuntimeError.exception("SELECT a.lsid FROM cf.application"))
       Ash.update!(row, %{error: error}, action: :mark_failed, authorize?: false)
 
-      Gettext.put_locale("ar")
-      on_exit(fn -> Gettext.put_locale("en") end)
-
       [_header | [[_id, last_error | _cells] | _rest]] = decode(bulk_action)
 
-      assert last_error == "حدث خطأ غير متوقع في هذا الصف، ولم يُحفظ شيء له."
+      assert last_error == "This row hit an unexpected error, so nothing was saved for it."
     end
   end
 

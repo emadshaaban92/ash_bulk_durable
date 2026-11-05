@@ -13,7 +13,7 @@
       "type": "uuid"
     },
     {
-      "allow_nil?": false,
+      "allow_nil?": true,
       "default": "nil",
       "generated?": false,
       "precision": null,
@@ -21,11 +21,11 @@
       "references": null,
       "scale": null,
       "size": null,
-      "source": "code",
-      "type": "text"
+      "source": "order_id",
+      "type": "uuid"
     },
     {
-      "allow_nil?": false,
+      "allow_nil?": true,
       "default": "nil",
       "generated?": false,
       "precision": null,
@@ -33,44 +33,32 @@
       "references": null,
       "scale": null,
       "size": null,
-      "source": "name",
+      "source": "organization_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": false,
+      "default": "false",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "refreshed",
+      "type": "boolean"
+    },
+    {
+      "allow_nil?": false,
+      "default": "\"active\"",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "status",
       "type": "text"
-    },
-    {
-      "allow_nil?": false,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "native_name",
-      "type": "text"
-    },
-    {
-      "allow_nil?": false,
-      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "inserted_at",
-      "type": "utc_datetime_usec"
-    },
-    {
-      "allow_nil?": false,
-      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "updated_at",
-      "type": "utc_datetime_usec"
     },
     {
       "allow_nil?": true,
@@ -89,20 +77,20 @@
         "match_type": null,
         "match_with": null,
         "multitenancy": {
-          "attribute": "organization_id",
-          "global": true,
-          "strategy": "attribute"
+          "attribute": null,
+          "global": null,
+          "strategy": null
         },
-        "name": "regions_inserted_by_id_fkey",
-        "on_delete": "restrict",
+        "name": "bookings_asset_id_fkey",
+        "on_delete": null,
         "on_update": null,
         "primary_key?": true,
         "schema": "public",
-        "table": "users"
+        "table": "assets"
       },
       "scale": null,
       "size": null,
-      "source": "inserted_by_id",
+      "source": "asset_id",
       "type": "uuid"
     }
   ],
@@ -112,49 +100,35 @@
   "custom_indexes": [],
   "custom_statements": [],
   "has_create_action": true,
-  "hash": "AB331F39910E440F03616D6404300C4C0D096F71ABF5B7CE1A3AA3AD0B3F2E3A",
+  "hash": "A33CB07FB4EC44368322FBDB9AA4831E44EC79A1F530B2EB9B0C233535FEAD2B",
   "identities": [
     {
       "all_tenants?": false,
       "base_filter": null,
-      "index_name": "regions_code_index",
+      "index_name": "bookings_active_on_asset_index",
       "keys": [
         {
           "type": "atom",
-          "value": "code"
+          "value": "asset_id"
         }
       ],
-      "name": "code",
+      "name": "active_on_asset",
       "nils_distinct?": true,
-      "where": null
+      "where": "status = 'active'"
     },
     {
       "all_tenants?": false,
       "base_filter": null,
-      "index_name": "regions_name_index",
+      "index_name": "bookings_order_index",
       "keys": [
         {
           "type": "atom",
-          "value": "name"
+          "value": "order_id"
         }
       ],
-      "name": "name",
+      "name": "order",
       "nils_distinct?": true,
-      "where": null
-    },
-    {
-      "all_tenants?": false,
-      "base_filter": null,
-      "index_name": "regions_native_name_index",
-      "keys": [
-        {
-          "type": "atom",
-          "value": "native_name"
-        }
-      ],
-      "name": "native_name",
-      "nils_distinct?": true,
-      "where": null
+      "where": "status != 'cancelled'"
     }
   ],
   "multitenancy": {
@@ -164,6 +138,6 @@
   },
   "repo": "Elixir.Example.Repo",
   "schema": null,
-  "table": "regions",
+  "table": "bookings",
   "temporal": null
 }

@@ -44,9 +44,9 @@
         "match_type": null,
         "match_with": null,
         "multitenancy": {
-          "attribute": null,
-          "global": null,
-          "strategy": null
+          "attribute": "organization_id",
+          "global": true,
+          "strategy": "attribute"
         },
         "name": "memberships_user_id_fkey",
         "on_delete": null,
@@ -100,7 +100,7 @@
   "custom_indexes": [],
   "custom_statements": [],
   "has_create_action": true,
-  "hash": "05D66BFD254FB4F74C371C48A73C7B3D11A08CC0F2FBA91D9DF896C8A5FCCD67",
+  "hash": "40794C2561FC99B73D9FB7E0DE35830711C32E0CAF3FBF963E4C18F52DBE93EA",
   "identities": [
     {
       "all_tenants?": false,

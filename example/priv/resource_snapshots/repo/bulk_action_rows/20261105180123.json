@@ -21,20 +21,8 @@
       "references": null,
       "scale": null,
       "size": null,
-      "source": "name",
-      "type": "text"
-    },
-    {
-      "allow_nil?": false,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "email",
-      "type": "citext"
+      "source": "row_index",
+      "type": "bigint"
     },
     {
       "allow_nil?": true,
@@ -45,38 +33,104 @@
       "references": null,
       "scale": null,
       "size": null,
-      "source": "phone",
+      "source": "target",
+      "type": "binary"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "input",
+      "type": "binary"
+    },
+    {
+      "allow_nil?": false,
+      "default": "%{}",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "metadata",
+      "type": "map"
+    },
+    {
+      "allow_nil?": false,
+      "default": "%{}",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "resolved_data",
+      "type": "map"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "resolved_tenant",
+      "type": "binary"
+    },
+    {
+      "allow_nil?": false,
+      "default": "\"pending\"",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "status",
       "type": "text"
     },
     {
-      "allow_nil?": false,
-      "default": "[]",
+      "allow_nil?": true,
+      "default": "nil",
       "generated?": false,
       "precision": null,
       "primary_key?": false,
       "references": null,
       "scale": null,
       "size": null,
-      "source": "platform_roles",
-      "type": [
-        "array",
-        "text"
-      ]
+      "source": "error",
+      "type": "binary"
     },
     {
       "allow_nil?": false,
-      "default": "[]",
+      "default": "false",
       "generated?": false,
       "precision": null,
       "primary_key?": false,
       "references": null,
       "scale": null,
       "size": null,
-      "source": "organization_roles",
-      "type": [
-        "array",
-        "text"
-      ]
+      "source": "refused",
+      "type": "boolean"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "record_id",
+      "type": "text"
     },
     {
       "allow_nil?": false,
@@ -92,18 +146,6 @@
     },
     {
       "allow_nil?": false,
-      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "updated_at",
-      "type": "utc_datetime_usec"
-    },
-    {
-      "allow_nil?": true,
       "default": "nil",
       "generated?": false,
       "precision": null,
@@ -123,42 +165,61 @@
           "global": null,
           "strategy": null
         },
-        "name": "users_organization_id_fkey",
-        "on_delete": null,
-        "on_update": null,
+        "name": "bulk_action_rows_bulk_action_id_fkey",
+        "on_delete": "delete",
+        "on_update": "restrict",
         "primary_key?": true,
         "schema": "public",
-        "table": "organizations"
+        "table": "bulk_actions"
       },
       "scale": null,
       "size": null,
-      "source": "organization_id",
+      "source": "bulk_action_id",
       "type": "uuid"
     }
   ],
   "base_filter": null,
   "check_constraints": [],
   "create_table_options": null,
-  "custom_indexes": [],
-  "custom_statements": [],
-  "has_create_action": true,
-  "hash": "791CEBF68F272B926D75EB50C8DCE04282AE97DBFA0FD5FBEF7FDFCD9B1E9A25",
-  "identities": [
+  "custom_indexes": [
     {
       "all_tenants?": false,
-      "base_filter": null,
-      "index_name": "users_email_index",
-      "keys": [
+      "concurrently": false,
+      "error_fields": [
+        "bulk_action_id",
+        "status",
+        "row_index"
+      ],
+      "fields": [
         {
           "type": "atom",
-          "value": "email"
+          "value": "bulk_action_id"
+        },
+        {
+          "type": "atom",
+          "value": "status"
+        },
+        {
+          "type": "atom",
+          "value": "row_index"
         }
       ],
-      "name": "email",
-      "nils_distinct?": true,
+      "include": null,
+      "include_base_filter?": true,
+      "message": null,
+      "name": null,
+      "nulls_distinct": true,
+      "prefix": null,
+      "table": null,
+      "unique": false,
+      "using": null,
       "where": null
     }
   ],
+  "custom_statements": [],
+  "has_create_action": true,
+  "hash": "C5607B07D7EA8405D78E518E373226864116087ED0F587A4E139EAB4D7B8AF19",
+  "identities": [],
   "multitenancy": {
     "attribute": null,
     "global": null,
@@ -166,6 +227,6 @@
   },
   "repo": "Elixir.Example.Repo",
   "schema": null,
-  "table": "users",
+  "table": "bulk_action_rows",
   "temporal": null
 }
