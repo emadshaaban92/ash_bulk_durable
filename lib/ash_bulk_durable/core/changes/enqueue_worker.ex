@@ -4,7 +4,7 @@ defmodule AshBulkDurable.Core.Changes.EnqueueWorker do
   inserts an `AshBulkDurable.Core.Worker` Oban job for the bulk action and writes
   the resulting `oban_job_id` back onto the bulk action via `:set_oban_job_id`.
 
-  Composes inside the action's transaction: if `Oban.insert/1` fails,
+  Composes inside the action's transaction: if `Oban.insert/2` fails,
   the bulk action insert (and any prior after_action writes like `PersistRows`)
   rolls back. The doc calls this out as the "no half-run bulk actions"
   guarantee.
@@ -22,7 +22,9 @@ defmodule AshBulkDurable.Core.Changes.EnqueueWorker do
     queue = AshBulkDurable.Core.config(:queue, :bulk_actions)
     worker = AshBulkDurable.Core.config(:worker_module, AshBulkDurable.Core.Worker)
 
-    case Oban.insert(worker.new(%{bulk_action_id: bulk_action.id}, queue: queue)) do
+    job = worker.new(%{bulk_action_id: bulk_action.id}, queue: queue)
+
+    case Oban.insert(AshBulkDurable.Core.oban(), job) do
       {:ok, %Oban.Job{id: job_id}} ->
         bulk_action
         |> Ash.Changeset.for_update(:set_oban_job_id, %{oban_job_id: job_id}, authorize?: false)

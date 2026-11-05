@@ -60,7 +60,10 @@ defmodule AshBulkDurable.Core.Changes.ApplyMarkFinished do
   defp maybe_enqueue_staging_purge(changeset, :cancelled) do
     Ash.Changeset.after_action(changeset, fn _changeset, bulk_action ->
       _ =
-        Oban.insert(AshBulkDurable.Core.PurgeStaleStaging.new(%{bulk_action_id: bulk_action.id}))
+        Oban.insert(
+          AshBulkDurable.Core.oban(),
+          AshBulkDurable.Core.PurgeStaleStaging.new(%{bulk_action_id: bulk_action.id})
+        )
 
       {:ok, bulk_action}
     end)

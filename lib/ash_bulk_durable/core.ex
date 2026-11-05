@@ -111,4 +111,12 @@ defmodule AshBulkDurable.Core do
   @doc "Reads one `ash_bulk_durable` config key."
   @spec config(atom(), term()) :: term()
   def config(key, default \\ nil), do: Application.get_env(:ash_bulk_durable, key, default)
+
+  @doc """
+  The name of the Oban instance the engine enqueues, reads and cancels its
+  jobs through: `:oban` in the config, `Oban` by default. Every job call goes
+  through that instance's config, so its `:prefix` is honoured.
+  """
+  @spec oban() :: Oban.name()
+  def oban, do: config(:oban, Oban)
 end

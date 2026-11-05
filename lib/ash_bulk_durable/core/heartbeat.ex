@@ -52,7 +52,9 @@ defmodule AshBulkDurable.Core.Heartbeat do
   defp record(job) do
     now = System.system_time(:millisecond)
 
-    case Oban.update_job(job, %{meta: Map.put(job.meta, "heartbeat_at", now)}) do
+    meta = Map.put(job.meta, "heartbeat_at", now)
+
+    case Oban.update_job(AshBulkDurable.Core.oban(), job, %{meta: meta}) do
       {:ok, _job} -> :ok
       {:error, reason} -> missed(job, reason)
     end
