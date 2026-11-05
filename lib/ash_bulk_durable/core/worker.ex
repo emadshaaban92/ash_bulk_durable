@@ -84,8 +84,10 @@ defmodule AshBulkDurable.Core.Worker do
   stops without writing anything more, and no verdict: if the bulk action is
   terminal or names another job, this job is superseded and cancels;
   otherwise this job is the current run, a stale one got to the row first,
-  and it fails the attempt for Oban to retry, which resumes from the rows'
-  status like any other.
+  and it snoozes for 30 seconds, then resumes from the rows' status like any
+  other attempt. Snoozing gives the attempt back, so a run that keeps
+  colliding never exhausts its attempts and is never failed as `worker_lost`
+  for that.
   """
   # The queue is host-configurable at enqueue time through the
   # `AshBulkDurable.Core.config/2` seam (see `AshBulkDurable.Core.Changes.EnqueueWorker`),
@@ -141,10 +143,10 @@ defmodule AshBulkDurable.Core.Worker do
     else
       Logger.warning(
         "bulk action #{bulk_action_id}: a stale run wrote a row first; " <>
-          "job #{job.id} stops and retries"
+          "job #{job.id} stops and snoozes"
       )
 
-      {:error, :row_moved_on}
+      {:snooze, 30}
     end
   end
 

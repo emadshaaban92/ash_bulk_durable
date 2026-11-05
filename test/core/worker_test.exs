@@ -137,9 +137,10 @@ defmodule AshBulkDurable.Core.WorkerTest do
   defmodule MovingResolver do
     @moduledoc """
     Resolves a value to itself, and the first time it resolves after
-    `hook/1`, runs the hook first: a test steps in as another run between
-    this run reading its `:pending` rows and flipping them. Kept in
-    `:persistent_term`, since phase 1 resolves in its own tasks.
+    `hook/1`, runs the hook first, given the resolver context: a test steps
+    in as another run between this run reading its `:pending` rows and
+    flipping them. Kept in `:persistent_term`, since phase 1 resolves in its
+    own tasks.
     """
     @behaviour AshBulkDurable.Core.Resolver
 
@@ -152,11 +153,11 @@ defmodule AshBulkDurable.Core.WorkerTest do
     def prepare(_args, _context), do: {:ok, nil}
 
     @impl true
-    def resolve(value, nil, _context) do
+    def resolve(value, nil, context) do
       # `erase/1` is true for one caller only.
-      with fun when is_function(fun, 0) <- :persistent_term.get(@key, nil),
+      with fun when is_function(fun, 1) <- :persistent_term.get(@key, nil),
            true <- :persistent_term.erase(@key),
-           do: fun.()
+           do: fun.(context)
 
       {:ok, value}
     end
@@ -1048,7 +1049,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
       |> perform_job()
     end
 
-    test "phase 1, per row: the current job's resolve is refused and it retries",
+    test "phase 1, per row: the current job's resolve is refused and it snoozes",
          %{super_user: user} do
       suffix = System.unique_integer([:positive])
 
@@ -1060,12 +1061,12 @@ defmodule AshBulkDurable.Core.WorkerTest do
 
       [row] = list_rows(bulk_action.id)
 
-      move_in_resolve(fn ->
+      move_in_resolve(fn _context ->
         Ash.Seed.update!(row, %{status: :resolved, resolved_data: %{"native_name" => "other"}})
       end)
 
       log =
-        capture_log(fn -> assert {:error, :row_moved_on} = perform_as_current(bulk_action) end)
+        capture_log(fn -> assert {:snooze, 30} = perform_as_current(bulk_action) end)
 
       assert log =~ "a stale run wrote a row first"
 
@@ -1089,7 +1090,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
 
       [row | _] = list_rows(bulk_action.id)
 
-      move_in_resolve(fn ->
+      move_in_resolve(fn _context ->
         Ash.Seed.update!(row, %{status: :failed, error: "other run"})
       end)
 
@@ -1143,7 +1144,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
       assert fresh.rows_done == 0
     end
 
-    test "phase 2, all or nothing: the transaction rolls back, no rollback verdict, and the current job retries",
+    test "phase 2, all or nothing: the transaction rolls back, no rollback verdict, and the current job snoozes",
          %{super_user: user} do
       suffix = System.unique_integer([:positive])
 
@@ -1161,7 +1162,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
       end)
 
       log =
-        capture_log(fn -> assert {:error, :row_moved_on} = perform_as_current(bulk_action) end)
+        capture_log(fn -> assert {:snooze, 30} = perform_as_current(bulk_action) end)
 
       assert log =~ "a stale run wrote a row first"
 
@@ -1171,6 +1172,100 @@ defmodule AshBulkDurable.Core.WorkerTest do
                list_rows(bulk_action.id)
 
       assert_no_verdict(bulk_action)
+    end
+
+    test "phase 2, per row: a refused flip to :failed in row-by-row recovery stops the run",
+         %{super_user: user} do
+      suffix = System.unique_integer([:positive])
+
+      # Row 2's code is taken, so the chunk rolls back and recovery runs the
+      # rows one at a time.
+      Ash.create!(Region, %{code: "B2-#{suffix}", name: "X#{suffix}", native_name: "Y#{suffix}"},
+        actor: user,
+        authorize?: false
+      )
+
+      bulk_action =
+        create_bulk_action!(region_rows(2, suffix), user_id: user.id, chunk_size: 2)
+
+      [_r1, r2] = list_rows(bulk_action.id)
+
+      # The `:run` batches end, outside their transactions, in this order: the
+      # chunk, then recovery's row 1 and row 2. After row 2's, and before the
+      # worker marks it failed, the other run applies it.
+      handler = "after-row-2-#{bulk_action.id}"
+      short_name = Ash.Domain.Info.short_name(AshBulkDurable.Test.BulkActions)
+      counter = :counters.new(1, [])
+
+      :telemetry.attach(
+        handler,
+        [:ash, short_name, :bulk_update, :stop],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:action] == :run do
+            :counters.add(counter, 1, 1)
+
+            if :counters.get(counter, 1) == 3 do
+              :telemetry.detach(handler)
+              Ash.Seed.update!(r2, %{status: :succeeded, record_id: "other"})
+            end
+          end
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      log =
+        capture_log(fn ->
+          assert {:cancel, :superseded} =
+                   perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+        end)
+
+      assert log =~ "is superseded"
+
+      # Row 1 committed in its own batch before; row 2 keeps the other run's write.
+      assert [%{status: :succeeded}, %{status: :succeeded, record_id: "other", error: nil}] =
+               list_rows(bulk_action.id)
+
+      fresh = reload(bulk_action)
+      assert fresh.status == :running
+      assert fresh.result == nil
+      assert fresh.finished_at == nil
+      assert fresh.rows_done == 1
+    end
+
+    test "the staged temporary files are deleted when the run stops", %{super_user: user} do
+      put_config(:storage, AshBulkDurable.TestStorage)
+      start_supervised!(AshBulkDurable.TestStorage)
+      key = "bulk-staging/#{user.id}/abc/companions/logo.zip"
+      AshBulkDurable.TestStorage.put(key, "zip")
+
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(1, suffix, MovingResolver),
+          user_id: user.id,
+          chunk_size: 1,
+          staged_files: %{"logo" => key}
+        )
+
+      [row] = list_rows(bulk_action.id)
+      test_pid = self()
+
+      move_in_resolve(fn context ->
+        send(test_pid, {:staged, context.staged_files})
+        Ash.Seed.update!(row, %{status: :resolved})
+      end)
+
+      capture_log(fn ->
+        assert {:cancel, :superseded} =
+                 perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      end)
+
+      assert_received {:staged, %{"logo" => path}}
+      refute File.exists?(path)
+      # The staged object itself stays, as for any run without a verdict.
+      assert key in AshBulkDurable.TestStorage.keys()
     end
   end
 end
