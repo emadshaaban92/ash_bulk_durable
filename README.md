@@ -27,6 +27,9 @@ See `AshBulkDurable` for every verb and option.
 The library stands on Ash, Oban and Postgres. It has no screens and needs no
 web framework.
 
+[`example/`](example/README.md) is a Phoenix app using it, with a `/bulk` page
+to copy into yours.
+
 ## Installation
 
 ```elixir
