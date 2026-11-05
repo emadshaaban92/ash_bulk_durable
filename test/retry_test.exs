@@ -715,8 +715,8 @@ defmodule AshBulkDurable.RetryTest do
       assert succeeded.status == :succeeded
       assert parked.rows_done == 1
 
-      # `retry` read its rows before its transaction, with no way in between
-      # for a test to reach: this is the write that tab goes on to make.
+      # `retry` reads its rows once it holds the bulk action's lock, so it
+      # never acts on this tab's copy: this is the write that copy would make.
       assert {:error, %Ash.Error.Invalid{errors: [%Ash.Error.Changes.StaleRecord{}]}} =
                Ash.update(read_by_the_other_tab, %{input: %{name: "Branch #{tag()}"}},
                  action: :reopen_with_corrections,

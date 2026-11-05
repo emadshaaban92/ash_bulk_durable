@@ -6,13 +6,18 @@ defmodule AshBulkDurable.Core.Retry do
   then runs the rows that are no longer finished, as it ran them the first
   time.
 
-  A bulk action that finished with failed rows, or failed outright, can be
-  retried. One queued or running is refused, as are one completed or
-  cancelled and one the caller's scope does not own: the refusal is the
-  `:enqueue_retry` update matching no row, so two retries cannot race. One
-  whose resource or action no longer exists, or that stored what no longer
-  decodes (`AshBulkDurable.Core.StoredTerm`), returns `{:error, :gone}`, and
-  its owner can only abandon it.
+  A retry first locks the bulk action (`AshBulkDurable.Core.BulkActionLock`),
+  before any of its rows, and reads the rows and the bulk action's state under
+  that lock, not from the caller's copy. A bulk action that finished with
+  failed rows, or failed outright, can be retried. One queued or running is
+  refused, as are one completed or cancelled and one the caller's scope does
+  not own, and one whose lock another transaction holds, such as a run's: that
+  retry is refused at once rather than waiting for it. A caller who does not
+  own it never locks it, so learns nothing of its rows. Two retries cannot
+  race: the second finds the lock held or the status moved on. One whose
+  resource or action no longer exists, or that stored what no longer decodes
+  (`AshBulkDurable.Core.StoredTerm`), returns `{:error, :gone}` to its owner,
+  who can only abandon it.
 
   A row its caller refused before it was stored never ran and has no input
   to run as it is: only a correction reopens it.
@@ -24,7 +29,7 @@ defmodule AshBulkDurable.Core.Retry do
   require Ash.Query
 
   alias AshBulkDurable.Core
-  alias AshBulkDurable.Core.{Introspection, Owner, Runner}
+  alias AshBulkDurable.Core.{BulkActionLock, Introspection, Owner, Runner}
 
   @doc """
   Reruns every row of `bulk_action` that has not succeeded. Returns `{:ok,
@@ -49,7 +54,7 @@ defmodule AshBulkDurable.Core.Retry do
     corrections = opts |> Keyword.get(:rows, %{}) |> Map.new()
     shared = opts |> Keyword.take([:input]) |> Map.new()
 
-    reopen(bulk_action, corrections, shared, opts, fn -> open_rows(bulk_action) end)
+    reopen(bulk_action, corrections, shared, opts, &{:ok, open_rows(&1)})
   end
 
   @doc """
@@ -73,9 +78,9 @@ defmodule AshBulkDurable.Core.Retry do
 
     correction = opts |> Keyword.take([:input, :lookup, :tenant, :metadata]) |> Map.new()
 
-    with :ok <- nothing_unprocessed(bulk_action) do
-      reopen(bulk_action, %{row.id => correction}, %{}, opts, fn -> failed(row) end)
-    end
+    reopen(bulk_action, %{row.id => correction}, %{}, opts, fn locked ->
+      with :ok <- nothing_unprocessed(locked), do: {:ok, failed(row)}
+    end)
   end
 
   @doc "The rows of `bulk_action` that have not succeeded, in the order they run."
@@ -94,7 +99,8 @@ defmodule AshBulkDurable.Core.Retry do
   end
 
   # Only a failed bulk action can have stopped short: every other retryable
-  # one ran all its rows, and one running is refused by `:enqueue_retry`.
+  # one ran all its rows. Given the locked bulk action, so its status is the
+  # committed one.
   defp nothing_unprocessed(%{status: :failed} = bulk_action) do
     Core.config(:row_resource)
     |> Ash.Query.filter(bulk_action_id == ^bulk_action.id and status in [:pending, :resolved])
@@ -107,32 +113,66 @@ defmodule AshBulkDurable.Core.Retry do
 
   defp nothing_unprocessed(_bulk_action), do: :ok
 
+  @retryable [:completed_with_errors, :failed]
+
+  # The bulk action is locked before anything reads or writes its rows (see
+  # `AshBulkDurable.Core.BulkActionLock`), and what it holds is read under the
+  # lock rather than taken from the caller, whose copy may predate another
+  # retry. A refusal before the first write is returned as it is, nothing
+  # written; `Ash.transaction` would turn a rollback's `%{unmatched: ids}`
+  # into an unknown error.
   defp reopen(bulk_action, corrections, shared, opts, rows) do
-    with :ok <- Introspection.runnable(bulk_action),
-         rows = rows.(),
-         :ok <- Introspection.readable(rows),
-         :ok <- all_known(corrections, rows) do
-      write(rows, corrections, shared, bulk_action, opts)
+    resources = [Core.config(:bulk_action_resource), Core.config(:row_resource)]
+
+    with {:ok, result} <-
+           Ash.transaction(resources, fn ->
+             under_lock(resources, bulk_action, corrections, shared, opts, rows)
+           end) do
+      result
     end
   end
 
-  # The rows go first: each compares the shared input it ran with to the one
-  # it will, so the bulk action must still hold the former. That is read here
-  # rather than taken from the caller, whose copy may predate another retry:
-  # one still saying `:running` would write no status, and no job would run.
-  defp write(rows, corrections, shared, bulk_action, opts) do
-    resources = [Core.config(:bulk_action_resource), Core.config(:row_resource)]
+  defp under_lock(resources, bulk_action, corrections, shared, opts, rows) do
+    with {:ok, locked} <- lock(bulk_action, opts),
+         :ok <- Introspection.runnable(locked),
+         {:ok, rows} <- rows.(locked),
+         :ok <- Introspection.readable(rows),
+         :ok <- all_known(corrections, rows) do
+      write(resources, rows, corrections, shared, locked, opts)
+    end
+  end
 
-    Ash.transaction(resources, fn ->
-      current = Ash.get!(Core.config(:bulk_action_resource), bulk_action.id, authorize?: false)
+  # Each row compares the shared input it ran with to the one it will, so the
+  # rows reopen before `:enqueue_retry` moves that input on.
+  defp write(resources, rows, corrections, shared, locked, opts) do
+    with :ok <- reopen_rows(rows, corrections, shared, locked),
+         {:ok, retried} <- enqueue(locked, shared, opts) do
+      {:ok, retried}
+    else
+      {:error, error} -> Ash.DataLayer.rollback(resources, error)
+    end
+  end
 
-      with :ok <- reopen_rows(rows, corrections, shared, current),
-           {:ok, retried} <- enqueue(current, shared, opts) do
-        retried
-      else
-        {:error, error} -> Ash.DataLayer.rollback(resources, error)
-      end
-    end)
+  # Only the owner's: anyone else is refused before reading anything, as
+  # `:enqueue_retry` refuses a bulk action it matches no row of.
+  defp lock(bulk_action, opts) do
+    owner = Owner.worker_key(Keyword.fetch!(opts, :scope))
+
+    case BulkActionLock.lock(bulk_action.id, @retryable, filter: expr(user_id == ^owner)) do
+      {:ok, locked} ->
+        {:ok, locked}
+
+      :none ->
+        resource = Core.config(:bulk_action_resource)
+
+        {:error,
+         Ash.Error.to_error_class(
+           Ash.Error.Changes.StaleRecord.exception(
+             resource: resource,
+             filter: %{id: bulk_action.id, status: @retryable, user_id: owner}
+           )
+         )}
+    end
   end
 
   defp all_known(corrections, rows) do
