@@ -113,6 +113,7 @@ Oban's Lifeline plugin should run too: a job orphaned by a dead node stays
 
 | Key | Default | |
 |---|---|---|
+| `:oban` | `Oban` | the Oban instance's name, for a host that names its own; it must be running |
 | `:queue` | `:bulk_actions` | the Oban queue |
 | `:default_chunk_size` | `50` | rows a per-row bulk action commits per batch |
 | `:atomic_mode_max_rows` | `10_000` | the cap on an all-or-nothing bulk action |

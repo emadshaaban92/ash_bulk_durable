@@ -81,7 +81,12 @@ defmodule AshBulkDurable.Core.RescueStuckBulkActions do
   def worker_lost?(%{oban_job_id: nil}), do: true
 
   def worker_lost?(%{oban_job_id: job_id}) do
-    case Oban.config().repo.get(Oban.Job, job_id) do
+    # Through `Oban.Repo` so the instance's `:prefix` applies: a bare
+    # `repo.get` reads `public.oban_jobs`, misses every job of a prefixed
+    # instance and condemns each live bulk action as lost.
+    oban_conf = Oban.config(AshBulkDurable.Core.oban())
+
+    case Oban.Repo.get(oban_conf, Oban.Job, job_id) do
       nil -> true
       %Oban.Job{state: "executing"} = job -> Heartbeat.silent?(job)
       %Oban.Job{state: state} -> state in ~w(completed discarded cancelled)
@@ -127,7 +132,7 @@ defmodule AshBulkDurable.Core.RescueStuckBulkActions do
   end
 
   defp cancel_job(%{oban_job_id: nil}), do: :ok
-  defp cancel_job(%{oban_job_id: job_id}), do: Oban.cancel_job(job_id)
+  defp cancel_job(%{oban_job_id: job_id}), do: Oban.cancel_job(AshBulkDurable.Core.oban(), job_id)
 
   defp in_flight_bulk_actions do
     case AshBulkDurable.Core.config(:bulk_action_resource) do
