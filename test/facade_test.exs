@@ -6,7 +6,6 @@ defmodule AshBulkDurable.FacadeTest do
   sends.
   """
   use AshBulkDurable.DataCase, async: true
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
 
   require Ash.Query
 
@@ -51,8 +50,10 @@ defmodule AshBulkDurable.FacadeTest do
 
   defp run!(bulk_action) do
     assert bulk_action.status == :queued
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
-    {Ash.get!(BulkAction, bulk_action.id, authorize?: false), rows(bulk_action)}
+    assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
+
+    {Ash.get!(BulkAction, bulk_action.id, authorize?: false, load: [:rows_done, :rows_pending]),
+     rows(bulk_action)}
   end
 
   defp rows(bulk_action) do
@@ -273,7 +274,7 @@ defmodule AshBulkDurable.FacadeTest do
       corrected = Enum.map(sheet.rows, &Map.put(&1, "email", to_string(person.email)))
 
       {:ok, retried} = AshBulkDurable.retry(bulk_action, %{sheet | rows: corrected}, scope: scope)
-      assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+      assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
       assert Ash.reload!(retried, authorize?: false).status == :completed
     end
 
@@ -314,7 +315,7 @@ defmodule AshBulkDurable.FacadeTest do
         AshBulkDurable.destroy_many(sheet, Branch, :destroy, scope: scope)
       end
 
-      assert %{success: 0} = Oban.drain_queue(queue: :bulk_actions)
+      assert %{success: 0} = AshBulkDurable.Core.Worker.drain()
       assert exists?(branch, user)
       refute hd(reloaded([branch], user)).name == "Renamed"
     end
@@ -498,8 +499,10 @@ defmodule AshBulkDurable.FacadeTest do
 
       # A selected record stays the one selected, so nothing moves the row on.
       {:ok, _retried} = AshBulkDurable.retry(bulk_action, scope: ctx.scope)
-      assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
-      bulk_action = Ash.get!(BulkAction, bulk_action.id, authorize?: false)
+      assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
+
+      bulk_action =
+        Ash.get!(BulkAction, bulk_action.id, authorize?: false, load: [:rows_done, :rows_pending])
 
       assert bulk_action.status == :completed_with_errors
       assert Ash.reload!(failed, authorize?: false).status == :failed
@@ -766,7 +769,9 @@ defmodule AshBulkDurable.FacadeTest do
                AshBulkDurable.abandon(finished, scope: ctx.scope)
 
       # Final: an abandoned bulk action is not abandoned again.
-      cancelled = Ash.get!(BulkAction, finished.id, authorize?: false)
+      cancelled =
+        Ash.get!(BulkAction, finished.id, authorize?: false, load: [:rows_done, :rows_pending])
+
       assert {:error, %Ash.Error.Invalid{}} = AshBulkDurable.abandon(cancelled, scope: ctx.scope)
     end
   end
@@ -785,7 +790,9 @@ defmodule AshBulkDurable.FacadeTest do
       assert failed.status == :failed
 
       assert {:error, %Ash.Error.Invalid{}} = AshBulkDurable.abandon(failed, scope: ctx.scope)
-      assert Ash.get!(BulkAction, failed.id, authorize?: false).status == :failed
+
+      assert Ash.get!(BulkAction, failed.id, authorize?: false, load: [:rows_done, :rows_pending]).status ==
+               :failed
     end
   end
 end

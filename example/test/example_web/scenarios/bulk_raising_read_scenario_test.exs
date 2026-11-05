@@ -12,7 +12,6 @@ defmodule ExampleWeb.Scenarios.BulkRaisingReadScenarioTest do
   `async: false`: the outage is application-wide.
   """
   use ExampleWeb.ConnCase, async: false
-  use Oban.Testing, repo: Example.Repo
 
   import Phoenix.LiveViewTest
 
@@ -161,6 +160,8 @@ defmodule ExampleWeb.Scenarios.BulkRaisingReadScenarioTest do
     |> render_upload("corrections.csv")
   end
 
-  defp reload(%BulkAction{id: id}), do: Ash.get!(BulkAction, id, authorize?: false)
-  defp drain, do: Oban.drain_queue(queue: :bulk_actions)
+  defp reload(%BulkAction{id: id}),
+    do: Ash.get!(BulkAction, id, authorize?: false, load: [:rows_done, :rows_pending])
+
+  defp drain, do: AshBulkDurable.Core.Worker.drain()
 end

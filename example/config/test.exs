@@ -40,9 +40,14 @@ config :phoenix_live_view,
 config :phoenix,
   sort_verified_routes_query_params: true
 
-config :example, Oban, testing: :manual
+config :example, :bulk_poller?, false
 
-config :ash_bulk_durable, phase1_concurrency: 1
+# Every committed chunk tells the page, so a test sees each step. Tests run
+# bulk actions with `Worker.drain/0`, not the poller.
+config :ash_bulk_durable,
+  phase1_concurrency: 1,
+  progress_interval: 0,
+  warn_without_poller: false
 
 config :ash, warn_on_transaction_hooks?: false
 

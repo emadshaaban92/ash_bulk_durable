@@ -1,25 +1,23 @@
 defmodule ExampleWeb.Scenarios.BulkLostWorkerScenarioTest do
   @moduledoc """
-  The node running a bulk action dies. Nothing moves its Oban job off
-  `:executing`, so the run looks alive until the job's silence gives it away:
-  then the page says it stopped, the owner's slot is free, and a retry runs only
-  what the dead node left. A slow run that is still beating is left alone.
+  The node running a bulk action dies. Its claim holds the bulk action only
+  until its lease runs out: then any node's next poll claims it again and the
+  rows resume where the dead node left them, none run twice. A bulk action
+  whose claims keep dying is failed for its owner to retry. A slow run keeps
+  renewing its lease and is left alone; a run that lost its claim stops.
 
-  The worker is killed for real, after a chunk committed, and the job's silence
-  stands in for five minutes passing. Pulling the plug on a real node is the
-  one thing a test can't do; that was done by hand (`kill -9`).
+  The worker is killed for real, after a chunk committed, and an expired
+  lease stands in for a minute passing. Pulling the plug on a real node is
+  the one thing a test can't do; that was done by hand (`kill -9`).
 
   `async: false`: telemetry handlers and the engine's config are global.
   """
   use ExampleWeb.ConnCase, async: false
-  use Oban.Testing, repo: Example.Repo
 
   import Example.Test.StorageHelpers
-  import Ecto.Query
-  import ExUnit.CaptureLog
   import Phoenix.LiveViewTest
 
-  alias AshBulkDurable.Core.{RescueStuckBulkActions, Worker}
+  alias AshBulkDurable.Core.{Lease, Worker}
   alias Example.BulkActions.BulkAction
   alias Example.Test.Asset
   alias Example.Repo
@@ -39,7 +37,7 @@ defmodule ExampleWeb.Scenarios.BulkLostWorkerScenarioTest do
     put_config(:default_chunk_size, 1)
   end
 
-  test "a sales officer watching the page sees the cron free a dead run, and the retry finishes it",
+  test "a sales officer watching the page sees a dead run resume, no row run twice",
        %{conn: conn, super_user: super_user} do
     organization = RoleTestHelpers.create_organization(super_user)
 
@@ -56,30 +54,22 @@ defmodule ExampleWeb.Scenarios.BulkLostWorkerScenarioTest do
       #{Enum.map_join(serial, "\n", &"#{&1},EN#{&1},truck,Isuzu")}
       """)
 
-    job = job_running(bulk_action)
-    die(job, [:ash_bulk_durable, :chunk, :stop])
+    die(bulk_action, [:ash_bulk_durable, :chunk, :stop])
 
-    # Dead, but nobody can know yet: a run this recent keeps its slot.
-    assert :ok = perform_job(RescueStuckBulkActions, %{})
+    # Dead, but nobody can know yet: its lease still holds it.
+    assert :skipped = Worker.run_now(bulk_action.id)
     assert view |> element("#bulk-action-panel") |> render() =~ "1 of 3 rows done"
-    assert %{status: :running, rows_done: 1} = reload(bulk_action)
+    assert %{status: :running, rows_done: 1, attempts: 1} = reload(bulk_action)
 
-    silent_for_ages(job)
-    assert :ok = perform_job(RescueStuckBulkActions, %{})
+    lease_runs_out(bulk_action)
+    assert %{success: 1, failure: 0} = Worker.drain()
 
-    html = render(view)
-    assert html =~ @stopped
-    assert html =~ @go_to_retry
-    refute html =~ "start it again with the same settings"
-    assert %{state: "cancelled"} = Repo.reload!(job)
-
-    retry(view, bulk_action)
-    assert %{status: :completed, rows_done: 3} = reload(bulk_action)
-
+    assert render(view) =~ "Completed"
+    assert %{status: :completed, rows_done: 3, attempts: 2} = reload(bulk_action)
     assert serial |> Enum.map(&asset_count(&1, officer)) == [1, 1, 1]
   end
 
-  test "a super user coming back to the page frees a dead run without waiting for the cron",
+  test "a super user coming back to the page finds the dead run where it stopped",
        %{conn: conn, super_user: super_user} do
     codes = Enum.map(1..3, fn _n -> "L#{:erlang.unique_integer([:positive])}" end)
 
@@ -89,20 +79,18 @@ defmodule ExampleWeb.Scenarios.BulkLostWorkerScenarioTest do
       #{Enum.map_join(codes, "\n", &"#{&1},Name #{&1},اسم #{&1}")}
       """)
 
-    job = job_running(bulk_action)
-    die(job, [:ash_bulk_durable, :chunk, :stop])
-    silent_for_ages(job)
+    die(bulk_action, [:ash_bulk_durable, :chunk, :stop])
+    lease_runs_out(bulk_action)
 
     {:ok, view, html} = conn |> login_as(super_user) |> live(~p"/bulk")
-    assert html =~ @stopped
+    assert html =~ "1 of 3 rows done"
 
-    retry(view, bulk_action)
-    assert %{status: :completed, rows_done: 3} = reload(bulk_action)
-
+    assert %{success: 1, failure: 0} = Worker.drain()
+    assert render(view) =~ "Completed"
     assert codes |> Enum.map(&region_count(&1, super_user)) == [1, 1, 1]
   end
 
-  test "all or nothing: a run dead before it wrote leaves the owner free to submit another",
+  test "all or nothing: a run dead before it wrote runs again whole",
        %{conn: conn, super_user: super_user} do
     code = "A#{:erlang.unique_integer([:positive])}"
 
@@ -112,81 +100,90 @@ defmodule ExampleWeb.Scenarios.BulkLostWorkerScenarioTest do
         super_user,
         "region",
         "code,name,native_name\n#{code},N #{code},ا #{code}\n",
-        %{
-          "all_or_nothing" => "on"
-        }
+        %{"all_or_nothing" => "on"}
       )
 
-    job = job_running(bulk_action)
-    die(job, [:ash_bulk_durable, :chunk, :start])
-    silent_for_ages(job)
-
-    assert :ok = perform_job(RescueStuckBulkActions, %{})
-    assert render(view) =~ @stopped
+    die(bulk_action, [:ash_bulk_durable, :chunk, :start])
     assert region_count(code, super_user) == 0
 
-    view |> element("#bulk-action-panel button", "Dismiss") |> render_click()
+    lease_runs_out(bulk_action)
+    assert %{success: 1, failure: 0} = Worker.drain()
 
-    {_view, next} =
-      submit(conn, super_user, "region", "code,name,native_name\n#{code},N #{code},ا #{code}\n")
-
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
-    assert %{status: :completed} = reload(next)
+    assert render(view) =~ "Completed"
     assert region_count(code, super_user) == 1
   end
 
-  test "a slow run outlasting the limit keeps beating, and the cron leaves it alone",
+  test "a run whose claims keep dying is failed, and a retry finishes it",
        %{conn: conn, super_user: super_user} do
-    put_config(:worker_lost_after, 300)
+    put_config(:max_attempts, 1)
+    codes = Enum.map(1..2, fn _n -> "F#{:erlang.unique_integer([:positive])}" end)
+
+    {view, bulk_action} =
+      submit(conn, super_user, "region", """
+      code,name,native_name
+      #{Enum.map_join(codes, "\n", &"#{&1},Name #{&1},اسم #{&1}")}
+      """)
+
+    die(bulk_action, [:ash_bulk_durable, :chunk, :stop])
+    lease_runs_out(bulk_action)
+
+    assert %{success: 0, failure: 0} = Worker.drain()
+    assert [_failed] = Lease.fail_exhausted()
+
+    html = render(view)
+    assert html =~ @stopped
+    assert html =~ @go_to_retry
+    refute html =~ "start it again with the same settings"
+
+    retry(view, bulk_action)
+    assert %{status: :completed, rows_done: 2} = reload(bulk_action)
+    assert codes |> Enum.map(&region_count(&1, super_user)) == [1, 1]
+  end
+
+  test "a slow run outlasting its lease renews it, and no other claim takes it",
+       %{conn: conn, super_user: super_user} do
+    put_config(:lease_duration, 300)
     code = "S#{:erlang.unique_integer([:positive])}"
 
     {view, bulk_action} =
       submit(conn, super_user, "region", "code,name,native_name\n#{code},N #{code},ا #{code}\n")
 
-    job = job_running(bulk_action)
+    {:ok, claimed} = Lease.claim_one(bulk_action.id)
     attach([:ash_bulk_durable, :chunk, :start], %{id: bulk_action.id}, {Process, :sleep, [900]})
-    {worker, monitor} = spawn_monitor(fn -> Worker.perform(job) end)
+    {worker, monitor} = spawn_monitor(fn -> Worker.run(claimed) end)
 
     Process.sleep(600)
-    assert :ok = perform_job(RescueStuckBulkActions, %{})
-    assert reload(bulk_action).status == :running
-    assert Process.alive?(worker)
+    assert :skipped = Worker.run_now(bulk_action.id)
+    assert reload(bulk_action).claim_token == claimed.claim_token
 
     assert_receive {:DOWN, ^monitor, :process, ^worker, :normal}, 5000
     assert render(view) =~ "Completed"
     assert %{status: :completed} = reload(bulk_action)
   end
 
-  test "a beat that can't be written costs the run nothing",
+  test "a run whose claim another took over stops",
        %{conn: conn, super_user: super_user} do
-    put_config(:worker_lost_after, 100)
+    put_config(:lease_duration, 300)
+    code = "T#{:erlang.unique_integer([:positive])}"
 
-    for {break_the_beat, reason} <- [
-          {&delete_job/1, "missed a heartbeat: :locked_or_not_found"},
-          {&raising_beat/1, "missed a heartbeat: %BadMapError"}
-        ] do
-      code = "B#{:erlang.unique_integer([:positive])}"
+    {_view, bulk_action} =
+      submit(conn, super_user, "region", "code,name,native_name\n#{code},N #{code},ا #{code}\n")
 
-      {_view, bulk_action} =
-        submit(
-          conn,
-          super_user,
-          "region",
-          "code,name,native_name\n#{code},N #{code},ا #{code}\n"
-        )
+    {:ok, stale} = Lease.claim_one(bulk_action.id)
+    attach([:ash_bulk_durable, :chunk, :start], %{id: bulk_action.id}, {Process, :sleep, [900]})
+    {worker, monitor} = spawn_monitor(fn -> Worker.run(stale) end)
 
-      job = bulk_action |> job_running() |> break_the_beat.()
-      attach([:ash_bulk_durable, :chunk, :start], %{id: bulk_action.id}, {Process, :sleep, [100]})
+    # As though the stale run's renewals had stopped reaching the database.
+    lease_runs_out(bulk_action)
+    {:ok, current} = Lease.claim_one(bulk_action.id)
 
-      log =
-        capture_log(fn ->
-          {worker, monitor} = spawn_monitor(fn -> Worker.perform(job) end)
-          assert_receive {:DOWN, ^monitor, :process, ^worker, :normal}, 5000
-        end)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, {:lease_lost, _id}}, 5000
+    assert region_count(code, super_user) == 0
+    assert %{status: :running} = reload(bulk_action)
 
-      assert log =~ "Bulk action job #{job.id} #{reason}"
-      assert %{status: :completed} = reload(bulk_action)
-    end
+    :ok = Worker.run(current)
+    assert %{status: :completed} = reload(bulk_action)
+    assert region_count(code, super_user) == 1
   end
 
   @doc false
@@ -195,19 +192,12 @@ defmodule ExampleWeb.Scenarios.BulkLostWorkerScenarioTest do
 
   def run_for(_event, _measurements, _metadata, _config), do: :ok
 
-  # Oban, had it picked the job up: no queue runs in a test.
-  defp job_running(bulk_action) do
-    from(j in Oban.Job, where: j.id == ^bulk_action.oban_job_id)
-    |> Repo.update_all(set: [state: "executing", attempted_at: DateTime.utc_now()])
+  # A poll's claim, run in a process killed at `event`.
+  defp die(bulk_action, event) do
+    {:ok, claimed} = Lease.claim_one(bulk_action.id)
+    handler = attach(event, %{id: bulk_action.id}, {__MODULE__, :kill_self, []})
 
-    Repo.get!(Oban.Job, bulk_action.oban_job_id)
-  end
-
-  defp die(job, event) do
-    %{"bulk_action_id" => id} = job.args
-    handler = attach(event, %{id: id}, {__MODULE__, :kill_self, []})
-
-    {worker, monitor} = spawn_monitor(fn -> Worker.perform(job) end)
+    {worker, monitor} = spawn_monitor(fn -> Worker.run(claimed) end)
     assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}, 5000
     :telemetry.detach(handler)
   end
@@ -222,15 +212,13 @@ defmodule ExampleWeb.Scenarios.BulkLostWorkerScenarioTest do
     handler
   end
 
-  defp delete_job(job), do: Repo.delete!(job)
-
-  # A database that is really down keeps a beat in Oban's own retries for
-  # seconds before it raises.
-  defp raising_beat(job), do: %{job | meta: nil}
-
-  defp silent_for_ages(job) do
-    from(j in Oban.Job, where: j.id == ^job.id)
-    |> Repo.update_all(set: [attempted_at: DateTime.add(DateTime.utc_now(), -6, :minute)])
+  defp lease_runs_out(bulk_action) do
+    Repo.query!(
+      "UPDATE bulk_actions SET lease_until = now() - interval '1 second' WHERE id = $1",
+      [
+        Ecto.UUID.dump!(bulk_action.id)
+      ]
+    )
   end
 
   defp retry(view, bulk_action) do
@@ -247,7 +235,7 @@ defmodule ExampleWeb.Scenarios.BulkLostWorkerScenarioTest do
     |> render_upload("corrections.csv")
 
     view |> element("#bulk-action-panel button", "Retry failed rows") |> render_click()
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert %{success: 1, failure: 0} = Worker.drain()
   end
 
   defp submit(conn, user, resource, csv, form_params \\ %{}) do
@@ -276,7 +264,8 @@ defmodule ExampleWeb.Scenarios.BulkLostWorkerScenarioTest do
     {view, bulk_action}
   end
 
-  defp reload(%BulkAction{id: id}), do: Ash.get!(BulkAction, id, authorize?: false)
+  defp reload(%BulkAction{id: id}),
+    do: Ash.get!(BulkAction, id, authorize?: false, load: [:rows_done, :rows_pending])
 
   defp region_count(code, user) do
     Region |> Ash.Query.filter(code == ^code) |> Ash.count!(actor: user)

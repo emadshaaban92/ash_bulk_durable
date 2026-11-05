@@ -7,7 +7,6 @@ defmodule ExampleWeb.Scenarios.BulkPrimaryKeyScenarioTest do
   is corrected on the errors sheet.
   """
   use ExampleWeb.ConnCase, async: true
-  use Oban.Testing, repo: Example.Repo
 
   import Phoenix.LiveViewTest
 
@@ -236,6 +235,8 @@ defmodule ExampleWeb.Scenarios.BulkPrimaryKeyScenarioTest do
     )
   end
 
-  defp reload(%BulkAction{id: id}), do: Ash.get!(BulkAction, id, authorize?: false)
-  defp drain, do: Oban.drain_queue(queue: :bulk_actions)
+  defp reload(%BulkAction{id: id}),
+    do: Ash.get!(BulkAction, id, authorize?: false, load: [:rows_done, :rows_pending])
+
+  defp drain, do: AshBulkDurable.Core.Worker.drain()
 end

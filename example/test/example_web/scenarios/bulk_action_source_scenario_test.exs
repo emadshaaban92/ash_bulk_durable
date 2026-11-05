@@ -45,7 +45,7 @@ defmodule ExampleWeb.Scenarios.BulkActionSourceScenarioTest do
         scope: Example.Scope.new(actor: super_user)
       )
 
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
 
     session
     |> visit(~p"/bulk")

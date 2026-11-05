@@ -1,9 +1,10 @@
 defmodule AshBulkDurable.Core do
   @moduledoc """
   The engine's core: durable bulk actions kept as `BulkAction` and `Row`
-  records and run by an Oban worker. A row is a target and an input; where
-  the rows came from is the caller's. Ash, Oban and Postgres only; nothing
-  here names a layer above it.
+  records. The `bulk_actions` table is the queue: `AshBulkDurable.Core.Poller`
+  claims them and `AshBulkDurable.Core.Worker` runs them. A row is a target
+  and an input; where the rows came from is the caller's. Ash and Postgres
+  only; nothing here names a layer above it.
 
   ## Configuration
 
@@ -19,7 +20,8 @@ defmodule AshBulkDurable.Core do
 
   @doc """
   Creates a bulk action running `action` of `resource` over `rows`, writing
-  the bulk action, its rows and its job in one transaction. A row is
+  the bulk action, `:queued`, and its rows in one transaction; a poller
+  claims it from there. A row is
   `%{target:, input:, metadata:, error:}`, every key optional (see
   `AshBulkDurable.Core.Runner`). Returns `{:ok, bulk_action}`, or `{:error,
   error}` with nothing written.
@@ -66,7 +68,18 @@ defmodule AshBulkDurable.Core do
       action: :create,
       authorize?: false
     )
+    |> nudge_poller()
   end
+
+  # Queued and committed (unless the caller's own transaction holds it, and
+  # then the next poll claims it): this node's poller claims it now.
+  @doc false
+  def nudge_poller({:ok, _bulk_action} = result) do
+    AshBulkDurable.Core.Poller.nudge()
+    result
+  end
+
+  def nudge_poller(result), do: result
 
   defp action!(resource, action) do
     unless Ash.Resource.Info.resource?(resource),
@@ -111,12 +124,4 @@ defmodule AshBulkDurable.Core do
   @doc "Reads one `ash_bulk_durable` config key."
   @spec config(atom(), term()) :: term()
   def config(key, default \\ nil), do: Application.get_env(:ash_bulk_durable, key, default)
-
-  @doc """
-  The name of the Oban instance the engine enqueues, reads and cancels its
-  jobs through: `:oban` in the config, `Oban` by default. Every job call goes
-  through that instance's config, so its `:prefix` is honoured.
-  """
-  @spec oban() :: Oban.name()
-  def oban, do: config(:oban, Oban)
 end

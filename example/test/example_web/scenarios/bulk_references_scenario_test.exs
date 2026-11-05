@@ -126,7 +126,7 @@ defmodule ExampleWeb.Scenarios.BulkReferencesScenarioTest do
   end
 
   defp drain(session) do
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
     session
   end
 

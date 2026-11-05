@@ -23,25 +23,27 @@ defmodule AshBulkDurable.Core.Changes.ApplyMarkFinished do
   :completed_with_errors]` — the same set that holds the user's
   one-unresolved slot. A call on an already-terminal bulk action (`:completed`,
   `:failed`, `:cancelled`) is rejected as `StaleRecord` rather than
-  silently overwriting the verdict. This closes the worker-vs-rescue
-  race: if the rescue cron flips a stuck `:running` bulk action to
-  `:failed`/`worker_lost` and a delayed worker then tries to finalize
-  `:completed`, the worker's UPDATE no-ops.
+  silently overwriting the verdict. The worker also fences its calls on its
+  claim token (`AshBulkDurable.Core.Lease.fenced/2`), so a run that lost its
+  claim cannot finalize over the run that took it over.
 
   ## Eager staging purge on `:cancelled`
 
   The Abandon path flips a `:completed_with_errors` bulk action to
-  `:cancelled` long after the worker exited, so nothing on the bulk action's own
-  code path can drop its staged files. This change enqueues a
-  one-shot `AshBulkDurable.Core.PurgeStaleStaging` job for that case. The enqueue
-  is best-effort — a failed insert never blocks the cancel, because the
-  daily sweep catches the `:cancelled` bulk action on its next pass. Other
+  `:cancelled` long after the worker exited, so nothing on the bulk action's
+  own code path can drop its staged files. This change deletes them once the
+  cancel commits (`AshBulkDurable.Core.PurgeStaleStaging.delete_staging/1`).
+  A cancel made inside a caller's own transaction hasn't committed when its
+  own action ends, and could still roll back: its files are left for the
+  sweep instead. It is best-effort — a failed delete never fails the cancel, because the
+  staging sweep catches the `:cancelled` bulk action on its next pass. Other
   terminal flips (`:completed`, `:failed`, `:completed_with_errors`) are
-  handled by the worker's own `maybe_delete_staging/1`, so only
-  `:cancelled` enqueues here.
+  handled by the worker's own `maybe_delete_staging/1`, so only `:cancelled`
+  purges here.
   """
   use Ash.Resource.Change
   require Ash.Expr
+  require Logger
 
   @impl true
   def change(changeset, _opts, _context) do
@@ -53,23 +55,38 @@ defmodule AshBulkDurable.Core.Changes.ApplyMarkFinished do
     |> Ash.Changeset.force_change_attribute(:status, status)
     |> Ash.Changeset.force_change_attribute(:result, result_blob)
     |> Ash.Changeset.force_change_attribute(:error, error)
-    |> Ash.Changeset.force_change_attribute(:finished_at, DateTime.utc_now())
-    |> maybe_enqueue_staging_purge(status)
+    # The database's clock, the one `started_at` is stamped with.
+    |> Ash.Changeset.atomic_update(
+      :finished_at,
+      Ash.Expr.expr(fragment("(now() AT TIME ZONE 'utc')"))
+    )
+    |> maybe_purge_staging(status)
   end
 
-  defp maybe_enqueue_staging_purge(changeset, :cancelled) do
-    Ash.Changeset.after_action(changeset, fn _changeset, bulk_action ->
-      _ =
-        Oban.insert(
-          AshBulkDurable.Core.oban(),
-          AshBulkDurable.Core.PurgeStaleStaging.new(%{bulk_action_id: bulk_action.id})
-        )
+  defp maybe_purge_staging(changeset, :cancelled) do
+    Ash.Changeset.after_transaction(changeset, fn
+      changeset, {:ok, bulk_action} ->
+        unless in_outer_transaction?(changeset), do: purge_staging(bulk_action)
+        {:ok, bulk_action}
 
-      {:ok, bulk_action}
+      _changeset, error ->
+        error
     end)
   end
 
-  defp maybe_enqueue_staging_purge(changeset, _status), do: changeset
+  defp maybe_purge_staging(changeset, _status), do: changeset
+
+  defp in_outer_transaction?(changeset),
+    do: AshPostgres.DataLayer.Info.repo(changeset.resource, :mutate).in_transaction?()
+
+  defp purge_staging(bulk_action) do
+    AshBulkDurable.Core.PurgeStaleStaging.delete_staging(bulk_action)
+  rescue
+    exception ->
+      Logger.warning(
+        "bulk action #{bulk_action.id} kept its staged files: #{Exception.message(exception)}"
+      )
+  end
 
   defp interpret(:completed), do: {:completed, %{outcome: "completed"}, nil}
 

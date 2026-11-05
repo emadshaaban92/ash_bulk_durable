@@ -32,6 +32,7 @@ defmodule ExampleWeb.Bulk.Components.Page do
   attr :bulk_action_status, :atom, default: :ready
   attr :errors_sheet, :any, default: nil
   attr :failed_preview, :list, default: []
+  attr :uncommitted_rows, :integer, default: nil
   attr :retry_filename, :string, default: nil
   attr :params, :map, default: %{}
 
@@ -52,6 +53,7 @@ defmodule ExampleWeb.Bulk.Components.Page do
           uploads={@uploads}
           errors_sheet={@errors_sheet}
           failed_preview={@failed_preview}
+          uncommitted_rows={@uncommitted_rows}
           retry_filename={@retry_filename}
         />
       <% @params["bulk_action"] -> %>

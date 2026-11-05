@@ -29,13 +29,16 @@ defmodule ExampleWeb.Bulk.LiveView do
 
   Submitting a bulk action never runs the row loop inline.
   Instead the LV persists an `BulkAction` (config `:bulk_action_resource`)
-  via `start_async/3` and hands the actual bulk action to the Oban
-  `AshBulkDurable.Core.Worker`. The LV then subscribes to the bulk action's PubSub
-  topic and re-renders progress as the worker bumps `rows_done` and reaches
-  a terminal state. On mount, a logged-in user with an unresolved bulk action —
-  `:queued`, `:running`, or parked in `:completed_with_errors` — is
-  reattached to it (and a provably-dead `:queued`/`:running` bulk action is
-  flipped to `:failed` so the one-unresolved slot frees up). An errored
+  via `start_async/3`, `:queued`, for `AshBulkDurable.Core.Poller` to claim
+  and run. The LV then subscribes to the bulk action's PubSub topic and
+  reads the bulk action again whenever the worker commits rows or it changes
+  state, so `rows_done` (its succeeded rows, counted) moves as rows commit.
+  An all-or-nothing run also says how many rows its open transaction has
+  processed, a hint kept only while the page is open. On mount, a logged-in
+  user with an unresolved bulk action — `:queued`, `:running`, or parked in
+  `:completed_with_errors` — is reattached to it. A run whose node died is
+  resumed by another node once its lease runs out, so there is nothing to
+  rescue here. An errored
   bulk action must be retried to completion or abandoned before a new bulk action can
   start. Creates, updates and destroys all run this way.
   """
@@ -142,6 +145,7 @@ defmodule ExampleWeb.Bulk.LiveView do
       |> assign(
         bulk_action_status: :ready,
         bulk_action: nil,
+        uncommitted_rows: nil,
         errors_sheet: nil,
         failed_preview: []
       )
@@ -401,27 +405,37 @@ defmodule ExampleWeb.Bulk.LiveView do
   def on_handle_async(_name, _result, socket), do: {:noreply, socket}
 
   @doc false
-  # `Ash.Notifier.PubSub` (configured on `BulkAction`) broadcasts each update
-  # through the host endpoint, so subscribers receive a
-  # `%Phoenix.Socket.Broadcast{}` wrapping the notification. Replace the
-  # in-flight bulk action assign with the fresh row — but only while we still hold a
-  # matching bulk action, so a stray notification can't re-show a panel the user
-  # just dismissed.
+  # Two kinds of message arrive on the bulk action's topic through the host
+  # endpoint, each a `%Phoenix.Socket.Broadcast{}`: `Ash.Notifier.PubSub`
+  # (configured on `BulkAction`) wraps each update of the bulk action, and the
+  # worker's `"progress"` (`AshBulkDurable.Core.Progress`) says rows were
+  # committed, or how far an all-or-nothing transaction has got. Either way the
+  # bulk action is read again, its rows counted — but only while we still
+  # hold a matching bulk action, so a stray message can't re-show a panel the
+  # user just dismissed.
   def on_handle_info(
-        %Phoenix.Socket.Broadcast{payload: %Ash.Notifier.Notification{data: data}},
+        %Phoenix.Socket.Broadcast{payload: %Ash.Notifier.Notification{data: %{id: id}}},
+        socket
+      ),
+      do: {:noreply, refresh_bulk_action(socket, id)}
+
+  def on_handle_info(
+        %Phoenix.Socket.Broadcast{
+          event: "progress",
+          payload: %{bulk_action_id: id, committed: false, rows_processed: processed} = hint
+        },
         socket
       ) do
-    current = socket.assigns[:bulk_action]
-    bulk_action_resource = AshBulkDurable.config(:bulk_action_resource)
-
-    if (not is_nil(bulk_action_resource) and is_struct(data, bulk_action_resource) and current) &&
-         current.id == data.id do
-      {:noreply,
-       socket |> assign(:bulk_action, data) |> assign(:failed_preview, failed_preview(data))}
-    else
-      {:noreply, socket}
-    end
+    if attached?(socket, id) and current_run?(socket, hint),
+      do: {:noreply, assign(socket, :uncommitted_rows, processed)},
+      else: {:noreply, socket}
   end
+
+  def on_handle_info(
+        %Phoenix.Socket.Broadcast{event: "progress", payload: %{bulk_action_id: id}},
+        socket
+      ),
+      do: {:noreply, refresh_bulk_action(socket, id)}
 
   def on_handle_info(_msg, socket), do: {:noreply, socket}
 
@@ -481,7 +495,7 @@ defmodule ExampleWeb.Bulk.LiveView do
           ngettext(
             "Reopened %{count} row for retry.",
             "Reopened %{count} rows for retry.",
-            retried.total_rows - retried.rows_done
+            retried.total_rows - Ash.load!(retried, :rows_done, authorize?: false).rows_done
           )
         )
 
@@ -565,8 +579,8 @@ defmodule ExampleWeb.Bulk.LiveView do
 
   # Stage the durable bulk action off the LV process: the sheet layer maps
   # every row to its target and input, then one transaction wraps the bulk
-  # action insert + its rows + its Oban job, so a `:queued` bulk action
-  # without a job is structurally impossible.
+  # action insert + its rows, so a `:queued` bulk action always has every
+  # row to run.
   defp start_persist(socket, options, uploaded_file, fields, params) do
     %{resource: resource, action: action} = options
 
@@ -611,7 +625,7 @@ defmodule ExampleWeb.Bulk.LiveView do
   defp maybe_attach_unresolved_bulk_action(socket) do
     with true <- connected?(socket),
          bulk_action when not is_nil(bulk_action) <- fetch_unresolved_bulk_action(socket) do
-      attach_bulk_action(socket, rescue_if_stuck(bulk_action))
+      attach_bulk_action(socket, bulk_action)
     else
       _ -> socket
     end
@@ -631,16 +645,45 @@ defmodule ExampleWeb.Bulk.LiveView do
     end
   end
 
-  # Mount-time check: if a `:queued`/`:running` bulk action's Oban job is
-  # in a terminal state (or its row is gone), the worker is provably dead.
-  # Flip the bulk action to `:failed` so the one-unresolved slot frees up and the
-  # user can submit afresh without waiting for the rescue cron. A parked
-  # `:completed_with_errors` bulk action passes through untouched — its job is
-  # legitimately terminal. The detection + flip live in
-  # `AshBulkDurable.Core.RescueStuckBulkActions` so the lazy (mount) and eager (cron)
-  # paths can never disagree on what "worker lost" means.
-  defp rescue_if_stuck(bulk_action),
-    do: AshBulkDurable.Core.RescueStuckBulkActions.rescue_if_stuck(bulk_action)
+  # A hint from a run that lost its claim, still going on another node, would
+  # make the count jump about: only the claim the page knows is shown. Every
+  # claim resets `started_at`, which the page learns from the claim's own
+  # `"progress"` broadcast.
+  defp current_run?(socket, %{started_at: started_at}),
+    do: socket.assigns.bulk_action.started_at == started_at
+
+  defp current_run?(_socket, _hint), do: true
+
+  defp attached?(socket, id) do
+    case socket.assigns[:bulk_action] do
+      %{id: ^id} -> true
+      _other -> false
+    end
+  end
+
+  # Reads the attached bulk action again, so its row counts are the committed
+  # ones. The uncommitted hint only lives while the same run still runs: every
+  # claim resets `started_at`, so a run another node took over starts afresh.
+  defp refresh_bulk_action(socket, id) do
+    with true <- attached?(socket, id),
+         resource when not is_nil(resource) <- AshBulkDurable.config(:bulk_action_resource),
+         {:ok, fresh} <-
+           Ash.get(resource, id, authorize?: false, load: [:rows_done, :rows_pending]) do
+      same_run? =
+        fresh.status == :running and fresh.started_at == socket.assigns.bulk_action.started_at
+
+      socket
+      |> assign(:bulk_action, fresh)
+      |> assign(:failed_preview, failed_preview(fresh))
+      |> assign(:uncommitted_rows, if(same_run?, do: socket.assigns[:uncommitted_rows]))
+    else
+      _ -> socket
+    end
+  end
+
+  # The panel shows the counts, which a bulk action read elsewhere doesn't load.
+  defp with_counts(bulk_action),
+    do: Ash.load!(bulk_action, [:rows_done, :rows_pending], authorize?: false)
 
   defp attach_bulk_action(socket, bulk_action) do
     subscribe_to_bulk_action(bulk_action)
@@ -648,7 +691,8 @@ defmodule ExampleWeb.Bulk.LiveView do
     # async result held for a previous bulk action is stale. The retry stash is
     # cleared too: a different bulk action shouldn't carry a previously-staged file.
     socket
-    |> assign(:bulk_action, bulk_action)
+    |> assign(:bulk_action, with_counts(bulk_action))
+    |> assign(:uncommitted_rows, nil)
     |> assign(:errors_sheet, nil)
     |> assign(:failed_preview, failed_preview(bulk_action))
     |> assign(:retry_sheet, nil)

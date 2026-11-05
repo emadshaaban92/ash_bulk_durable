@@ -1,21 +1,40 @@
 defmodule AshBulkDurable.Core.Worker do
   @moduledoc """
-  Oban worker that drives a single `BulkAction` through phase 1
-  (resolving its rows' references) and phase 2 (the chunk loop).
+  Drives one claimed `BulkAction` through phase 1 (resolving its rows'
+  references) and phase 2 (the chunk loop). `AshBulkDurable.Core.Poller`
+  claims bulk actions and runs them here; `run_now/1` and `drain/0` run the
+  same path in the caller, for tests and scripts.
 
   ## Crash-resume
 
-  `max_attempts: 3` is safe because the row-state mutation IS the
-  pagination. Phase 1 reads `:next_pending_chunk` (rows still `:pending`;
-  a row holding no reference is stored `:resolved` and never read here)
-  and flips them to `:resolved`; phase 2 reads `:next_resolved_chunk`
-  (rows `:resolved` but not yet applied) and flips them to `:succeeded`.
-  A retry resumes at the next un-touched row in whichever phase it died
-  in — no row committed twice.
+  The row-state mutation IS the pagination. Phase 1 reads
+  `:next_pending_chunk` (rows still `:pending`; a row holding no reference
+  is stored `:resolved` and never read here) and flips them to `:resolved`;
+  phase 2 reads `:next_resolved_chunk` (rows `:resolved` but not yet
+  applied) and flips them to `:succeeded`. A later claim resumes at the next
+  un-touched row in whichever phase the last one died in — no row committed
+  twice.
 
-  A node that dies takes no attempt with it: its job stays `:executing`, the
-  run's `Heartbeat` stops, and `RescueStuckBulkActions` fails the bulk action
-  for its owner to retry, which resumes the same way.
+  A node that dies holds its claim only until its lease runs out
+  (`AshBulkDurable.Core.Lease`): the next poll on any node claims the bulk
+  action again and resumes it. After `:max_attempts` claims it is failed
+  `:worker_lost` instead, for its owner to retry, which resumes the same way.
+
+  ## Fencing
+
+  Every write to the bulk action filters on the claim token it was claimed
+  with. Every row write is a compare-and-set on the row's status
+  (`AshBulkDurable.Core.Changes.RequireStatus`), and confirms the claim
+  token still holds just before its transaction commits
+  (`AshBulkDurable.Core.Changes.RequireClaim` for one row,
+  `AshBulkDurable.Core.Changes.RunRow` for a chunk). A run that lost its
+  claim (its lease ran out while it still ran) writes nothing more: its row
+  write fails, the target writes in that transaction roll back with it, and
+  the run stops (`ClaimLostError`); its `mark_finished` matches no row.
+
+  A row write refused while this run's token still holds can only be one
+  already committing when the claim was taken; the step it happened in
+  starts again from the rows' status, a few times at most.
 
   ## Failure surface
 
@@ -25,8 +44,6 @@ defmodule AshBulkDurable.Core.Worker do
   - Staged-file download error, with a row left for a resolver → each such
     row fails alone (`StagedFileError`) and the rest run. All or nothing →
     `:mark_finished({:failed, %{reason: :staged_file_download_error, ...}})`.
-    Does NOT raise; we want a real terminal state, not three Oban retries →
-    rescue cron.
   - A resolver's `prepare/2` error for a chunk →
     `:mark_finished({:failed, %{reason: :resolver_prepare_error, ...}})`.
   - All-or-nothing phase 1 failure, or a row its caller already refused →
@@ -38,8 +55,16 @@ defmodule AshBulkDurable.Core.Worker do
     any row landed `:failed`.
 
   A row that raises, or outruns `:row_resolve_timeout` in phase 1, fails like
-  one that returns an error, in either phase and either mode. Only a raise from the worker's own reads and writes propagates
-  as a job failure, which is what triggers Oban's retry.
+  one that returns an error, in either phase and either mode. Only a raise
+  from the worker's own reads and writes ends the run: its lease is released
+  so a later poll claims it again after `Lease.backoff/1`, and on the last
+  attempt the bulk action is failed `:raised` with what was raised.
+
+  ## Progress
+
+  Nothing a chunk's transaction writes touches the bulk action's row; after
+  each chunk commits, the worker broadcasts through
+  `AshBulkDurable.Core.Progress` so a page recounts `rows_done`.
 
   ## Tenants
 
@@ -57,29 +82,11 @@ defmodule AshBulkDurable.Core.Worker do
   between download and that call, Briefly's `:DOWN` handler still
   cleans them up. Only a hard VM kill (`kill -9`, OOM-killer) can
   leak — at which point the OS tmp sweeper is the fallback.
-
-  ## Idempotency on terminal bulk actions
-
-  `perform/1` short-circuits to `:ok` when the bulk action is already in a
-  terminal state. This closes the window where an attempt's BEAM
-  process dies *after* `mark_finished` committed but *before* Oban
-  acked the job: Oban will retry, but the next attempt sees a
-  terminal bulk action and no-ops instead of re-running `mark_running`, which
-  has no filter of its own and would take it back to `:running`.
-
-  It does the same for a later attempt of a job the bulk action no longer
-  names. A retry enqueues a new job while an attempt of the old one can still
-  be waiting, and two would drive the same rows.
   """
-  # The queue is host-configurable at enqueue time through the
-  # `AshBulkDurable.Core.config/2` seam (see `AshBulkDurable.Core.Changes.EnqueueWorker`),
-  # which is the single source of truth for `ash_bulk_durable` config. This
-  # `:bulk_actions` literal is only the compile-time default Oban needs on
-  # the worker; the insert-time `queue:` override is what actually runs.
-  use Oban.Worker, queue: :bulk_actions, max_attempts: 3
 
   alias AshBulkDurable.Core.{
-    Heartbeat,
+    Lease,
+    Progress,
     Reference,
     Runner,
     StagedFileError,
@@ -87,33 +94,185 @@ defmodule AshBulkDurable.Core.Worker do
     StoredTerm
   }
 
+  require Ash.Expr
   require Ash.Query
   require Logger
 
   # A row's files run one after another, each an extraction and a PUT.
   @row_resolve_timeout :timer.minutes(5)
 
-  @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"bulk_action_id" => bulk_action_id}, attempt: attempt} = job) do
-    bulk_action = fetch_bulk_action!(bulk_action_id)
+  # Where `run/1` keeps the claim it runs under, for its row writes.
+  @claim_key {__MODULE__, :claim}
 
-    if terminal?(bulk_action.status) or superseded?(job, bulk_action) do
-      :ok
-    else
-      attempt(bulk_action, job, attempt)
+  # How often a run whose rows another run wrote first starts its step again
+  # before giving the bulk action back.
+  @max_resumes 3
+
+  @doc """
+  Claims the bulk action `id`, if it is claimable, and runs it in the
+  caller. Returns `:ok` once it ran, or `:skipped` when it was not
+  claimable: finished, or held by a live lease.
+  """
+  def run_now(id) do
+    case Lease.claim_one(id) do
+      {:ok, bulk_action} -> bulk_action |> run_apart() |> outcome!()
+      :none -> :skipped
     end
   end
 
-  defp attempt(bulk_action, job, attempt) do
+  @doc """
+  Claims and runs, in the caller, every claimable bulk action, one at a
+  time, until none is left. Returns `%{success: n, failure: m}`: the runs
+  that returned and those that raised.
+
+  A run that raised can't be claimed again until its backoff ends, so
+  `drain/0` leaves it `:running`, not `:failed`. A host's tests that want
+  it to reach `:failed` set `config :ash_bulk_durable, retry_backoff: 0`.
+  """
+  def drain, do: drain(%{success: 0, failure: 0})
+
+  defp drain(acc) do
+    case Lease.claim(1) do
+      [] ->
+        acc
+
+      [bulk_action] ->
+        case run_apart(bulk_action) do
+          {:ok, _outcome} -> drain(%{acc | success: acc.success + 1})
+          _raised -> drain(%{acc | failure: acc.failure + 1})
+        end
+    end
+  end
+
+  # `run/1` in a process of its own, watched rather than linked: a lease
+  # renewer that finds the claim lost exits the run, and must not take the
+  # test, script or shell that called `run_now/1` or `drain/0` with it.
+  # `$callers` carries a test's sandboxed connection over.
+  defp run_apart(bulk_action) do
+    callers = [self() | Process.get(:"$callers", [])]
+
+    {pid, ref} =
+      spawn_monitor(fn ->
+        Process.put(:"$callers", callers)
+
+        result =
+          try do
+            {:ok, run(bulk_action)}
+          catch
+            kind, reason -> {:raised, kind, reason, __STACKTRACE__}
+          end
+
+        exit({:shutdown, {__MODULE__, result}})
+      end)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, {:shutdown, {__MODULE__, result}}} -> result
+      {:DOWN, ^ref, :process, ^pid, {:lease_lost, _id}} -> {:ok, :lost}
+      {:DOWN, ^ref, :process, ^pid, reason} -> {:raised, :exit, reason, []}
+    end
+  end
+
+  defp outcome!({:ok, outcome}), do: outcome
+  defp outcome!({:raised, kind, reason, stacktrace}), do: :erlang.raise(kind, reason, stacktrace)
+
+  defmodule ClaimLostError do
+    @moduledoc """
+    Raised inside a run whose claim another run took over: a row it was about
+    to flip had already moved on. The run stops; what it wrote in the
+    transaction at hand rolls back.
+    """
+    defexception [:bulk_action_id]
+
+    @impl true
+    def message(%{bulk_action_id: id}), do: "bulk action #{id} was claimed by another run"
+  end
+
+  @doc """
+  Runs a bulk action `AshBulkDurable.Core.Lease` claimed, holding its lease
+  while it runs. Returns `:ok`, or `:lost` when another run took the claim
+  over meanwhile and this one stopped. A raise, exit or throw from the
+  worker's own reads and writes releases the lease for a later poll to claim
+  it again after a backoff, or on the last attempt fails the bulk action
+  `:raised`, and is raised again.
+
+  The lease renewer is linked to the caller, and exits it when the claim is
+  lost: call this from a process of its own, as the poller does.
+  `run_now/1` and `drain/0` do that for you.
+  """
+  def run(bulk_action) do
+    outer = Process.put(@claim_key, %{id: bulk_action.id, token: bulk_action.claim_token})
+
+    try do
+      Lease.hold(bulk_action, fn -> attempt(bulk_action) end)
+    after
+      Process.put(@claim_key, outer)
+    end
+  rescue
+    exception in ClaimLostError ->
+      Logger.warning(Exception.message(exception) <> "; stopping")
+      :lost
+
+    exception ->
+      give_up_attempt(bulk_action, Exception.format_banner(:error, exception, __STACKTRACE__))
+      reraise exception, __STACKTRACE__
+  catch
+    kind, reason ->
+      give_up_attempt(bulk_action, Exception.format_banner(kind, reason, __STACKTRACE__))
+      :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
+  # A row write refused means the row moved on under another run. If this
+  # run's token still holds, that other run wrote it first (only possible for
+  # a write already committing when this claim was taken, since every row
+  # write confirms the claim before it commits), so `fun` starts again from
+  # the rows' status. Otherwise, or after `@max_resumes`, this run stops.
+  defp while_held(bulk_action, fun, resumes \\ 0) do
+    fun.()
+  rescue
+    exception in ClaimLostError ->
+      cond do
+        not Lease.held?(bulk_action) ->
+          reraise exception, __STACKTRACE__
+
+        resumes >= @max_resumes ->
+          Lease.release(bulk_action.id, bulk_action.claim_token)
+          reraise exception, __STACKTRACE__
+
+        true ->
+          Logger.info("bulk action #{bulk_action.id}: another run wrote rows first; resuming")
+          while_held(bulk_action, fun, resumes + 1)
+      end
+  end
+
+  # A raise on the last attempt fails the bulk action with what was raised,
+  # instead of leaving it to `Lease.fail_exhausted/0` as `:worker_lost`. An
+  # earlier one releases the lease with a backoff before the next claim.
+  defp give_up_attempt(bulk_action, banner) do
+    if bulk_action.attempts >= Lease.max_attempts() do
+      result = {:failed, %{reason: :raised, term: first_line(banner)}}
+      # nil when another claim took it over: nothing left to release.
+      mark_finished(bulk_action, result)
+    else
+      Lease.release(bulk_action.id, bulk_action.claim_token,
+        retry_in: Lease.backoff(bulk_action.attempts)
+      )
+    end
+  rescue
+    _exception -> Lease.release(bulk_action.id, bulk_action.claim_token)
+  end
+
+  defp first_line(banner), do: banner |> String.split("\n", parts: 2) |> hd()
+
+  defp attempt(bulk_action) do
     if StoredTerm.unreadable?(bulk_action) do
       mark_finished(bulk_action, {:failed, %{reason: :unreadable}})
       :ok
     else
-      emit_worker_attempt_start(bulk_action, attempt)
+      emit_worker_attempt_start(bulk_action)
+      # The claim was a plain UPDATE, which no notifier saw.
+      Progress.changed(bulk_action)
       scope = reconstruct_scope(bulk_action)
-      bulk_action = mark_running(bulk_action)
-
-      Heartbeat.beating(job, fn -> drive_with_telemetry(bulk_action, scope) end)
+      drive_with_telemetry(bulk_action, scope)
     end
   end
 
@@ -132,28 +291,29 @@ defmodule AshBulkDurable.Core.Worker do
     )
   end
 
-  defp terminal?(status),
-    do: status in [:completed, :completed_with_errors, :failed, :cancelled]
-
-  # Only a later attempt can be late: a job is enqueued to be the one its bulk
-  # action names, which keeps a job built for a test working too.
-  defp superseded?(%Oban.Job{attempt: attempt, id: id}, %{oban_job_id: current}),
-    do: attempt > 1 and id != current
-
+  # A refused row write resumes the step it happened in (`while_held/2`),
+  # not the attempt: the staged files are downloaded once, and deleted
+  # however the run ends.
   defp drive(bulk_action, scope) do
     settings = Runner.settings(bulk_action, scope, %{})
-    forget_lost_resolutions(bulk_action, settings)
+    while_held(bulk_action, fn -> forget_lost_resolutions(bulk_action, settings) end)
 
-    {staged_paths_for_cleanup, terminal_bulk_action} =
+    terminal_bulk_action =
       case download_staged_files_with_telemetry(bulk_action, settings) do
         {:ok, staged_paths} ->
-          {staged_paths, run_rows(bulk_action, %{settings | staged_files: staged_paths})}
+          try do
+            settings = %{settings | staged_files: staged_paths}
+            while_held(bulk_action, fn -> run_rows(bulk_action, settings) end)
+          after
+            delete_local_staged_tmp(staged_paths)
+          end
 
         {:error, reason} ->
-          {%{}, run_without_staged_files(bulk_action, settings, reason)}
+          while_held(bulk_action, fn ->
+            run_without_staged_files(bulk_action, settings, reason)
+          end)
       end
 
-    delete_local_staged_tmp(staged_paths_for_cleanup)
     maybe_delete_staging(terminal_bulk_action)
     :ok
   end
@@ -188,6 +348,9 @@ defmodule AshBulkDurable.Core.Worker do
   defp run_rows(bulk_action, settings) do
     with nil <- refused_row(bulk_action),
          :ok <- resolve_pending_rows(bulk_action, settings) do
+      # Never throttled away: an all-or-nothing write commits nothing until
+      # it ends, so a page that missed this would show phase 1 until then.
+      Progress.changed(bulk_action, force: true)
       run_chunks(bulk_action, settings)
     else
       %{row_index: row_index, error: error} ->
@@ -224,19 +387,31 @@ defmodule AshBulkDurable.Core.Worker do
 
   # ── Bulk action loading + scope rebuild ─────────────────────────────────────────
 
-  defp fetch_bulk_action!(bulk_action_id) do
-    Ash.get!(bulk_action_resource(), bulk_action_id, authorize?: false)
-  end
-
   defp reconstruct_scope(bulk_action),
     do: AshBulkDurable.Core.Owner.scope_from_worker_key(bulk_action.user_id, bulk_action.tenant)
 
-  defp mark_running(bulk_action) do
-    Ash.update!(bulk_action, %{}, action: :mark_running, authorize?: false)
-  end
-
+  # Fenced on the claim token: a run whose claim another took over matches no
+  # row, writes nothing and returns nil, which stops it quietly. And only
+  # while still `:running`: the run keeps its token once it finishes, and a
+  # raise after that (`give_up_attempt/2`) must not overwrite the result.
   defp mark_finished(bulk_action, result) do
-    Ash.update!(bulk_action, %{result: result}, action: :mark_finished, authorize?: false)
+    bulk_action
+    |> Ash.Changeset.for_update(:mark_finished, %{result: result}, authorize?: false)
+    |> Lease.fenced(bulk_action)
+    |> Ash.Changeset.filter(Ash.Expr.expr(status == :running))
+    |> Ash.update(authorize?: false)
+    |> case do
+      {:ok, finished} ->
+        finished
+
+      {:error, error} ->
+        if Lease.stale?(error) do
+          Logger.warning("bulk action #{bulk_action.id} was claimed by another run; stopping")
+          nil
+        else
+          raise error
+        end
+    end
   end
 
   # ── Kept resolutions ───────────────────────────────────────────────────
@@ -252,9 +427,25 @@ defmodule AshBulkDurable.Core.Worker do
     )
     |> Ash.read!(authorize?: false)
     |> then(&Runner.lost_resolutions(settings, &1))
-    |> Enum.each(fn {row, names} ->
-      Ash.update!(row, %{names: names}, action: :forget_resolutions, authorize?: false)
-    end)
+    |> Enum.each(fn {row, names} -> forget_resolutions(row, names) end)
+  end
+
+  # Guarded like the other flips: the row was read before `lost/2` went to
+  # storage, and a stale run may have applied it meanwhile.
+  defp forget_resolutions(row, names) do
+    case Ash.update(row, %{names: names},
+           action: :forget_resolutions,
+           authorize?: false,
+           context: claim_context()
+         ) do
+      {:ok, forgotten} ->
+        forgotten
+
+      {:error, error} ->
+        if claim_lost?(error),
+          do: raise(ClaimLostError, bulk_action_id: row.bulk_action_id),
+          else: raise(error)
+    end
   end
 
   # ── Staged-file download ───────────────────────────────────────────────
@@ -349,10 +540,11 @@ defmodule AshBulkDurable.Core.Worker do
   end
 
   # Acts on the terminal record returned by `mark_finished/2` (threaded
-  # back through `drive/2` via `run_rows/3`). Re-reading the bulk action
-  # here would reopen a window where the rescue cron — or any other
-  # writer — could land between the terminal write and the purge
-  # decision, so the purge would key off a status the worker never set.
+  # back through `drive/2` via `run_rows/3`), so the purge keys off the
+  # status this run set; nil when another run took the claim over, which
+  # purges for itself.
+  defp maybe_delete_staging(nil), do: :ok
+
   defp maybe_delete_staging(bulk_action) do
     if delete_staging?(bulk_action.status) do
       Enum.each(bulk_action.staged_files, fn {_name, key} -> Storage.delete_object(key) end)
@@ -361,8 +553,8 @@ defmodule AshBulkDurable.Core.Worker do
     :ok
   end
 
-  # A `:failed` bulk action can be retried, so its files stay for the daily
-  # sweep to reclaim.
+  # A `:failed` bulk action can be retried, so its files stay for the
+  # staging sweep to reclaim.
   defp delete_staging?(:completed), do: true
   defp delete_staging?(:cancelled), do: true
   defp delete_staging?(_other), do: false
@@ -424,7 +616,10 @@ defmodule AshBulkDurable.Core.Worker do
         {:ok, failed_acc}
 
       chunk ->
-        case resolve_chunk(chunk, settings, concurrency, atomic?) do
+        result = resolve_chunk(chunk, settings, concurrency, atomic?)
+        Progress.changed(bulk_action)
+
+        case result do
           {:ok, failed} ->
             do_resolve_chunks(bulk_action, settings, concurrency, atomic?, failed_acc + failed)
 
@@ -500,10 +695,11 @@ defmodule AshBulkDurable.Core.Worker do
   # where no rescue reaches, and every attempt would meet the same row.
   defp resolve_rows(rows, settings, resolvers, concurrency, atomic?) do
     timeout = AshBulkDurable.Core.config(:row_resolve_timeout, @row_resolve_timeout)
+    claim = Process.get(@claim_key)
 
     rows
     |> Task.async_stream(
-      fn row -> {row, resolve_one_row(row, settings, resolvers)} end,
+      fn row -> {row, resolve_one_row(row, settings, resolvers, claim)} end,
       max_concurrency: concurrency,
       ordered: false,
       timeout: timeout,
@@ -520,15 +716,22 @@ defmodule AshBulkDurable.Core.Worker do
     end)
   end
 
-  defp reduce_resolution({:ok, _resolved}, _row, status, failed, _atomic?),
-    do: {:cont, {status, failed}}
+  # Each resolved row has committed, so a page can count it (throttled).
+  defp reduce_resolution({:ok, _resolved}, row, status, failed, _atomic?) do
+    Progress.changed(%{id: row.bulk_action_id})
+    {:cont, {status, failed}}
+  end
 
   defp reduce_resolution({:error, err}, row, _status, failed, true) do
+    raise_if_claim_unknown!(err)
+    if claim_lost?(err), do: raise(ClaimLostError, bulk_action_id: row.bulk_action_id)
     mark_row_failed(row, err)
     {:halt, {:atomic_phase1_failed, {row.row_index, err}, failed + 1}}
   end
 
   defp reduce_resolution({:error, err}, row, status, failed, false) do
+    raise_if_claim_unknown!(err)
+    if claim_lost?(err), do: raise(ClaimLostError, bulk_action_id: row.bulk_action_id)
     mark_row_failed(row, err)
     {:cont, {status, failed + 1}}
   end
@@ -537,11 +740,11 @@ defmodule AshBulkDurable.Core.Worker do
   # action's `before_transaction` hook (`AshBulkDurable.Core.Changes.ResolveRow`);
   # the settings, in the row's tenant, and the prepared resolvers ride in on
   # the context.
-  defp resolve_one_row(row, settings, resolvers) do
+  defp resolve_one_row(row, settings, resolvers, claim) do
     Ash.update(row, %{},
       action: :resolve,
       authorize?: false,
-      context: %{ash_bulk_durable: %{settings: settings, resolvers: resolvers}}
+      context: %{ash_bulk_durable: %{settings: settings, resolvers: resolvers, claim: claim}}
     )
   rescue
     exception -> Runner.row_raised(exception, __STACKTRACE__, row)
@@ -589,23 +792,23 @@ defmodule AshBulkDurable.Core.Worker do
     end)
   end
 
+  # Every row is `:succeeded` or `:failed` by now, so the succeeded ones
+  # counted against the total tell which.
   defp finalize_bulk_action(bulk_action) do
-    fresh = Ash.get!(bulk_action_resource(), bulk_action.id, authorize?: false)
-
     final_status =
-      if fresh.rows_done == fresh.total_rows do
+      if succeeded_row_count(bulk_action.id) == bulk_action.total_rows do
         :completed
       else
         :completed_with_errors
       end
 
-    mark_finished(fresh, final_status)
+    mark_finished(bulk_action, final_status)
   end
 
   # All-or-nothing: the whole bulk action is one chunk, run in one transaction, so any
   # failure fails the bulk action. `bulk_run/5` drives the `:run` action over the chunk
-  # — the action's after_batch creates the targets, flips row status, and bumps
-  # rows_done, so the worker never opens a transaction itself.
+  # — the action's after_batch creates the targets and flips row status, so the
+  # worker never opens a transaction itself.
   defp process_chunk(bulk_action, settings, chunk, chunk_index)
        when bulk_action.mode == :all_or_nothing do
     case bulk_run(chunk, settings, bulk_action, stop_on_error?: true) do
@@ -637,6 +840,7 @@ defmodule AshBulkDurable.Core.Worker do
 
       {:error, _error} ->
         succeeded = recover_row_by_row(chunk, settings, bulk_action)
+        Progress.changed(bulk_action)
 
         {:continue, chunk_measurements(length(chunk), succeeded, length(chunk) - succeeded),
          chunk_metadata(bulk_action, chunk_index, :rolled_back, :row_by_row)}
@@ -645,10 +849,11 @@ defmodule AshBulkDurable.Core.Worker do
 
   # Re-run each row of a rolled-back chunk as its own batch of 1. A row that
   # still fails lands :failed with the clean error from the bulk result; the
-  # `:run` action already marked the rest :succeeded and bumped rows_done.
+  # `:run` action already marked the rest :succeeded. The page is told once,
+  # after the chunk, not after each row.
   defp recover_row_by_row(chunk, settings, bulk_action) do
     Enum.reduce(chunk, 0, fn row, succeeded ->
-      case bulk_run([row], settings, bulk_action, stop_on_error?: false) do
+      case bulk_run([row], settings, bulk_action, stop_on_error?: false, announce?: false) do
         :ok ->
           succeeded + 1
 
@@ -662,8 +867,24 @@ defmodule AshBulkDurable.Core.Worker do
   # Drives the `:run` action over a batch of Rows. The settings ride in on
   # the action context so the change doesn't rebuild them per chunk. `transaction: :all` makes the batch atomic.
   # What the batch wrote is announced once it commits: left queued, a page's
-  # progress would stand still until the bulk action finished.
+  # progress would stand still until the bulk action finished. An
+  # all-or-nothing run also counts the rows its one transaction has processed,
+  # for the hint `Progress.uncommitted/2` gives while it runs.
+  #
+  # A row that another run already wrote fails its compare-and-set flip
+  # (`AshBulkDurable.Core.Changes.RequireStatus`): the batch rolls back and
+  # this run stops, its claim lost.
   defp bulk_run(rows, settings, bulk_action, opts) do
+    {announce?, opts} = Keyword.pop(opts, :announce?, true)
+
+    context = %{
+      settings: settings,
+      bulk_action: bulk_action,
+      processed: :counters.new(1, []),
+      rows: length(rows),
+      claim: Process.get(@claim_key)
+    }
+
     result =
       Ash.bulk_update(
         rows,
@@ -676,19 +897,49 @@ defmodule AshBulkDurable.Core.Worker do
           return_errors?: true,
           return_notifications?: true,
           authorize?: false,
-          context: %{ash_bulk_durable: %{settings: settings, bulk_action: bulk_action}}
+          context: %{ash_bulk_durable: context}
         ] ++ opts
       )
 
     case result.status do
       :success ->
         Ash.Notifier.notify(result.notifications)
+        if announce?, do: Progress.changed(bulk_action)
         :ok
 
       _ ->
+        if Enum.any?(List.wrap(result.errors), &claim_lost?/1),
+          do: raise(ClaimLostError, bulk_action_id: bulk_action.id)
+
         {:error, first_error(result)}
     end
   end
+
+  # The claim couldn't be checked, which says nothing about the row: the
+  # attempt is given up, to resume after a backoff, rather than the row failed.
+  defp raise_if_claim_unknown!(error) do
+    case find_claim_check_error(error) do
+      nil -> :ok
+      claim_check_error -> raise claim_check_error
+    end
+  end
+
+  defp find_claim_check_error(%AshBulkDurable.Core.ClaimCheckError{} = error), do: error
+
+  defp find_claim_check_error(%{errors: errors}) when is_list(errors),
+    do: Enum.find_value(errors, &find_claim_check_error/1)
+
+  defp find_claim_check_error(_error), do: nil
+
+  # A row flip that matched no row: the row moved on under another run. A
+  # target's own `StaleRecord` is a row failure like any other.
+  defp claim_lost?(%Ash.Error.Changes.StaleRecord{resource: resource}),
+    do: resource == row_resource()
+
+  defp claim_lost?(%Ash.Changeset{errors: errors}), do: Enum.any?(errors, &claim_lost?/1)
+  defp claim_lost?(%{errors: errors}) when is_list(errors), do: Enum.any?(errors, &claim_lost?/1)
+  defp claim_lost?(errors) when is_list(errors), do: Enum.any?(errors, &claim_lost?/1)
+  defp claim_lost?(_error), do: false
 
   defp first_error(%{errors: [error | _]}), do: error
   defp first_error(_result), do: :unknown
@@ -737,27 +988,44 @@ defmodule AshBulkDurable.Core.Worker do
 
   # Best-effort row-by-row recovery (and phase-1 resolution) mark failures
   # here, *outside* the row's own (rolled-back) `:run` transaction. The success
-  # path — target write + `:succeeded` flip + `rows_done` bump — lives in the
-  # `:run` action's after_batch (`AshBulkDurable.Core.Changes.RunRow`).
+  # path — target write + `:succeeded` flip — lives in the `:run` action's
+  # after_batch (`AshBulkDurable.Core.Changes.RunRow`).
+  #
+  # Compare-and-set like the success flip: a row another run already wrote is
+  # left as that run wrote it, and this run stops.
   defp mark_row_failed(row, err) do
-    Ash.update!(row, %{error: err},
-      action: :mark_failed,
-      authorize?: false
-    )
+    case Ash.update(row, %{error: err},
+           action: :mark_failed,
+           authorize?: false,
+           context: claim_context()
+         ) do
+      {:ok, failed} ->
+        failed
+
+      {:error, error} ->
+        if claim_lost?(error),
+          do: raise(ClaimLostError, bulk_action_id: row.bulk_action_id),
+          else: raise(error)
+    end
   end
+
+  # The claim this process runs under, for a row write to confirm before it
+  # commits (`AshBulkDurable.Core.Changes.RequireClaim`).
+  defp claim_context, do: %{ash_bulk_durable: %{claim: Process.get(@claim_key)}}
 
   # ── Telemetry ────────────────────────────────────────────────────
 
-  # Emitted before `mark_running` so the attempt is observable even if the
-  # bulk action never starts. `pending_rows_at_start == total_rows` on attempt 1 is
-  # a cold start; a smaller count on a later attempt is a crash resume.
-  defp emit_worker_attempt_start(bulk_action, attempt) do
+  # Emitted once a claim is taken, before anything runs. `attempt` counts the
+  # bulk action's claims since it was submitted or last retried.
+  # `pending_rows_at_start == total_rows` on attempt 1 is a cold start; a
+  # smaller count on a later attempt is a crash resume.
+  defp emit_worker_attempt_start(bulk_action) do
     :telemetry.execute(
       [:ash_bulk_durable, :worker_attempt, :start],
       %{system_time: System.system_time()},
       %{
         bulk_action_id: bulk_action.id,
-        attempt: attempt,
+        attempt: bulk_action.attempts,
         pending_rows_at_start: pending_row_count(bulk_action)
       }
     )
@@ -776,9 +1044,13 @@ defmodule AshBulkDurable.Core.Worker do
   end
 
   defp bulk_action_stop(bulk_action) do
-    fresh = Ash.get!(bulk_action_resource(), bulk_action.id, authorize?: false)
+    fresh =
+      Ash.get!(bulk_action_resource(), bulk_action.id, authorize?: false, load: [:rows_done])
 
-    measurements = %{rows_done: fresh.rows_done, rows_failed: failed_row_count(fresh.id)}
+    measurements = %{
+      rows_done: fresh.rows_done,
+      rows_failed: failed_row_count(fresh.id)
+    }
 
     metadata = %{
       bulk_action_id: fresh.id,
@@ -801,11 +1073,19 @@ defmodule AshBulkDurable.Core.Worker do
   defp reason_atom("atomic_chunk_rolled_back"), do: :atomic_chunk_rolled_back
   defp reason_atom("staged_file_download_error"), do: :staged_file_download_error
   defp reason_atom("worker_lost"), do: :worker_lost
+  defp reason_atom("raised"), do: :raised
+  defp reason_atom("unreadable"), do: :unreadable
   defp reason_atom(_reason), do: nil
 
   defp pending_row_count(bulk_action) do
     row_resource()
     |> Ash.Query.filter(bulk_action_id == ^bulk_action.id and status == :pending)
+    |> Ash.count!(authorize?: false)
+  end
+
+  defp succeeded_row_count(bulk_action_id) do
+    row_resource()
+    |> Ash.Query.filter(bulk_action_id == ^bulk_action_id and status == :succeeded)
     |> Ash.count!(authorize?: false)
   end
 

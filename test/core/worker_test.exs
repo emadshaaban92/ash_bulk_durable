@@ -1,15 +1,14 @@
 defmodule AshBulkDurable.Core.WorkerTest do
   @moduledoc """
   Tests for `AshBulkDurable.Core.Worker` driving the two-phase
-  pipeline. Each scenario uses `Oban.Testing.perform_job/3` so the
-  worker runs synchronously inside the test sandbox.
+  pipeline. Each scenario uses `Worker.run_now/1` so the worker runs
+  synchronously inside the test sandbox.
 
   `async: false` because tests swap `:ash_bulk_durable` config (storage
   adapter, `:test_poison`) globally and drive the
   `AshBulkDurable.TestStorage` named Agent (a VM-wide singleton).
   """
   use AshBulkDurable.DataCase, async: false
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
 
   import AshBulkDurable.StorageHelpers
 
@@ -31,8 +30,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
     written, `after_write/3` first refuses it (so the chunk fails
     non-raisingly and the worker drops into row-by-row recovery), then
     raises on the recovery attempt. A `Process.put` counter scopes the "second call" tracking
-    to the Oban perform process (the test process under
-    `Oban.Testing.perform_job/3`).
+    to the worker's process (the test process under `Worker.run_now/1`).
     """
     @behaviour AshBulkDurable.Core.Resolver
 
@@ -224,7 +222,8 @@ defmodule AshBulkDurable.Core.WorkerTest do
     |> Ash.read!(authorize?: false)
   end
 
-  defp reload(%BulkAction{id: id}), do: Ash.get!(BulkAction, id, authorize?: false)
+  defp reload(%BulkAction{id: id}),
+    do: Ash.get!(BulkAction, id, authorize?: false, load: [:rows_done, :rows_pending])
 
   defp put_poison(value) do
     Application.put_env(:ash_bulk_durable, :test_poison, value)
@@ -241,7 +240,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
       bulk_action =
         create_bulk_action!(region_rows(5, suffix), user_id: user.id, chunk_size: 2)
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       fresh = reload(bulk_action)
       assert fresh.status == :completed
@@ -282,7 +281,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
       bulk_action =
         create_bulk_action!(region_rows(5, suffix), user_id: user.id, chunk_size: 2)
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       fresh = reload(bulk_action)
       assert fresh.status == :completed_with_errors
@@ -323,7 +322,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
       bulk_action =
         create_bulk_action!(region_rows(6, suffix), user_id: user.id, chunk_size: 3)
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       fresh = reload(bulk_action)
       assert fresh.status == :completed_with_errors
@@ -361,7 +360,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
           chunk_size: 2
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       fresh = reload(bulk_action)
       assert fresh.status == :completed_with_errors
@@ -398,7 +397,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
 
         log =
           capture_log(fn ->
-            assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+            assert :ok = Worker.run_now(bulk_action.id)
           end)
 
         assert log =~ "bulk action #{bulk_action.id} row 1 raised"
@@ -434,7 +433,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
             mode: :all_or_nothing
           )
 
-        assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+        assert :ok = Worker.run_now(bulk_action.id)
 
         fresh = reload(bulk_action)
         assert fresh.status == :failed
@@ -461,7 +460,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
       ]
 
       bulk_action = create_bulk_action!(rows, user_id: user.id, chunk_size: 2)
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       fresh = reload(bulk_action)
       assert fresh.status == :completed_with_errors
@@ -488,7 +487,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
       bulk_action =
         create_bulk_action!(rows, user_id: user.id, chunk_size: 2, mode: :all_or_nothing)
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       fresh = reload(bulk_action)
       assert fresh.status == :failed
@@ -518,7 +517,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
           mode: :all_or_nothing
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       fresh = reload(bulk_action)
       assert fresh.status == :failed
@@ -552,7 +551,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
           chunk_size: 2
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       fresh = reload(bulk_action)
       assert fresh.status == :completed_with_errors
@@ -579,7 +578,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
           mode: :all_or_nothing
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       fresh = reload(bulk_action)
       assert fresh.status == :failed
@@ -596,8 +595,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
   end
 
   describe "crash-resume" do
-    test "no-ops when the bulk action is already terminal (post-mark_finished crash window)",
-         %{super_user: user} do
+    test "a finished bulk action is never claimed again", %{super_user: user} do
       suffix = System.unique_integer([:positive])
 
       bulk_action =
@@ -607,15 +605,12 @@ defmodule AshBulkDurable.Core.WorkerTest do
           mode: :all_or_nothing
         )
 
-      # Simulate the first attempt having reached mark_finished but the
-      # BEAM dying before Oban acked. The next attempt picks up a bulk action in
-      # `:completed` state.
       Ash.update!(bulk_action, %{result: :completed}, action: :mark_finished, authorize?: false)
 
       finished = reload(bulk_action)
       finished_at = finished.finished_at
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :skipped = Worker.run_now(bulk_action.id)
 
       reread = reload(bulk_action)
       assert reread.status == :completed
@@ -642,11 +637,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
         )
       end)
 
-      bulk_action
-      |> Ash.Changeset.for_update(:bump_rows_done, %{n: 3}, authorize?: false)
-      |> Ash.update!(authorize?: false)
-
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       fresh = reload(bulk_action)
       assert fresh.status == :completed
@@ -676,7 +667,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
           chunk_size: 2
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       assert reload(bulk_action).status == :completed_with_errors
       assert length(regions_from(suffix, user)) == 2
@@ -700,7 +691,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
           chunk_size: 2
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       fresh = reload(bulk_action)
       assert fresh.status == :failed
@@ -713,7 +704,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
   end
 
   describe "staged-file download error" do
-    test "all or nothing: storage adapter returns :error → bulk action :failed, no Oban raise", %{
+    test "all or nothing: storage adapter returns :error → bulk action :failed, no raise", %{
       super_user: user
     } do
       put_storage(ErrorStorage)
@@ -733,7 +724,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
           staged_files: %{"logo" => "bulk-staging/#{user.id}/abc/companions/logo.zip"}
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       fresh = reload(bulk_action)
       assert fresh.status == :failed
@@ -762,7 +753,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
         )
 
       capture_log(fn ->
-        assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+        assert :ok = Worker.run_now(bulk_action.id)
       end)
 
       assert %{status: :completed_with_errors} = reload(bulk_action)
@@ -801,7 +792,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
         )
 
       capture_log(fn ->
-        assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+        assert :ok = Worker.run_now(bulk_action.id)
       end)
 
       assert %{status: :completed_with_errors, rows_done: 1} = reload(bulk_action)
@@ -825,7 +816,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
           staged_files: %{"logo" => "bulk-staging/#{user.id}/abc/companions/logo.zip"}
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       assert reload(bulk_action).status == :completed
       assert length(regions_from(suffix, user)) == 3
@@ -834,7 +825,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
 
   # The cleanup keys off the bulk action record `mark_finished/2` just returned
   # — re-reading the row here would open a window where a racing writer
-  # could flip the purge decision (see the RescueStuckBulkActions TOCTOU). Both
+  # could flip the purge decision (another claim finishing it first). Both
   # purge branches must therefore reflect the terminal status the worker
   # itself wrote.
   describe "staged-file cleanup gates on the worker's terminal status" do
@@ -862,7 +853,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
           staged_files: %{"logo" => key}
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
       assert reload(bulk_action).status == :completed
       refute key in AshBulkDurable.TestStorage.keys()
     end
@@ -889,7 +880,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
           staged_files: %{"logo" => key}
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
       assert reload(bulk_action).status == :completed_with_errors
       assert key in AshBulkDurable.TestStorage.keys()
     end
@@ -914,7 +905,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
           staged_files: %{"logo" => key}
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
       assert reload(bulk_action).status == :failed
       assert key in AshBulkDurable.TestStorage.keys()
     end
@@ -936,7 +927,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
       rows = region_rows(3, suffix) |> List.update_at(1, &refused/1)
 
       bulk_action = create_bulk_action!(rows, user_id: user.id, chunk_size: 2)
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       fresh = reload(bulk_action)
       assert fresh.status == :completed_with_errors
@@ -958,7 +949,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
       bulk_action =
         create_bulk_action!(rows, user_id: user.id, chunk_size: 3, mode: :all_or_nothing)
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       fresh = reload(bulk_action)
       assert fresh.status == :failed

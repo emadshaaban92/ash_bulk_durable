@@ -6,11 +6,9 @@ defmodule AshBulkDurable.Sheet.ErrorsSheetTest do
   bulk action started from.
   """
   use AshBulkDurable.DataCase, async: true
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
 
   require Ash.Query
 
-  alias AshBulkDurable.Core.Worker
   alias AshBulkDurable.Sheet
   alias AshBulkDurable.Sheet.{ErrorsSheet, Field, Mapping}
   alias AshBulkDurable.EchoResolver
@@ -29,8 +27,8 @@ defmodule AshBulkDurable.Sheet.ErrorsSheetTest do
     do: %{code: tag, name: "Region #{tag}", native_name: "منطقة #{tag}"}
 
   defp run!(bulk_action) do
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
-    Ash.get!(BulkAction, bulk_action.id, authorize?: false)
+    assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
+    Ash.get!(BulkAction, bulk_action.id, authorize?: false, load: [:rows_done, :rows_pending])
   end
 
   defp rows(bulk_action) do
@@ -302,10 +300,8 @@ defmodule AshBulkDurable.Sheet.ErrorsSheetTest do
             row
         end)
 
-      assert {:ok, %{status: :running}} =
+      assert {:ok, %{status: :queued}} =
                AshBulkDurable.retry(bulk_action, sheet, scope: ctx.scope)
-
-      assert_enqueued(worker: Worker, args: %{bulk_action_id: bulk_action.id})
 
       bulk_action = run!(bulk_action)
       [first, second] = rows(bulk_action)
@@ -588,7 +584,9 @@ defmodule AshBulkDurable.Sheet.ErrorsSheetTest do
       name = "Branch #{tag()}"
 
       jobs = fn ->
-        length(all_enqueued(worker: Worker, args: %{bulk_action_id: bulk_action.id}))
+        BulkAction
+        |> Ash.get!(bulk_action.id, authorize?: false)
+        |> Map.take([:status, :updated_at])
       end
 
       jobs_before = jobs.()
@@ -600,7 +598,10 @@ defmodule AshBulkDurable.Sheet.ErrorsSheetTest do
       assert {:error, %{unmatched: [^bogus]}} =
                AshBulkDurable.retry(bulk_action, sheet, scope: ctx.scope)
 
-      assert Ash.get!(BulkAction, bulk_action.id, authorize?: false).status ==
+      assert Ash.get!(BulkAction, bulk_action.id,
+               authorize?: false,
+               load: [:rows_done, :rows_pending]
+             ).status ==
                :completed_with_errors
 
       assert reload_row(second).status == :failed

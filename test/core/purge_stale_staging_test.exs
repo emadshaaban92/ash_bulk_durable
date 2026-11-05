@@ -1,14 +1,12 @@
 defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
   @moduledoc """
-  Tests for the companion-staging GC. Runs the cron via
-  `Oban.Testing.perform_job/3` against the in-memory
+  Tests for the companion-staging GC. Runs the sweep against the in-memory
   `AshBulkDurable.TestStorage` adapter so deletions are observable without a
   real bucket.
 
   `async: false` — swaps the `:ash_bulk_durable` storage adapter globally.
   """
   use AshBulkDurable.DataCase, async: false
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
 
   alias AshBulkDurable.Core.PurgeStaleStaging
   alias AshBulkDurable.TestStorage
@@ -81,7 +79,7 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       TestStorage.put(key_completed, "x", old())
       TestStorage.put(key_with_errors, "x", old())
 
-      assert :ok = perform_job(PurgeStaleStaging, %{})
+      assert :ok = PurgeStaleStaging.sweep()
 
       remaining = TestStorage.keys()
       refute key_orphan in remaining
@@ -102,7 +100,7 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       TestStorage.put(key_parked, "x", old())
       TestStorage.put(key_orphan, "x", old())
 
-      assert :ok = perform_job(PurgeStaleStaging, %{})
+      assert :ok = PurgeStaleStaging.sweep()
 
       remaining = TestStorage.keys()
       assert key_parked in remaining
@@ -113,7 +111,7 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       fresh_orphan = "#{@prefix}#{Ecto.UUID.generate()}/uuid-d/companions/logo.zip"
       TestStorage.put(fresh_orphan, "x", DateTime.utc_now())
 
-      assert :ok = perform_job(PurgeStaleStaging, %{})
+      assert :ok = PurgeStaleStaging.sweep()
 
       assert fresh_orphan in TestStorage.keys()
     end
@@ -122,19 +120,19 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       {_queued, [key]} = create_bulk_action!(["logo.zip"])
       TestStorage.put(key, "x", old())
 
-      assert :ok = perform_job(PurgeStaleStaging, %{})
+      assert :ok = PurgeStaleStaging.sweep()
 
       assert key in TestStorage.keys()
     end
 
     # The sweep's preserve-set is built from bulk actions in
-    # `[:queued, :running, :completed_with_errors]` only. A bulk action that's
-    # left a stale staging blob behind in :failed / :cancelled must still
-    # be cleaned up — verifies that excluding those bulk actions from the read
-    # didn't break the "worker-exited terminal" purge branch.
+    # `[:queued, :running, :completed_with_errors]`, and those that failed in
+    # the last day. A bulk action that's left a stale staging blob behind,
+    # failed more than a day ago or cancelled, must still be cleaned up.
     test "deletes keys for :failed and :cancelled bulk actions (read excludes them)" do
       {failed, [key_failed]} = create_bulk_action!(["logo.zip"])
       finish!(failed, {:failed, %{reason: :resolver_prepare_error}})
+      failed_at!(failed, old())
 
       {cancelled, [key_cancelled]} = create_bulk_action!(["logo.zip"])
       finish!(cancelled, :cancelled)
@@ -142,12 +140,31 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       TestStorage.put(key_failed, "x", old())
       TestStorage.put(key_cancelled, "x", old())
 
-      assert :ok = perform_job(PurgeStaleStaging, %{})
+      assert :ok = PurgeStaleStaging.sweep()
 
       remaining = TestStorage.keys()
       refute key_failed in remaining
       refute key_cancelled in remaining
     end
+
+    # Retryable for a day from when it failed, not from when its files went
+    # up: an upload a day old that failed an hour ago keeps its files.
+    test "keeps keys of a bulk action that failed less than a day ago" do
+      {failed, [key]} = create_bulk_action!(["logo.zip"])
+      finish!(failed, {:failed, %{reason: :resolver_prepare_error}})
+      TestStorage.put(key, "x", old())
+
+      assert :ok = PurgeStaleStaging.sweep()
+
+      assert key in TestStorage.keys()
+    end
+  end
+
+  defp failed_at!(bulk_action, at) do
+    AshBulkDurable.Test.Repo.query!("UPDATE bulk_actions SET finished_at = $1 WHERE id = $2", [
+      DateTime.to_naive(at),
+      Ecto.UUID.dump!(bulk_action.id)
+    ])
   end
 
   describe "eager one-shot" do
@@ -167,11 +184,11 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       assert other in remaining
     end
 
-    test "perform/1 with a bulk_action_id arg drives the eager delete" do
+    test "abandoning a bulk action deletes its keys once the cancel commits" do
       {bulk_action, [key]} = create_bulk_action!(["a.zip"])
       TestStorage.put(key)
 
-      assert :ok = perform_job(PurgeStaleStaging, %{"bulk_action_id" => bulk_action.id})
+      bulk_action |> finish!(:completed_with_errors) |> finish!(:cancelled)
 
       refute key in TestStorage.keys()
     end

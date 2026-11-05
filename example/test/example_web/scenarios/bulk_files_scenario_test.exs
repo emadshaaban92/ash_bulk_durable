@@ -10,7 +10,6 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
   `Example.Test.TestStorage`.
   """
   use ExampleWeb.ConnCase, async: false
-  use Oban.Testing, repo: Example.Repo
 
   import Example.Test.StorageHelpers
   import ExUnit.CaptureLog
@@ -383,7 +382,13 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
       TestStorage.put(key, zip(), long_ago)
     end)
 
-    assert :ok = perform_job(PurgeStaleStaging, %{})
+    # A bulk action keeps its files a day from when it failed, too.
+    Example.Repo.query!("UPDATE bulk_actions SET finished_at = $1 WHERE id = $2", [
+      DateTime.to_naive(long_ago),
+      Ecto.UUID.dump!(bulk_action.id)
+    ])
+
+    assert :ok = PurgeStaleStaging.sweep()
     refute Enum.any?(TestStorage.keys(), &String.starts_with?(&1, "bulk-staging/"))
   end
 
@@ -398,8 +403,8 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
   end
 
   defp drain_finished(bulk_action) do
-    assert %{failure: 0} = Oban.drain_queue(queue: :bulk_actions)
-    Ash.get!(BulkAction, bulk_action.id, authorize?: false)
+    assert %{failure: 0} = AshBulkDurable.Core.Worker.drain()
+    Ash.get!(BulkAction, bulk_action.id, authorize?: false, load: [:rows_done, :rows_pending])
   end
 
   defp product(sku) do

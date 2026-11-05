@@ -5,7 +5,6 @@ alias AshBulkDurable.Test.{PubSub, Repo}
 
 {:ok, _pid} = Repo.start_link()
 {:ok, _pid} = Supervisor.start_link([PubSub], strategy: :one_for_one)
-{:ok, _pid} = Oban.start_link(Application.fetch_env!(:ash_bulk_durable, Oban))
 
 Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
 
