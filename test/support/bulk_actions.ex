@@ -54,8 +54,11 @@ defmodule AshBulkDurable.Test.Row do
     repo AshBulkDurable.Test.Repo
   end
 
+  # Narrower than the bulk action's: an actor with the `:row_blind` platform
+  # role reads its own bulk actions but none of their rows.
   policies do
     policy action_type(:read) do
+      forbid_if expr(:row_blind in ^actor(:platform_roles))
       authorize_if AshBulkDurable.Test.Checks.ActorIsSuperUser
       authorize_if expr(bulk_action.user_id == ^actor(:id))
     end

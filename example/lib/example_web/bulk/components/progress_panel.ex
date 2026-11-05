@@ -3,19 +3,22 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
   Live progress / terminal-state view for an attached `BulkAction`.
   `ExampleWeb.Bulk.Components.Page` renders this in place of the
   submit form whenever a bulk action is attached. The row carries everything the
-  panel needs (`status`, `rows_done`, `total_rows`, `mode`,
-  `result`), so a single component renders every state — there is no
-  per-message switch on the LV side.
+  panel needs (`status`, `rows_done` and `rows_pending` — its rows counted
+  by status —, `total_rows`, `mode`, `started_at`, `result`), so a single
+  component renders every state — there is no per-message switch on the LV
+  side.
 
   ## Render branches (mode-aware progress)
 
     * `:queued` — "Queued" badge, no progress bar, no actions.
     * `:running` + `:per_row` — a chunked progress bar and a
       `rows_done / total_rows` counter. No actions.
-    * `:running` + `:all_or_nothing` — a "Running…" badge only. No
-      progress bar: all-or-nothing keeps `rows_done` at `0`
-      until the single commit, so a bar could only show 0% or snap to
-      100% — worse than nothing.
+    * `:running` + `:all_or_nothing` — the phase, from committed data:
+      references still resolving (rows `:pending`), or every row being
+      written in one transaction, started some time ago. No progress bar:
+      `rows_done` stays `0` until the single commit. While the page is open,
+      the worker's uncommitted count (`uncommitted_rows`) is shown as a
+      hint, labelled as not saved yet; a page opened later doesn't have it.
     * `:completed` / `:failed` / `:cancelled` — terminal badge + a
       "Dismiss" button (`phx-click="dismiss_bulk_action"`). A `:failed` bulk action
       additionally renders the captured root cause (first offending row +
@@ -48,6 +51,7 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
   attr :uploads, :any, default: %{}
   attr :errors_sheet, :any, default: nil
   attr :failed_preview, :list, default: []
+  attr :uncommitted_rows, :integer, default: nil
   attr :retry_filename, :string, default: nil
 
   def progress_panel(%{bulk_action: nil} = assigns), do: ~H""
@@ -77,9 +81,15 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
                 </p>
               </div>
             <% @bulk_action.status == :running -> %>
-              <p class="text-sm text-base-content/60">
-                {gettext("Running as a single all-or-nothing transaction…")}
-              </p>
+              <div class="text-sm text-base-content/60">
+                <p>{all_or_nothing_phase(@bulk_action)}</p>
+                <p :if={@uncommitted_rows && @bulk_action.rows_pending == 0}>
+                  {gettext("%{count} of %{total} rows processed, not saved yet.",
+                    count: @uncommitted_rows,
+                    total: @bulk_action.total_rows
+                  )}
+                </p>
+              </div>
             <% @bulk_action.status == :queued -> %>
               <p class="text-sm text-base-content/60">{gettext("Waiting to start…")}</p>
             <% @bulk_action.status == :failed -> %>
@@ -297,6 +307,32 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
         total: bulk_action.total_rows
       )
 
+  # What an all-or-nothing run is doing, read from what it has committed:
+  # resolving rows commit one by one; the writes commit only together.
+  defp all_or_nothing_phase(%{rows_pending: pending} = bulk_action) when pending > 0 do
+    gettext("Resolving references: %{done} of %{total} rows…",
+      done: bulk_action.total_rows - pending,
+      total: bulk_action.total_rows
+    )
+  end
+
+  defp all_or_nothing_phase(bulk_action) do
+    gettext("Writing all %{total} rows in one transaction, started %{ago}…",
+      total: bulk_action.total_rows,
+      ago: ago(bulk_action.started_at)
+    )
+  end
+
+  defp ago(nil), do: gettext("just now")
+
+  defp ago(started_at) do
+    case DateTime.diff(DateTime.utc_now(), started_at, :second) do
+      seconds when seconds < 60 -> gettext("just now")
+      seconds when seconds < 3600 -> gettext("%{count} min ago", count: div(seconds, 60))
+      seconds -> gettext("%{count} h ago", count: div(seconds, 3600))
+    end
+  end
+
   # A few failed rows inline — the cells of the errors sheet that hold
   # something plus a clean error, so they can see what to fix before
   # downloading the full sheet.
@@ -393,6 +429,11 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
 
       "unreadable" ->
         gettext("What this bulk action held no longer exists, so it can't run.")
+
+      "raised" ->
+        gettext(
+          "The bulk action kept hitting an unexpected error and stopped. Rows already saved won't run again; retry it once the problem is fixed."
+        )
 
       "resolver_prepare_error" ->
         gettext("The bulk action couldn't be prepared. Please check your data and try again.")

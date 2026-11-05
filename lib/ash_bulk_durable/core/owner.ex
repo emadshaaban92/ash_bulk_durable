@@ -6,7 +6,7 @@ defmodule AshBulkDurable.Core.Owner do
 
       config :ash_bulk_durable, owner_module: MyApp.BulkActions.Owner
 
-  A bulk action is submitted with one scope and run by an Oban worker in
+  A bulk action is submitted with one scope and run by the worker in
   another process, so it keeps `worker_key/1` of the submitter and the tenant
   they acted in, and the worker rebuilds a scope from those with
   `scope_from_worker_key/2`.

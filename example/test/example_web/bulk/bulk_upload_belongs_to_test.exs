@@ -37,7 +37,7 @@ defmodule ExampleWeb.Bulk.BulkUploadBelongsToTest do
       |> click_button("Submit")
       |> assert_has("#bulk-action-panel", timeout: 2000)
 
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
 
     session
     |> assert_has("h2, h3, p, div", text: "Completed with errors")

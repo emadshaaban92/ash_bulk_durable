@@ -2,7 +2,8 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanelTest do
   @moduledoc """
   Step 7 (#39) coverage for `ExampleWeb.Bulk.Components.ProgressPanel`. The
   component pattern-matches on the bulk action's plain fields (`status`,
-  `rows_done`, `total_rows`, `mode`, `result`), so these render tests
+  `rows_done`, `rows_pending`, `total_rows`, `mode`, `started_at`,
+  `result`), so these render tests
   pass lightweight maps rather than building real `BulkAction` rows.
   """
   use ExUnit.Case, async: true
@@ -18,6 +19,8 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanelTest do
         id: "run-abc",
         status: :running,
         rows_done: 0,
+        rows_pending: 0,
+        started_at: nil,
         total_rows: 10,
         mode: :per_row,
         result: nil
@@ -32,6 +35,14 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanelTest do
       uploads: uploads,
       errors_sheet: errors_sheet,
       retry_filename: retry_filename
+    )
+  end
+
+  defp render_running_all_or_nothing(overrides, uncommitted_rows) do
+    render_component(&ProgressPanel.progress_panel/1,
+      bulk_action: bulk_action(Map.merge(%{status: :running, mode: :all_or_nothing}, overrides)),
+      uploads: %{},
+      uncommitted_rows: uncommitted_rows
     )
   end
 
@@ -72,6 +83,25 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanelTest do
       assert html =~ "Running…"
       refute html =~ "<progress"
       refute html =~ "Dismiss"
+    end
+
+    test "an all-or-nothing bulk action resolving shows how many rows are resolved" do
+      html = render_running_all_or_nothing(%{rows_pending: 4}, nil)
+      assert html =~ "Resolving references: 6 of 10 rows"
+    end
+
+    test "an all-or-nothing bulk action writing says since when, and the unsaved hint" do
+      started_at = DateTime.add(DateTime.utc_now(), -180, :second)
+      html = render_running_all_or_nothing(%{started_at: started_at}, 300)
+
+      assert html =~ "Writing all 10 rows in one transaction, started 3 min ago"
+      assert html =~ "300 of 10 rows processed, not saved yet."
+    end
+
+    test "with no hint, an all-or-nothing bulk action shows only its phase" do
+      html = render_running_all_or_nothing(%{}, nil)
+      assert html =~ "Writing all 10 rows in one transaction"
+      refute html =~ "not saved yet"
     end
   end
 

@@ -6,7 +6,6 @@ defmodule AshBulkDurable.RetryTest do
   corrected sheet (the example's `/bulk` page tests).
   """
   use AshBulkDurable.DataCase, async: true
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
 
   require Ash.Query
 
@@ -38,7 +37,6 @@ defmodule AshBulkDurable.RetryTest do
     def finish(_state), do: :ok
   end
 
-  alias AshBulkDurable.Core.Worker
   alias AshBulkDurable.Test.{BulkAction, Row}
   alias AshBulkDurable.Test.Branch
   alias AshBulkDurable.Test.Region
@@ -64,11 +62,12 @@ defmodule AshBulkDurable.RetryTest do
   defp lookup(code), do: {:lookup, Region, :code, code}
 
   defp run!(bulk_action) do
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
     {reload(bulk_action), rows(bulk_action)}
   end
 
-  defp reload(bulk_action), do: Ash.get!(BulkAction, bulk_action.id, authorize?: false)
+  defp reload(bulk_action),
+    do: Ash.get!(BulkAction, bulk_action.id, authorize?: false, load: [:rows_done, :rows_pending])
 
   defp rows(bulk_action) do
     Row
@@ -79,13 +78,9 @@ defmodule AshBulkDurable.RetryTest do
 
   defp region_id(branch, user), do: Ash.reload!(branch, actor: user).region_id
 
-  # An old attempt Oban still has, as one that raised after the bulk action
-  # finished leaves it.
-  defp old_job(%{oban_job_id: job_id}),
-    do: %{AshBulkDurable.Test.Repo.get!(Oban.Job, job_id) | attempt: 2}
-
+  # What a refused retry must leave as it was: nothing requeued.
   defp jobs(bulk_action),
-    do: length(all_enqueued(worker: Worker, args: %{bulk_action_id: bulk_action.id}))
+    do: bulk_action |> reload() |> Map.take([:status, :updated_at, :attempts])
 
   defp codes_written(codes) do
     Region
@@ -142,19 +137,14 @@ defmodule AshBulkDurable.RetryTest do
     }
   end
 
-  test "a late attempt of the job a retry replaced drives nothing; the retry's own job does",
-       ctx do
+  test "a retry queues the bulk action afresh: no claim, no attempts", ctx do
     failed = two_failed!(ctx)
-    superseded = old_job(failed.bulk_action)
+    assert reload(failed.bulk_action).attempts == 1
 
     {:ok, retried} = AshBulkDurable.retry(failed.bulk_action, scope: ctx.scope)
-    assert retried.oban_job_id != superseded.id
+    assert %{status: :queued, attempts: 0, claim_token: nil, lease_until: nil} = retried
 
-    assert :ok = perform_job(superseded, repo: AshBulkDurable.Test.Repo)
-
-    assert reload(retried).status == :running
-
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
     assert reload(retried).status == :completed_with_errors
   end
 
@@ -175,7 +165,7 @@ defmodule AshBulkDurable.RetryTest do
 
       region = Ash.create!(Region, region_input(code), actor: ctx.user)
 
-      assert {:ok, %{status: :running}} = AshBulkDurable.retry(bulk_action, scope: ctx.scope)
+      assert {:ok, %{status: :queued}} = AshBulkDurable.retry(bulk_action, scope: ctx.scope)
       {bulk_action, rows} = run!(bulk_action)
 
       assert bulk_action.status == :completed
@@ -318,7 +308,7 @@ defmodule AshBulkDurable.RetryTest do
       {_bulk_action, [row]} = run!(bulk_action)
 
       {:ok, retried} = AshBulkDurable.retry(bulk_action, scope: ctx.scope)
-      assert retried.status == :running
+      assert retried.status == :queued
 
       {_bulk_action, [%{status: :failed}]} = run!(bulk_action)
 
@@ -330,7 +320,7 @@ defmodule AshBulkDurable.RetryTest do
                  scope: ctx.scope
                )
 
-      assert again.status == :running
+      assert again.status == :queued
 
       {bulk_action, [row]} = run!(bulk_action)
 
@@ -411,7 +401,7 @@ defmodule AshBulkDurable.RetryTest do
                  scope: ctx.scope
                )
 
-      assert retried.status == :running
+      assert retried.status == :queued
       assert retried.error == nil
       assert retried.result == nil
       assert retried.finished_at == nil
@@ -539,9 +529,11 @@ defmodule AshBulkDurable.RetryTest do
       :telemetry.attach(
         handler,
         [:ash_bulk_durable, :test, :repo, :query],
-        fn _event, _measurements, %{source: source, query: query}, _config ->
-          if self() == test_pid and source == "bulk_actions" and
-               String.starts_with?(query, "SELECT") do
+        # Its row counts make the read a subquery, which Ecto reports with no
+        # source: the table is found in the query.
+        fn _event, _measurements, %{query: query}, _config ->
+          if self() == test_pid and String.starts_with?(query, "SELECT") and
+               query =~ ~s(FROM "bulk_actions") do
             send(test_pid, :bulk_action_read)
           end
         end,
@@ -607,7 +599,7 @@ defmodule AshBulkDurable.RetryTest do
       %{bulk_action: bulk_action, first: first, second: second} = two_failed!(ctx)
       fixed = region_input()
 
-      assert {:ok, %{status: :running}} =
+      assert {:ok, %{status: :queued}} =
                AshBulkDurable.retry_row(first, input: fixed, scope: ctx.scope)
 
       {bulk_action, [first_after, _good, second_after]} = run!(bulk_action)
@@ -765,14 +757,14 @@ defmodule AshBulkDurable.RetryTest do
       end
     end
 
-    test "while it is running, even held as a stale record", ctx do
+    test "while it is queued again, even held as a stale record", ctx do
       %{bulk_action: bulk_action, first: first, second: second} = two_failed!(ctx)
 
       {:ok, running} = AshBulkDurable.retry_row(first, scope: ctx.scope)
-      assert running.status == :running
+      assert running.status == :queued
       jobs_before = jobs(bulk_action)
 
-      # `running` reads :running, `bulk_action` the state it was retried from.
+      # `running` reads :queued, `bulk_action` the state it was retried from.
       for held <- [running, bulk_action] do
         assert {:error, %Ash.Error.Invalid{}} = AshBulkDurable.retry(held, scope: ctx.scope)
       end

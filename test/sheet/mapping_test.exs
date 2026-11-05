@@ -62,13 +62,13 @@ defmodule AshBulkDurable.Sheet.MappingTest do
 
     @impl true
     def prepare(_field, _ctx) do
-      send(self(), :prepared)
+      send(List.last(Process.get(:"$callers", [self()])), :prepared)
       if Process.get(:refuse_prepare), do: {:error, :refused}, else: {:ok, :state}
     end
 
     @impl true
     def finish(_field, state) do
-      send(self(), {:finished, state})
+      send(List.last(Process.get(:"$callers", [self()])), {:finished, state})
       :ok
     end
 
@@ -86,13 +86,13 @@ defmodule AshBulkDurable.Sheet.MappingTest do
 
     @impl true
     def prepare(_field, %{tenant: tenant}) do
-      send(self(), {:prepared_in, tenant})
+      send(List.last(Process.get(:"$callers", [self()])), {:prepared_in, tenant})
       {:ok, :state}
     end
 
     @impl true
     def input_value(_field, raw, %{tenant: tenant}) do
-      send(self(), {:row_in, tenant})
+      send(List.last(Process.get(:"$callers", [self()])), {:row_in, tenant})
       {:ok, raw}
     end
   end
@@ -112,7 +112,7 @@ defmodule AshBulkDurable.Sheet.MappingTest do
 
     @impl true
     def finish(_field, state) do
-      send(self(), {:finished, state})
+      send(List.last(Process.get(:"$callers", [self()])), {:finished, state})
       :ok
     end
 
@@ -278,16 +278,16 @@ defmodule AshBulkDurable.Sheet.MappingTest do
           scope: scope
         )
 
-      assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
-      bulk_action = Ash.reload!(bulk_action, authorize?: false)
+      assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
+      bulk_action = Ash.reload!(bulk_action, authorize?: false, load: [:rows_done])
       assert bulk_action.status == :completed_with_errors
 
       # Its input lacks the cell the handler refused, so running it would
       # write a record without it.
       assert {:ok, bulk_action} = AshBulkDurable.retry(bulk_action, scope: scope)
-      assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+      assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
 
-      bulk_action = Ash.reload!(bulk_action, authorize?: false)
+      bulk_action = Ash.reload!(bulk_action, authorize?: false, load: [:rows_done])
       assert bulk_action.status == :completed_with_errors
       assert bulk_action.rows_done == 0
 
@@ -303,9 +303,9 @@ defmodule AshBulkDurable.Sheet.MappingTest do
       }
 
       assert {:ok, _retried} = AshBulkDurable.retry(bulk_action, corrected, scope: scope)
-      assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+      assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
 
-      assert Ash.reload!(bulk_action, authorize?: false).status == :completed
+      assert Ash.reload!(bulk_action, authorize?: false, load: [:rows_done]).status == :completed
       assert Ash.get!(Region, %{code: tag}, authorize?: false).native_name == "اسم #{tag}"
     end
   end
@@ -370,8 +370,8 @@ defmodule AshBulkDurable.Sheet.MappingTest do
       {:ok, bulk_action} = AshBulkDurable.Sheet.stage([ctx.row], mapping(:create), scope: scope)
       assert_handed(ctx.first.id)
 
-      assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
-      bulk_action = Ash.reload!(bulk_action, authorize?: false)
+      assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
+      bulk_action = Ash.reload!(bulk_action, authorize?: false, load: [:rows_done])
       assert bulk_action.status == :completed_with_errors
 
       moved = acting_in(ctx.super_user, ctx.second)
@@ -390,8 +390,8 @@ defmodule AshBulkDurable.Sheet.MappingTest do
       {:ok, _retried} = AshBulkDurable.retry(bulk_action, corrected, scope: moved)
       assert_handed(ctx.first.id)
 
-      assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
-      assert Ash.reload!(bulk_action, authorize?: false).status == :completed
+      assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
+      assert Ash.reload!(bulk_action, authorize?: false, load: [:rows_done]).status == :completed
       assert Ash.get!(Region, %{code: code}, authorize?: false).native_name == "اسم #{code}"
     end
   end
@@ -404,8 +404,8 @@ defmodule AshBulkDurable.Sheet.MappingTest do
 
     defp run_retry!(bulk_action, sheet, scope) do
       assert {:ok, _retried} = AshBulkDurable.retry(bulk_action, sheet, scope: scope)
-      assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
-      Ash.reload!(bulk_action, authorize?: false)
+      assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
+      Ash.reload!(bulk_action, authorize?: false, load: [:rows_done])
     end
 
     defp edited(sheet, cells), do: %{sheet | rows: Enum.map(sheet.rows, &Map.merge(&1, cells))}
@@ -430,8 +430,8 @@ defmodule AshBulkDurable.Sheet.MappingTest do
           scope: scope
         )
 
-      assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
-      bulk_action = Ash.reload!(bulk_action, authorize?: false)
+      assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
+      bulk_action = Ash.reload!(bulk_action, authorize?: false, load: [:rows_done])
 
       sheet = AshBulkDurable.errors_sheet(bulk_action)
       assert [%{"phone" => "ten digits", "name" => "Wrong"}] = sheet.rows
@@ -516,7 +516,7 @@ defmodule AshBulkDurable.Sheet.MappingTest do
           scope: ctx.scope
         )
 
-      assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+      assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
 
       bulk_action
       |> Ash.reload!(authorize?: false)
@@ -531,7 +531,7 @@ defmodule AshBulkDurable.Sheet.MappingTest do
           scope: ctx.scope
         )
 
-      assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+      assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
 
       bulk_action
       |> Ash.reload!(authorize?: false)
@@ -547,7 +547,7 @@ defmodule AshBulkDurable.Sheet.MappingTest do
           scope: ctx.scope
         )
 
-      assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+      assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
 
       bulk_action
       |> Ash.reload!(authorize?: false)
@@ -573,8 +573,8 @@ defmodule AshBulkDurable.Sheet.MappingTest do
           scope: scope
         )
 
-      assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
-      bulk_action = Ash.reload!(bulk_action, authorize?: false)
+      assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
+      bulk_action = Ash.reload!(bulk_action, authorize?: false, load: [:rows_done])
       sheet = AshBulkDurable.errors_sheet(bulk_action)
 
       bulk_action =
@@ -633,7 +633,11 @@ defmodule AshBulkDurable.Sheet.MappingTest do
           authorize?: false
         )
 
-      read = Ash.get!(AshBulkDurable.Test.BulkAction, bulk_action.id, authorize?: false)
+      read =
+        Ash.get!(AshBulkDurable.Test.BulkAction, bulk_action.id,
+          authorize?: false,
+          load: [:rows_done, :rows_pending]
+        )
 
       assert Mapping.from_bulk_action(read) == mapping
 

@@ -15,7 +15,7 @@ defmodule AshBulkDurable.PrimaryKeyTest do
   setup %{super_user: user}, do: %{scope: AshBulkDurable.Test.Scope.new(actor: user)}
 
   defp run!(bulk_action) do
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
 
     rows =
       Row
@@ -23,7 +23,8 @@ defmodule AshBulkDurable.PrimaryKeyTest do
       |> Ash.Query.sort(row_index: :asc)
       |> Ash.read!(authorize?: false)
 
-    {Ash.get!(BulkAction, bulk_action.id, authorize?: false), rows}
+    {Ash.get!(BulkAction, bulk_action.id, authorize?: false, load: [:rows_done, :rows_pending]),
+     rows}
   end
 
   defp plate(number), do: Ash.get(Plate, number, authorize?: false)

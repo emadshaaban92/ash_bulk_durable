@@ -2,9 +2,9 @@ defmodule AshBulkDurable.Core.Retry do
   @moduledoc """
   Puts a finished bulk action's rows back to the worker: `retry/2` every row
   that has not succeeded, `retry_row/2` one failed row alone. Both write the
-  corrections and the bulk action's job in one transaction, and the worker
-  then runs the rows that are no longer finished, as it ran them the first
-  time.
+  corrections and put the bulk action back to `:queued` in one transaction,
+  and the worker then runs the rows that are no longer finished, as it ran
+  them the first time.
 
   A bulk action that finished with failed rows, or failed outright, can be
   retried. One queued or running is refused, as are one completed or
@@ -54,9 +54,9 @@ defmodule AshBulkDurable.Core.Retry do
 
   @doc """
   Reruns one failed `row` alone, the bulk action's other rows staying as
-  they are, through the same job: its result is read as `retry/2`'s is.
+  they are, through the same run: its result is read as `retry/2`'s is.
 
-  The job runs every row left unprocessed, so a bulk action that failed
+  The run takes every row left unprocessed, so a bulk action that failed
   before reaching them is refused with `{:error, %{unprocessed: count}}`,
   nothing written: `retry/2` resumes them.
 
@@ -119,7 +119,7 @@ defmodule AshBulkDurable.Core.Retry do
   # The rows go first: each compares the shared input it ran with to the one
   # it will, so the bulk action must still hold the former. That is read here
   # rather than taken from the caller, whose copy may predate another retry:
-  # one still saying `:running` would write no status, and no job would run.
+  # one still saying `:running` would match no row, and nothing would run.
   defp write(rows, corrections, shared, bulk_action, opts) do
     resources = [Core.config(:bulk_action_resource), Core.config(:row_resource)]
 
@@ -133,6 +133,7 @@ defmodule AshBulkDurable.Core.Retry do
         {:error, error} -> Ash.DataLayer.rollback(resources, error)
       end
     end)
+    |> Core.nudge_poller()
   end
 
   defp all_known(corrections, rows) do

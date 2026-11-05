@@ -43,7 +43,7 @@ defmodule AshBulkDurable.Core.Resource.BulkActionAtomicCapTest do
       AshBulkDurable.StorageHelpers.put_config(:atomic_mode_max_rows, 1)
 
       rows_before = AshBulkDurable.Test.Repo.aggregate(Row, :count, :id)
-      jobs_before = AshBulkDurable.Test.Repo.aggregate(Oban.Job, :count, :id)
+      bulk_actions_before = AshBulkDurable.Test.Repo.aggregate(BulkAction, :count, :id)
 
       attrs = create_attrs(%{mode: :all_or_nothing})
 
@@ -51,7 +51,7 @@ defmodule AshBulkDurable.Core.Resource.BulkActionAtomicCapTest do
                Ash.create(BulkAction, attrs, action: :create, authorize?: false)
 
       assert AshBulkDurable.Test.Repo.aggregate(Row, :count, :id) == rows_before
-      assert AshBulkDurable.Test.Repo.aggregate(Oban.Job, :count, :id) == jobs_before
+      assert AshBulkDurable.Test.Repo.aggregate(BulkAction, :count, :id) == bulk_actions_before
     end
 
     test "allows atomic-mode submits at or below the cap" do

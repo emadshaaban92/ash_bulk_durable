@@ -3,10 +3,9 @@ defmodule AshBulkDurable.Core.TelemetryTest do
   Verifies the telemetry events fire at the documented sites with the
   documented measurement / metadata shapes. A handler attached in the test
   process forwards every event to the mailbox (the worker runs inline under
-  `perform_job/3`, so the emits land here).
+  `Worker.run_now/1`, so the emits land here).
   """
   use AshBulkDurable.DataCase, async: true
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
 
   alias AshBulkDurable.Core.Worker
   alias AshBulkDurable.Test.BulkAction
@@ -86,7 +85,7 @@ defmodule AshBulkDurable.Core.TelemetryTest do
       suffix = System.unique_integer([:positive])
       bulk_action = create_bulk_action!(region_rows(3, suffix), 50, user.id)
       bulk_action_id = bulk_action.id
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action_id})
+      assert :ok = Worker.run_now(bulk_action_id)
 
       assert_receive {:telemetry, [:ash_bulk_durable, :worker_attempt, :start], %{system_time: _},
                       %{bulk_action_id: ^bulk_action_id, attempt: 1, pending_rows_at_start: 3}}
@@ -142,7 +141,7 @@ defmodule AshBulkDurable.Core.TelemetryTest do
 
       bulk_action = create_bulk_action!(region_rows(5, suffix), 5, user.id, :all_or_nothing)
       bulk_action_id = bulk_action.id
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action_id})
+      assert :ok = Worker.run_now(bulk_action_id)
 
       assert_receive {:telemetry, [:ash_bulk_durable, :bulk_action, :start], _,
                       %{bulk_action_id: ^bulk_action_id, mode: :all_or_nothing}}
@@ -170,7 +169,7 @@ defmodule AshBulkDurable.Core.TelemetryTest do
 
       bulk_action = create_bulk_action!(region_rows(5, suffix), 2, user.id)
       bulk_action_id = bulk_action.id
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action_id})
+      assert :ok = Worker.run_now(bulk_action_id)
 
       assert_receive {:telemetry, [:ash_bulk_durable, :chunk, :stop], %{rows_succeeded: _},
                       %{

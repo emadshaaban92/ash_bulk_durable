@@ -1,7 +1,7 @@
 defmodule AshBulkDurable.Core.RunnerTest do
   @moduledoc """
   Unit tests for the primitives in `AshBulkDurable.Core.Runner` that the
-  Oban worker calls directly:
+  worker calls directly:
 
     * `resolve_references/3` — phase 1: what one row's input references
       resolve to.

@@ -56,14 +56,16 @@ defmodule ExampleWeb.Scenarios.BulkTenantColumnScenarioTest do
         ]
       )
 
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
 
     {:ok, view, _html} = conn |> login_as(user) |> live(~p"/bulk")
     html = render(view)
     assert html =~ "1 of 2 rows done"
     assert html =~ "SOTUH"
 
-    bulk_action = Ash.get!(BulkAction, bulk_action.id, authorize?: false)
+    bulk_action =
+      Ash.get!(BulkAction, bulk_action.id, authorize?: false, load: [:rows_done, :rows_pending])
+
     errors = AshBulkDurable.errors_sheet(bulk_action)
     assert [%{"tenant.code" => "SOTUH"} = cells] = errors.rows
 
@@ -81,7 +83,7 @@ defmodule ExampleWeb.Scenarios.BulkTenantColumnScenarioTest do
     |> render_upload("corrections.csv")
 
     view |> element("#bulk-action-panel button", "Retry failed rows") |> render_click()
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert %{success: 1, failure: 0} = AshBulkDurable.Core.Worker.drain()
 
     assert render(view) =~ "2 of 2 rows done"
     assert names(north) == ["kept"]

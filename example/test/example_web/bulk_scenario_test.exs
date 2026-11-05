@@ -70,7 +70,7 @@ defmodule ExampleWeb.BulkScenarioTest do
   end
 
   defp finish(view, user) do
-    assert %{failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert %{failure: 0} = AshBulkDurable.Core.Worker.drain()
     _ = :sys.get_state(view.pid)
     render(view)
     latest(user)
@@ -81,6 +81,7 @@ defmodule ExampleWeb.BulkScenarioTest do
     |> Ash.Query.filter(user_id == ^user.id)
     |> Ash.Query.sort(id: :desc)
     |> Ash.Query.limit(1)
+    |> Ash.Query.load([:rows_done, :rows_pending])
     |> Ash.read_one!(authorize?: false)
   end
 

@@ -109,18 +109,6 @@
       "type": "map"
     },
     {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "oban_job_id",
-      "type": "bigint"
-    },
-    {
       "allow_nil?": false,
       "default": "\"queued\"",
       "generated?": false,
@@ -166,18 +154,6 @@
       "scale": null,
       "size": null,
       "source": "chunk_size",
-      "type": "bigint"
-    },
-    {
-      "allow_nil?": false,
-      "default": "0",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "rows_done",
       "type": "bigint"
     },
     {
@@ -229,6 +205,54 @@
       "type": "utc_datetime_usec"
     },
     {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "lease_until",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "claim_token",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": false,
+      "default": "0",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "attempts",
+      "type": "bigint"
+    },
+    {
+      "allow_nil?": false,
+      "default": "0",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "shutdowns",
+      "type": "bigint"
+    },
+    {
       "allow_nil?": false,
       "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
       "generated?": false,
@@ -256,10 +280,39 @@
   "base_filter": null,
   "check_constraints": [],
   "create_table_options": null,
-  "custom_indexes": [],
+  "custom_indexes": [
+    {
+      "all_tenants?": false,
+      "concurrently": false,
+      "error_fields": [
+        "inserted_at",
+        "id"
+      ],
+      "fields": [
+        {
+          "type": "atom",
+          "value": "inserted_at"
+        },
+        {
+          "type": "atom",
+          "value": "id"
+        }
+      ],
+      "include": null,
+      "include_base_filter?": true,
+      "message": null,
+      "name": null,
+      "nulls_distinct": true,
+      "prefix": null,
+      "table": null,
+      "unique": false,
+      "using": null,
+      "where": "status IN ('queued', 'running')"
+    }
+  ],
   "custom_statements": [],
   "has_create_action": true,
-  "hash": "FB75E428607E1C9E18E70A9A4E696CB31BCC82AE338BFDD225EE4856FF06F750",
+  "hash": "CD3CE3F7EE5C1EE18BDA3933A1F90B990E3169B9032CA9782EB541694261A5B3",
   "identities": [
     {
       "all_tenants?": false,

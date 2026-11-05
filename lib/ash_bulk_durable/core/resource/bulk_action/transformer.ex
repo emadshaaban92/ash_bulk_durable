@@ -28,7 +28,6 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
      |> add_attribute(:input, AshBulkDurable.Core.StoredTerm, allow_nil?: true, public?: true)
      |> add_attribute(:staged_files, :map, allow_nil?: false, public?: true, default: %{})
      |> add_attribute(:metadata, :map, allow_nil?: false, public?: true, default: %{})
-     |> add_attribute(:oban_job_id, :integer, allow_nil?: true, public?: true)
      |> add_attribute(:status, :atom,
        allow_nil?: false,
        public?: true,
@@ -44,20 +43,24 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
        constraints: [one_of: [:per_row, :all_or_nothing]]
      )
      |> add_attribute(:chunk_size, :integer, allow_nil?: false, public?: true)
-     |> add_attribute(:rows_done, :integer, allow_nil?: false, public?: true, default: 0)
      |> add_attribute(:error, AshBulkDurable.Core.StoredErrors, allow_nil?: true, public?: true)
      |> add_attribute(:result, :map, allow_nil?: true, public?: true)
      |> add_attribute(:started_at, :utc_datetime_usec, allow_nil?: true, public?: true)
      |> add_attribute(:finished_at, :utc_datetime_usec, allow_nil?: true, public?: true)
+     |> add_attribute(:lease_until, :utc_datetime_usec, allow_nil?: true, public?: true)
+     |> add_attribute(:claim_token, :uuid, allow_nil?: true, public?: true)
+     |> add_attribute(:attempts, :integer, allow_nil?: false, public?: true, default: 0)
+     |> add_attribute(:shutdowns, :integer, allow_nil?: false, public?: true, default: 0)
      |> add_create_timestamp(:inserted_at)
      |> add_update_timestamp(:updated_at)
+     |> add_rows_relationship()
+     |> add_row_count(:rows_done, :succeeded)
+     |> add_row_count(:rows_pending, :pending)
      |> add_one_unresolved_identity()
+     |> add_claimable_index()
      |> add_default_accept()
      |> add_defaults()
      |> add_create_action()
-     |> add_set_oban_job_id_action()
-     |> add_mark_running_action()
-     |> add_bump_rows_done_action()
      |> add_mark_finished_action()
      |> add_enqueue_retry_action()
      |> add_fetch_for_user_unresolved_action()
@@ -118,6 +121,69 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
     end
   end
 
+  # ── Row counts ───────────────────────────────────────────────────────────
+
+  # The counts are taken over `:rows`, so a host's own `:rows` must be the
+  # one to the row resource, not something else counted in its place.
+  defp add_rows_relationship(dsl_state) do
+    row_resource = AshBulkDurable.Core.config(:row_resource)
+
+    case Info.relationship(dsl_state, :rows) do
+      nil ->
+        build_rows_relationship(dsl_state, row_resource)
+
+      %{destination: ^row_resource} ->
+        dsl_state
+
+      %{destination: other} ->
+        raise Spark.Error.DslError,
+          module: Transformer.get_persisted(dsl_state, :module),
+          path: [:relationships, :rows],
+          message: """
+          `:rows` must point at the row resource (#{inspect(row_resource)}), \
+          not #{inspect(other)}: `rows_done` and `rows_pending` count it.
+          """
+    end
+  end
+
+  defp build_rows_relationship(dsl_state, row_resource) do
+    {:ok, relationship} =
+      Transformer.build_entity(Dsl, [:relationships], :has_many,
+        name: :rows,
+        destination: row_resource,
+        destination_attribute: :bulk_action_id,
+        public?: true
+      )
+
+    Transformer.add_entity(dsl_state, [:relationships], relationship, type: :append)
+  end
+
+  # Progress is counted from the rows, not kept on the bulk action: a counter
+  # bumped inside a chunk's transaction would hold the bulk action's row
+  # locked until it commits, and its lease could not be renewed meanwhile.
+  # The rows' `(bulk_action_id, status, row_index)` index serves the count.
+  defp add_row_count(dsl_state, name, status) do
+    import Ash.Expr
+
+    if Info.aggregate(dsl_state, name) do
+      dsl_state
+    else
+      {:ok, aggregate} =
+        Transformer.build_entity(Dsl, [:aggregates], :count,
+          name: name,
+          relationship_path: [:rows],
+          filter: expr(status == ^status),
+          default: 0,
+          public?: true,
+          # Progress of a bulk action its reader can already read: a row
+          # policy narrower than the bulk action's must not zero it.
+          authorize?: false
+        )
+
+      Transformer.add_entity(dsl_state, [:aggregates], aggregate, type: :append)
+    end
+  end
+
   # ── Identity ─────────────────────────────────────────────────────────────
 
   # One *unresolved* bulk action per user: a bulk action holds the slot while it's queued,
@@ -148,6 +214,30 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
         )
 
       Transformer.add_entity(dsl_state, [:identities], identity, type: :append)
+    end
+  end
+
+  # What the poller's claim and `fail_exhausted` read every few seconds on
+  # every node: the few in-flight bulk actions, oldest first, out of the
+  # whole history.
+  defp add_claimable_index(dsl_state) do
+    where = "status IN ('queued', 'running')"
+
+    existing =
+      dsl_state
+      |> Transformer.get_entities([:postgres, :custom_indexes])
+      |> Enum.any?(&(&1.where == where))
+
+    if existing do
+      dsl_state
+    else
+      {:ok, index} =
+        Transformer.build_entity(AshPostgres.DataLayer, [:postgres, :custom_indexes], :index,
+          fields: [:inserted_at, :id],
+          where: where
+        )
+
+      Transformer.add_entity(dsl_state, [:postgres, :custom_indexes], index, type: :append)
     end
   end
 
@@ -225,98 +315,13 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
           change: AshBulkDurable.Core.Changes.PersistRows
         )
 
-      enqueue_worker =
-        Transformer.build_entity!(Dsl, [:actions, :create], :change,
-          change: AshBulkDurable.Core.Changes.EnqueueWorker
-        )
-
       {:ok, action} =
         Transformer.build_entity(Dsl, [:actions], :create,
           name: :create,
           primary?: true,
           accept: accept,
           arguments: [rows_argument],
-          changes: [
-            validate_atomic_mode,
-            persist_rows,
-            enqueue_worker
-          ]
-        )
-
-      Transformer.add_entity(dsl_state, [:actions], action, type: :append)
-    end
-  end
-
-  defp add_set_oban_job_id_action(dsl_state) do
-    if Info.action(dsl_state, :set_oban_job_id) do
-      dsl_state
-    else
-      {:ok, action} =
-        Transformer.build_entity(Dsl, [:actions], :update,
-          name: :set_oban_job_id,
-          accept: [:oban_job_id],
-          require_atomic?: false
-        )
-
-      Transformer.add_entity(dsl_state, [:actions], action, type: :append)
-    end
-  end
-
-  defp add_mark_running_action(dsl_state) do
-    if Info.action(dsl_state, :mark_running) do
-      dsl_state
-    else
-      set_status =
-        Transformer.build_entity!(Dsl, [:actions, :update], :change,
-          change: {Ash.Resource.Change.SetAttribute, [attribute: :status, value: :running]}
-        )
-
-      set_started_at =
-        Transformer.build_entity!(Dsl, [:actions, :update], :change,
-          change:
-            {Ash.Resource.Change.SetAttribute,
-             [attribute: :started_at, value: &DateTime.utc_now/0]}
-        )
-
-      {:ok, action} =
-        Transformer.build_entity(Dsl, [:actions], :update,
-          name: :mark_running,
-          accept: [],
-          require_atomic?: false,
-          changes: [set_status, set_started_at]
-        )
-
-      Transformer.add_entity(dsl_state, [:actions], action, type: :append)
-    end
-  end
-
-  defp add_bump_rows_done_action(dsl_state) do
-    if Info.action(dsl_state, :bump_rows_done) do
-      dsl_state
-    else
-      import Ash.Expr
-
-      n_argument =
-        Transformer.build_entity!(Dsl, [:actions, :update], :argument,
-          name: :n,
-          type: :integer,
-          allow_nil?: false,
-          default: 1
-        )
-
-      atomic_bump =
-        Transformer.build_entity!(Dsl, [:actions, :update], :change,
-          change:
-            {Ash.Resource.Change.Atomic,
-             [attribute: :rows_done, expr: expr(rows_done + ^arg(:n)), cast_atomic?: true]}
-        )
-
-      {:ok, action} =
-        Transformer.build_entity(Dsl, [:actions], :update,
-          name: :bump_rows_done,
-          accept: [],
-          arguments: [n_argument],
-          changes: [atomic_bump]
+          changes: [validate_atomic_mode, persist_rows]
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)
@@ -368,23 +373,13 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
           change: AshBulkDurable.Core.Changes.ReopenBulkAction
         )
 
-      set_status =
-        Transformer.build_entity!(Dsl, [:actions, :update], :change,
-          change: {Ash.Resource.Change.SetAttribute, [attribute: :status, value: :running]}
-        )
-
-      enqueue_worker =
-        Transformer.build_entity!(Dsl, [:actions, :update], :change,
-          change: AshBulkDurable.Core.Changes.EnqueueWorker
-        )
-
       {:ok, action} =
         Transformer.build_entity(Dsl, [:actions], :update,
           name: :enqueue_retry,
           accept: [],
           require_atomic?: false,
           arguments: [input_argument],
-          changes: [reopen, set_status, enqueue_worker]
+          changes: [reopen]
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)

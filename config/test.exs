@@ -11,7 +11,9 @@ config :ash_bulk_durable,
   storage: Test.Storage,
   pubsub_module: Test.PubSub,
   field_handlers: [Test.FilesHandler],
-  phase1_concurrency: 1
+  phase1_concurrency: 1,
+  # Tests run bulk actions with `Worker.drain/0`, not a poller.
+  warn_without_poller: false
 
 config :ash_bulk_durable, Test.Repo,
   priv: "priv/test_repo",
@@ -27,11 +29,6 @@ config :ash_bulk_durable, Test.Repo,
   queue_interval: 30_000,
   timeout: 60_000,
   ownership_timeout: 120_000
-
-config :ash_bulk_durable, Oban,
-  repo: Test.Repo,
-  testing: :manual,
-  queues: [bulk_actions: 4]
 
 config :ash,
   allow_forbidden_field_for_relationships_by_default?: true,

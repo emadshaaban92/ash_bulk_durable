@@ -85,7 +85,7 @@ defmodule ExampleWeb.Bulk.UnresolvableRelationshipRowTest do
 
     run_region_bulk_action(conn, super_user, file_path)
 
-    assert %{failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert %{failure: 0} = AshBulkDurable.Core.Worker.drain()
 
     updated =
       Branch
@@ -116,7 +116,7 @@ defmodule ExampleWeb.Bulk.UnresolvableRelationshipRowTest do
 
     # The worker completes the job (no uncaught raise) and the bulk action lands
     # terminal with the row error surfaced — not stranded at `:running`.
-    assert %{failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert %{failure: 0} = AshBulkDurable.Core.Worker.drain()
     assert last_bulk_action().status == :failed
 
     unchanged =

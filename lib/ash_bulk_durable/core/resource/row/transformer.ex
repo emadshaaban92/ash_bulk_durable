@@ -287,6 +287,11 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
     if Info.action(dsl_state, :resolve) do
       dsl_state
     else
+      guard =
+        Transformer.build_entity!(Dsl, [:actions, :update], :change,
+          change: {AshBulkDurable.Core.Changes.RequireStatus, statuses: [:pending]}
+        )
+
       change =
         Transformer.build_entity!(Dsl, [:actions, :update], :change,
           change: AshBulkDurable.Core.Changes.ResolveRow
@@ -297,7 +302,7 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
           name: :resolve,
           accept: [],
           require_atomic?: false,
-          changes: [change]
+          changes: [guard, require_claim(), change]
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)
@@ -315,6 +320,13 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
           allow_nil?: false
         )
 
+      # Moves a row back to `:pending`, so it must not touch one another run
+      # has already applied.
+      guard =
+        Transformer.build_entity!(Dsl, [:actions, :update], :change,
+          change: {AshBulkDurable.Core.Changes.RequireStatus, statuses: [:pending, :resolved]}
+        )
+
       forget =
         Transformer.build_entity!(Dsl, [:actions, :update], :change,
           change: AshBulkDurable.Core.Changes.ForgetResolutions
@@ -326,7 +338,7 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
           accept: [],
           require_atomic?: false,
           arguments: [names_arg],
-          changes: [forget]
+          changes: [guard, require_claim(), forget]
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)
@@ -354,13 +366,18 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
           change: AshBulkDurable.Core.Changes.SetRecordIdFromArg
         )
 
+      guard =
+        Transformer.build_entity!(Dsl, [:actions, :update], :change,
+          change: {AshBulkDurable.Core.Changes.RequireStatus, statuses: [:resolved]}
+        )
+
       {:ok, action} =
         Transformer.build_entity(Dsl, [:actions], :update,
           name: :mark_succeeded,
           accept: [],
           require_atomic?: false,
           arguments: [record_id_arg],
-          changes: [set_status, set_record_id]
+          changes: [guard, set_status, set_record_id]
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)
@@ -388,13 +405,18 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
           change: AshBulkDurable.Core.Changes.SetErrorFromArg
         )
 
+      guard =
+        Transformer.build_entity!(Dsl, [:actions, :update], :change,
+          change: {AshBulkDurable.Core.Changes.RequireStatus, statuses: [:pending, :resolved]}
+        )
+
       {:ok, action} =
         Transformer.build_entity(Dsl, [:actions], :update,
           name: :mark_failed,
           accept: [],
           require_atomic?: false,
           arguments: [error_arg],
-          changes: [set_status, set_error]
+          changes: [guard, require_claim(), set_status, set_error]
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)
@@ -508,5 +530,12 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
 
       Transformer.add_entity(dsl_state, [:postgres, :custom_indexes], index, type: :append)
     end
+  end
+
+  # A run's row write confirms its claim before it commits.
+  defp require_claim do
+    Transformer.build_entity!(Dsl, [:actions, :update], :change,
+      change: AshBulkDurable.Core.Changes.RequireClaim
+    )
   end
 end

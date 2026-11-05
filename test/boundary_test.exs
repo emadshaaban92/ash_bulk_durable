@@ -1,6 +1,6 @@
 defmodule AshBulkDurable.BoundaryTest do
   @moduledoc """
-  `ash_bulk_durable` stands on Ash, Oban and Postgres alone: nothing under
+  `ash_bulk_durable` stands on Ash and Postgres alone: nothing under
   `lib/` names Phoenix or ash_phoenix, not even in a comment. An app plugs in
   through config (`:owner_module`, the storage driver, the field handlers),
   never by name.

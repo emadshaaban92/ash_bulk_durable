@@ -5,11 +5,9 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
   through a shell resource (`AshBulkDurable.Test.BulkAction`).
   """
   use AshBulkDurable.DataCase, async: true
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
 
   require Ash.Query
 
-  alias AshBulkDurable.Core.Worker
   alias AshBulkDurable.Test.{BulkAction, Row}
 
   @valid_rows [
@@ -40,14 +38,18 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
   end
 
   describe ":create" do
-    test "persists the bulk action, the rows, and an Oban job — all atomically" do
+    test "persists the bulk action, :queued, and its rows — all atomically" do
       bulk_action = create_bulk_action!()
 
       assert bulk_action.status == :queued
       assert bulk_action.total_rows == 2
-      assert bulk_action.rows_done == 0
-      assert bulk_action.oban_job_id
-      assert is_integer(bulk_action.oban_job_id)
+      assert bulk_action.attempts == 0
+      assert bulk_action.claim_token == nil
+
+      assert Ash.get!(BulkAction, bulk_action.id,
+               authorize?: false,
+               load: [:rows_done, :rows_pending]
+             ).rows_done == 0
 
       rows =
         Row
@@ -61,9 +63,6 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
 
       assert rows |> Enum.sort_by(& &1.row_index) |> Enum.map(&Map.take(&1, [:input, :metadata])) ==
                @valid_rows
-
-      # Exactly one worker job was enqueued for this bulk action.
-      assert length(all_enqueued(worker: Worker, args: %{bulk_action_id: bulk_action.id})) == 1
     end
   end
 
@@ -74,11 +73,6 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
       _first = create_bulk_action!(%{user_id: user_id})
 
       rows_before = AshBulkDurable.Test.Repo.aggregate(Row, :count, :id)
-      # Count ALL worker jobs, not just the first bulk action's — the second create's
-      # job would carry the second bulk action's id, so a bulk_action_id-scoped count could
-      # never observe it and the rollback assertion would be vacuous. Sandbox
-      # isolation already scopes this to the current test under async.
-      jobs_before = length(all_enqueued(worker: Worker))
 
       assert {:error, %Ash.Error.Invalid{}} =
                Ash.create(BulkAction, create_attrs(%{user_id: user_id}),
@@ -86,12 +80,9 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
                  authorize?: false
                )
 
-      # The full create transaction (bulk action + rows + Oban job) rolled back
-      # because the unique violation raised inside the same Ash.create — the
-      # first bulk action's rows and job are untouched, and no stray job for the
-      # rejected second bulk action leaked out.
+      # The full create transaction (bulk action + rows) rolled back because
+      # the unique violation raised inside the same Ash.create.
       assert AshBulkDurable.Test.Repo.aggregate(Row, :count, :id) == rows_before
-      assert length(all_enqueued(worker: Worker)) == jobs_before
     end
 
     test "creating after the previous bulk action reached a terminal state succeeds" do
@@ -146,7 +137,7 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
       assert %BulkAction{} = create_bulk_action!(%{user_id: user_id})
     end
 
-    test "retrying a :completed_with_errors bulk action flips it to :running without a violation" do
+    test "retrying a :completed_with_errors bulk action queues it again without a violation" do
       user_id = Ecto.UUID.generate()
       first = create_bulk_action!(%{user_id: user_id})
 
@@ -157,23 +148,30 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
         )
 
       # The bulk action already holds the one-unresolved slot; the
-      # completed_with_errors → running flip stays inside the index
+      # completed_with_errors → queued flip stays inside the index
       # predicate, so it can never collide with itself.
       retried = Ash.update!(parked, %{}, action: :enqueue_retry, authorize?: false)
-      assert retried.status == :running
+      assert retried.status == :queued
     end
   end
 
-  describe ":bump_rows_done" do
-    test "increments rows_done atomically" do
+  describe "row counts" do
+    test "rows_done counts the succeeded rows, rows_pending the pending ones" do
       bulk_action = create_bulk_action!()
+      assert %{rows_done: 0, rows_pending: 0} = reread(bulk_action)
 
-      bumped = Ash.update!(bulk_action, %{n: 1}, action: :bump_rows_done, authorize?: false)
-      assert bumped.rows_done == 1
+      [row | _rest] =
+        Row
+        |> Ash.Query.filter(bulk_action_id == ^bulk_action.id)
+        |> Ash.read!(authorize?: false)
 
-      bumped2 = Ash.update!(bumped, %{n: 5}, action: :bump_rows_done, authorize?: false)
-      assert bumped2.rows_done == 6
+      Ash.update!(row, %{record_id: "1"}, action: :mark_succeeded, authorize?: false)
+      assert %{rows_done: 1} = reread(bulk_action)
     end
+
+    defp reread(bulk_action),
+      do:
+        Ash.get!(BulkAction, bulk_action.id, authorize?: false, load: [:rows_done, :rows_pending])
   end
 
   describe ":mark_finished" do
@@ -233,7 +231,9 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
       assert Enum.any?(errors, &match?(%Ash.Error.Changes.StaleRecord{}, &1))
 
       # Original verdict survives the race.
-      reread = Ash.get!(BulkAction, bulk_action.id, authorize?: false)
+      reread =
+        Ash.get!(BulkAction, bulk_action.id, authorize?: false, load: [:rows_done, :rows_pending])
+
       assert reread.status == :completed
     end
   end
@@ -243,7 +243,7 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
       bulk_action = create_bulk_action!()
       assert bulk_action.status == :queued
 
-      running = Ash.update!(bulk_action, %{}, action: :mark_running, authorize?: false)
+      {:ok, running} = AshBulkDurable.Core.Lease.claim_one(bulk_action.id)
       assert running.status == :running
 
       for held <- [bulk_action, running] do
@@ -253,7 +253,10 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
         assert Enum.any?(errors, &match?(%Ash.Error.Changes.StaleRecord{}, &1))
       end
 
-      assert Ash.get!(BulkAction, bulk_action.id, authorize?: false).status == :running
+      assert Ash.get!(BulkAction, bulk_action.id,
+               authorize?: false,
+               load: [:rows_done, :rows_pending]
+             ).status == :running
     end
 
     test "takes a bulk action that finished with failed rows, or failed outright" do
@@ -264,7 +267,7 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
           |> Ash.update!(%{result: result}, action: :mark_finished, authorize?: false)
 
         assert Ash.update!(finished, %{}, action: :enqueue_retry, authorize?: false).status ==
-                 :running
+                 :queued
       end
     end
   end
@@ -318,7 +321,7 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
       topic = "bulk_action:#{bulk_action.id}"
       :ok = AshBulkDurable.Test.PubSub.subscribe(topic)
 
-      Ash.update!(bulk_action, %{n: 1}, action: :bump_rows_done, authorize?: false)
+      Ash.update!(bulk_action, %{result: :completed}, action: :mark_finished, authorize?: false)
 
       assert_receive {^topic, _event, %Ash.Notifier.Notification{data: %BulkAction{id: id}}}, 500
 
