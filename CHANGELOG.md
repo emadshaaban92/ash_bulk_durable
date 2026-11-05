@@ -20,3 +20,9 @@
   run whose row moved on under another run of the same bulk action stops
   without writing anything more: a superseded job cancels, the current one
   retries.
+- `retry/2` and `retry_row/2` lock the bulk action (`FOR NO KEY UPDATE SKIP
+  LOCKED`, through the new `Core.BulkActionLock`) before reading or writing
+  any of its rows, and read the rows and the bulk action's status under that
+  lock. A retry while another transaction holds the bulk action, or by a
+  caller who doesn't own it, is refused at once with the usual `StaleRecord`,
+  before reading any row.
