@@ -3,14 +3,12 @@ defmodule AshBulkDurable.Core.Worker do
   Drives a single `BulkAction` through phase 1 (resolving its rows'
   references) and phase 2 (the chunk loop).
 
-  ## The run and its Oban wrapper
+  ## Running
 
-  `run/2` is the run: a plain function, given the bulk action's id, that knows
-  nothing about Oban jobs. `perform/1` is the Oban wrapper around it. It skips
-  a superseded job (see "Idempotency on terminal bulk actions"), keeps the job's
-  `Heartbeat` beating while the run goes, and turns what `run/2` returns into
-  the job's result: `:busy` ends the job `:ok`, and a run stopped by a row
-  another run moved on cancels or snoozes the job (see "Overlapping runs").
+  `run/2` is the run: a plain function, given the bulk action's id, that
+  drives it from where its rows stand to its verdict. A host's
+  `AshBulkDurable.Core.Poller` calls it in a task for each bulk action it
+  starts.
 
   `run_now/1` and `drain/0` run bulk actions in the calling process, for a
   host's tests and scripts: `run_now/1` runs one, and `drain/0` every bulk
@@ -20,17 +18,20 @@ defmodule AshBulkDurable.Core.Worker do
 
   ## Crash-resume
 
-  `max_attempts: 3` is safe because the row-state mutation IS the
-  pagination. Phase 1 reads `:next_pending_chunk` (rows still `:pending`;
-  a row holding no reference is stored `:resolved` and never read here)
-  and flips them to `:resolved`; phase 2 reads `:next_resolved_chunk`
-  (rows `:resolved` but not yet applied) and flips them to `:succeeded`.
-  A retry resumes at the next un-touched row in whichever phase it died
-  in — no row committed twice.
+  A run can die anywhere and start again, because the row-state mutation IS
+  the pagination. Phase 1 reads `:next_pending_chunk` (rows still
+  `:pending`; a row holding no reference is stored `:resolved` and never
+  read here) and flips them to `:resolved`; phase 2 reads
+  `:next_resolved_chunk` (rows `:resolved` but not yet applied) and flips
+  them to `:succeeded`. The next run resumes at the next un-touched row in
+  whichever phase the last died in — no row committed twice.
 
-  A node that dies takes no attempt with it: its job stays `:executing`, the
-  run's `Heartbeat` stops, and `RescueStuckBulkActions` fails the bulk action
-  for its owner to retry, which resumes the same way.
+  A node that dies leaves its bulk action `:running`. Its liveness hint
+  (`alive_at`, see `AshBulkDurable.Core.Liveness`) stops moving, and once it
+  is older than the poller's `:stale_after` a poller starts the bulk action
+  again, which resumes the same way. A run stamps the hint in its start
+  transaction and in every chunk it commits, and a ticker linked to the run
+  stamps it every `:alive_interval` between them.
 
   ## The bulk action lock
 
@@ -49,8 +50,8 @@ defmodule AshBulkDurable.Core.Worker do
 
   Postgres releases the lock at commit, at rollback and when a connection
   dies, so a run that lost it has nothing left that can commit. A lock
-  another transaction holds stops the run at once, writing nothing; the job
-  ends `:ok`.
+  another transaction holds stops the run at once, writing nothing; `run/2`
+  returns `:busy`.
 
   The lock covers only what is written on the bulk action's own connection,
   so every target must live in the bulk action's repo.
@@ -67,8 +68,8 @@ defmodule AshBulkDurable.Core.Worker do
   - Staged-file download error, with a row left for a resolver → each such
     row fails alone (`StagedFileError`) and the rest run. All or nothing →
     `:mark_finished({:failed, %{reason: :staged_file_download_error, ...}})`.
-    Does NOT raise; we want a real terminal state, not three Oban retries →
-    rescue cron.
+    Does NOT raise; we want a real terminal state, not a run that fails the
+    same way every time it is started.
   - A resolver's `prepare/2` error for a chunk →
     `:mark_finished({:failed, %{reason: :resolver_prepare_error, ...}})`.
   - All-or-nothing phase 1 failure, or a row its caller already refused →
@@ -84,7 +85,8 @@ defmodule AshBulkDurable.Core.Worker do
 
   A row that raises, or outruns `:row_resolve_timeout` in phase 1, fails like
   one that returns an error, in either phase and either mode. Only a raise from the worker's own reads and writes propagates
-  as a job failure, which is what triggers Oban's retry.
+  out of the run; the bulk action stays `:running`, and is started again once
+  its liveness hint goes stale.
 
   ## Tenants
 
@@ -105,49 +107,32 @@ defmodule AshBulkDurable.Core.Worker do
 
   ## Idempotency on terminal bulk actions
 
-  `run/2`, and so `perform/1`, short-circuits to `:ok` when the bulk action is
-  already in a terminal state. This closes the window where an attempt's BEAM
-  process dies *after* `mark_finished` committed but *before* Oban
-  acked the job: Oban will retry, but the next attempt sees a
-  terminal bulk action and no-ops. A bulk action that turns terminal after
-  that read is found so under the lock, and left as it is.
-
-  It does the same for a later attempt of a job the bulk action no longer
-  names. A retry enqueues a new job while an attempt of the old one can still
-  be waiting, and two would drive the same rows.
+  `run/2` short-circuits to `:ok` when the bulk action is already in a
+  terminal state. A bulk action that turns terminal after that read is found
+  so under the lock, and left as it is.
 
   ## Overlapping runs
 
-  Two runs can still overlap: an old attempt still running after a retry
-  queued a new job, or a run declared `worker_lost` while it was alive.
-  Between chunks a run holds nothing, so two runs take turns: each chunk
-  reads the rows the last one left, and only one verdict is written, since a
-  bulk action the other run finished no longer locks as running. Both may
-  resolve the same rows in phase 1, which costs work, not data.
+  Two runs can overlap: two pollers can start the same bulk action, and a run
+  can be started again while its first is still alive but has not stamped
+  its hint in time. Between chunks a run holds nothing, so two runs take
+  turns: each chunk reads the rows the last one left, and only one verdict is
+  written, since a bulk action the other run finished no longer locks as
+  running. Both may resolve the same rows in phase 1, which costs work, not
+  data.
 
   Each row status flip is also a compare-and-set
   (`AshBulkDurable.Core.Changes.RequireStatus`), which is phase 1's only
   guard, and catches any phase-2 write that slips past the lock: the run that
   comes second to a row is refused, and the transaction holding the refused
-  flip rolls back with whatever it wrote. The run then
-  stops without writing anything more, and no verdict: if the bulk action is
-  terminal or names another job, this job is superseded and cancels;
-  otherwise this job is the current run, a stale one got to the row first,
-  and it snoozes for 30 seconds, then resumes from the rows' status like any
-  other attempt. Snoozing gives the attempt back, so a run that keeps
-  colliding never exhausts its attempts and is never failed as `worker_lost`
-  for that.
+  flip rolls back with whatever it wrote. The run then stops without writing
+  anything more, and no verdict, returning `{:stopped, :row_moved_on}`; the
+  other run carries the bulk action on.
   """
-  # The queue is host-configurable at enqueue time through the
-  # `AshBulkDurable.Core.config/2` seam (see `AshBulkDurable.Core.Changes.EnqueueWorker`),
-  # which is the single source of truth for `ash_bulk_durable` config. This
-  # `:bulk_actions` literal is only the compile-time default Oban needs on
-  # the worker; the insert-time `queue:` override is what actually runs.
-  use Oban.Worker, queue: :bulk_actions, max_attempts: 3
 
   alias AshBulkDurable.Core.{
     BulkActionLock,
-    Heartbeat,
+    Liveness,
     Reference,
     Runner,
     StagedFileError,
@@ -160,67 +145,36 @@ defmodule AshBulkDurable.Core.Worker do
   require Ash.Query
   require Logger
 
+  @runnable [:queued, :running]
+  @ticker {__MODULE__, :ticker}
+
   # A row's files run one after another, each an extraction and a PUT.
   @row_resolve_timeout :timer.minutes(5)
 
-  @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"bulk_action_id" => bulk_action_id}, attempt: attempt} = job) do
-    bulk_action = fetch_bulk_action!(bulk_action_id)
-
-    if terminal?(bulk_action.status) or superseded?(job, bulk_action) do
-      :ok
-    else
-      job
-      |> Heartbeat.beating(fn -> run(bulk_action_id, attempt: attempt) end)
-      |> job_result(job, bulk_action_id)
-    end
-  end
-
-  defp job_result(:ok, _job, _bulk_action_id), do: :ok
-  defp job_result(:busy, _job, _bulk_action_id), do: :ok
-
-  defp job_result({:stopped, :row_moved_on}, job, bulk_action_id),
-    do: row_moved_on(job, bulk_action_id)
-
-  # The run's transaction has rolled back and the heartbeat stopped; it
-  # writes no verdict of its own.
-  defp row_moved_on(job, bulk_action_id) do
-    bulk_action = fetch_bulk_action!(bulk_action_id)
-
-    if terminal?(bulk_action.status) or bulk_action.oban_job_id != job.id do
-      Logger.warning(
-        "bulk action #{bulk_action_id}: a row moved on under another run; " <>
-          "job #{job.id} is superseded and stops"
-      )
-
-      {:cancel, :superseded}
-    else
-      Logger.warning(
-        "bulk action #{bulk_action_id}: a stale run wrote a row first; " <>
-          "job #{job.id} stops and snoozes"
-      )
-
-      {:snooze, 30}
-    end
-  end
-
   @doc """
   Runs the bulk action `bulk_action_id` once, in the calling process: phase 1,
-  then phase 2, up to its verdict. Knows nothing about Oban jobs.
+  then phase 2, up to its verdict.
 
   Returns `:ok` when the run reached a verdict, or found nothing left to do
   (the bulk action is terminal); `:busy` when the run's start couldn't take
-  the bulk action's lock, another transaction holding it or the bulk action
-  no longer queued or running, and nothing was written; and
+  the bulk action's lock, another transaction holding it, the bulk action no
+  longer queued or running, or, with `:if_stale_after`, its liveness hint
+  still fresh, and nothing was written; and
   `{:stopped, :row_moved_on}` when another run had moved one of its rows on,
   which stopped this one without a verdict. Raises what the run's own reads
   and writes raise.
 
   `opts`:
 
+    * `:if_stale_after` - milliseconds. A `:running` bulk action whose
+      liveness hint (`alive_at`) is newer than that, on the database's clock,
+      is left alone, returning `:busy`: another run just started or stamped
+      it. Checked under the lock, in the run's start transaction. Nil by
+      default, which starts the bulk action whatever its hint; the poller
+      passes its `:stale_after`.
     * `:attempt` - reported as `attempt` in the
       `[:ash_bulk_durable, :worker_attempt, :start]` event's metadata. Nil
-      by default; `perform/1` passes the Oban job's attempt.
+      by default.
   """
   @spec run(Ash.UUID.t(), keyword()) :: :ok | :busy | {:stopped, :row_moved_on}
   def run(bulk_action_id, opts \\ []) do
@@ -230,7 +184,7 @@ defmodule AshBulkDurable.Core.Worker do
       :ok
     else
       try do
-        attempt(bulk_action, Keyword.get(opts, :attempt))
+        attempt(bulk_action, opts)
       rescue
         RowMovedOnError -> {:stopped, :row_moved_on}
       end
@@ -280,25 +234,50 @@ defmodule AshBulkDurable.Core.Worker do
     |> Ash.read_one!(authorize?: false)
   end
 
-  defp attempt(bulk_action, attempt) do
+  defp attempt(bulk_action, opts) do
     if StoredTerm.unreadable?(bulk_action) do
       finish_locked(bulk_action, {:failed, %{reason: :unreadable}})
       :ok
     else
-      emit_worker_attempt_start(bulk_action, attempt)
-      bulk_action |> start_run() |> run_started(reconstruct_scope(bulk_action))
+      emit_worker_attempt_start(bulk_action, Keyword.get(opts, :attempt))
+
+      bulk_action
+      |> start_run(Keyword.get(opts, :if_stale_after))
+      |> run_started(reconstruct_scope(bulk_action))
     end
   end
 
-  defp run_started({:ok, running}, scope), do: drive_with_telemetry(running, scope)
+  # The ticker stamps the liveness hint for as long as the run goes, and stops
+  # with it however it ends.
+  defp run_started({:ok, running}, scope) do
+    ticker = Liveness.start_ticker(running.id)
+    Process.put(@ticker, ticker)
+
+    try do
+      drive_with_telemetry(running, scope)
+    after
+      Process.delete(@ticker)
+      Liveness.stop_ticker(ticker)
+    end
+  end
+
   defp run_started(:busy, _scope), do: :busy
 
   # A run starts in a short locked transaction of its own, before phase 1:
-  # it takes the bulk action from `:queued` to `:running` and sets
-  # `started_at`, so the run shows as running, and is timed, while its
-  # references resolve. A run that can't take the lock stops here, before
-  # repeating another run's phase 1.
-  defp start_run(bulk_action), do: locked(bulk_action.id, & &1)
+  # it takes the bulk action from `:queued` to `:running`, sets `started_at`
+  # and stamps the liveness hint, so the run shows as running, and is timed,
+  # while its references resolve. A run that can't take the lock stops here,
+  # before repeating another run's phase 1, as does one asked to leave a
+  # bulk action another run stamped within `if_stale_after`.
+  defp start_run(bulk_action, nil), do: locked(bulk_action.id, &stamped/1)
+
+  defp start_run(bulk_action, if_stale_after),
+    do: locked(bulk_action.id, &stamped/1, @runnable, Liveness.startable(if_stale_after))
+
+  defp stamped(locked) do
+    Liveness.stamp!(locked)
+    locked
+  end
 
   # `[:ash_bulk_durable, :bulk_action, :start | :stop | :exception]`. The bulk action
   # reaches one terminal `mark_finished` per attempt, so the stop event's
@@ -317,11 +296,6 @@ defmodule AshBulkDurable.Core.Worker do
 
   defp terminal?(status),
     do: status in [:completed, :completed_with_errors, :failed, :cancelled]
-
-  # Only a later attempt can be late: a job is enqueued to be the one its bulk
-  # action names, which keeps a job built for a test working too.
-  defp superseded?(%Oban.Job{attempt: attempt, id: id}, %{oban_job_id: current}),
-    do: attempt > 1 and id != current
 
   defp drive(bulk_action, scope) do
     settings = Runner.settings(bulk_action, scope, %{})
@@ -429,21 +403,33 @@ defmodule AshBulkDurable.Core.Worker do
   @chunk_span {__MODULE__, :chunk_span}
 
   # Runs `fun` in a transaction of its own that first locks the bulk action
-  # (`BulkActionLock`, `SKIP LOCKED`) while its status is one of `statuses`,
-  # and gives it the locked record, taken from `:queued` to `:running` if it
-  # was queued. Returns `{:ok, result}`; `:busy`, nothing written, when
-  # another transaction holds the lock or the bulk action's status is another;
+  # (`BulkActionLock`, `SKIP LOCKED`) while its status is one of `statuses`
+  # and it matches `filter`, and gives it the locked record, taken from
+  # `:queued` to `:running` if it was queued. Returns `{:ok, result}`;
+  # `:busy`, nothing written, when another transaction holds the lock or the
+  # bulk action's status is another, or it doesn't match `filter`;
   # or `{:rolled_back, writing, error}` when rows `write_rows/5` was
   # writing failed, which rolls back the whole transaction, `writing` being
   # what it was given to remember. Ash announces what the transaction wrote
-  # once it commits.
-  defp locked(bulk_action_id, fun, statuses \\ [:queued, :running]) do
+  # once it commits. The run's ticker is held meanwhile, so its stamp never
+  # holds the lock this transaction takes (see `Liveness.hold/1`).
+  defp locked(bulk_action_id, fun, statuses \\ @runnable, filter \\ true) do
     Process.delete(@writing)
+    ticker = Process.get(@ticker)
+    Liveness.hold(ticker)
 
+    try do
+      lock_and_run(bulk_action_id, fun, statuses, filter)
+    after
+      Liveness.release(ticker)
+    end
+  end
+
+  defp lock_and_run(bulk_action_id, fun, statuses, filter) do
     Ash.transaction(
       [bulk_action_resource(), row_resource()],
       fn ->
-        case BulkActionLock.lock(bulk_action_id, statuses) do
+        case BulkActionLock.lock(bulk_action_id, statuses, filter: filter) do
           {:ok, locked} -> {:ok, fun.(start_running(locked))}
           :none -> :busy
         end
@@ -474,7 +460,7 @@ defmodule AshBulkDurable.Core.Worker do
 
   # A verdict written under the lock, read from the locked record: the
   # terminal bulk action, or nil when the lock was not taken.
-  defp finish_locked(bulk_action, result, statuses \\ [:queued, :running]) do
+  defp finish_locked(bulk_action, result, statuses \\ @runnable) do
     case locked(bulk_action.id, &mark_finished(&1, result), statuses) do
       {:ok, terminal} -> terminal
       :busy -> nil
@@ -594,9 +580,9 @@ defmodule AshBulkDurable.Core.Worker do
 
   # Acts on the terminal record returned by `mark_finished/2` (threaded
   # back through `drive/2` via `run_rows/3`). Re-reading the bulk action
-  # here would reopen a window where the rescue cron — or any other
-  # writer — could land between the terminal write and the purge
-  # decision, so the purge would key off a status the worker never set.
+  # here would reopen a window where another writer could land between the
+  # terminal write and the purge decision, so the purge would key off a
+  # status the worker never set.
   defp maybe_delete_staging(bulk_action) do
     if delete_staging?(bulk_action.status) do
       Enum.each(bulk_action.staged_files, fn {_name, key} -> Storage.delete_object(key) end)
@@ -848,6 +834,7 @@ defmodule AshBulkDurable.Core.Worker do
             stop_on_error?: locked.mode == :all_or_nothing
           )
 
+        Liveness.stamp!(locked)
         {:written, span, notifications, finalize_if_last(locked, length(rows))}
     end
   end

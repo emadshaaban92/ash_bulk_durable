@@ -4,9 +4,9 @@ defmodule AshBulkDurable.Core.Changes.RequireStatus do
   only while its status is one of `statuses`, and is refused as
   `Ash.Error.Changes.StaleRecord` otherwise.
 
-  Two runs of one bulk action can overlap: an old attempt still running
-  after a retry queued a new job, or a run declared lost while it was still
-  alive. The guard keeps the later writer from applying a row twice, or from
+  Two runs of one bulk action can overlap: two pollers starting it at once,
+  or one started again while the first, still alive, had not stamped its
+  liveness hint in time. The guard keeps the later writer from applying a row twice, or from
   moving one back after it succeeded; the target writes sharing the refused
   flip's transaction roll back with it. The worker reads such a refusal as
   its row having moved on under another run, and stops.

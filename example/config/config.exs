@@ -39,18 +39,8 @@ config :ash_bulk_durable,
 # The `/bulk` screens copied into this app.
 config :example, :bulk, resources: [Example.Library.Author, Example.Library.Book]
 
-config :example, Oban,
-  engine: Oban.Engines.Basic,
-  repo: Example.Repo,
-  queues: [bulk_actions: 4],
-  plugins: [
-    {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(30)},
-    {Oban.Plugins.Cron,
-     crontab: [
-       {"0 3 * * *", AshBulkDurable.Core.PurgeStaleStaging},
-       {"*/5 * * * *", AshBulkDurable.Core.RescueStuckBulkActions}
-     ]}
-  ]
+# The poller that runs bulk actions on this node (see `Example.Application`).
+config :example, poller?: true
 
 # Configure the endpoint
 config :example, ExampleWeb.Endpoint,

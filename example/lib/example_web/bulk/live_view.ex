@@ -29,13 +29,13 @@ defmodule ExampleWeb.Bulk.LiveView do
 
   Submitting a bulk action never runs the row loop inline.
   Instead the LV persists an `BulkAction` (config `:bulk_action_resource`)
-  via `start_async/3` and hands the actual bulk action to the Oban
+  via `start_async/3`, and a node's `AshBulkDurable.Core.Poller` runs it with
   `AshBulkDurable.Core.Worker`. The LV then subscribes to the bulk action's PubSub
   topic and re-renders progress as the worker bumps `rows_done` and reaches
   a terminal state. On mount, a logged-in user with an unresolved bulk action —
   `:queued`, `:running`, or parked in `:completed_with_errors` — is
-  reattached to it (and a provably-dead `:queued`/`:running` bulk action is
-  flipped to `:failed` so the one-unresolved slot frees up). An errored
+  reattached to it. A bulk action whose node died stays `:running` until a
+  poller resumes it, so the page shows it running meanwhile. An errored
   bulk action must be retried to completion or abandoned before a new bulk action can
   start. Creates, updates and destroys all run this way.
   """
@@ -565,8 +565,8 @@ defmodule ExampleWeb.Bulk.LiveView do
 
   # Stage the durable bulk action off the LV process: the sheet layer maps
   # every row to its target and input, then one transaction wraps the bulk
-  # action insert + its rows + its Oban job, so a `:queued` bulk action
-  # without a job is structurally impossible.
+  # action insert + its rows, so a `:queued` bulk action without its rows is
+  # structurally impossible.
   defp start_persist(socket, options, uploaded_file, fields, params) do
     %{resource: resource, action: action} = options
 
@@ -601,7 +601,7 @@ defmodule ExampleWeb.Bulk.LiveView do
 
   defp join_names(names), do: Enum.map_join(names, ", ", &to_string/1)
 
-  # ── Unresolved bulk action reconnect + stuck bulk action rescue ──────────
+  # ── Unresolved bulk action reconnect ─────────────────────────────────────
 
   # Reattaches whatever bulk action holds the user's one-unresolved slot: a live
   # `:queued`/`:running` bulk action resumes its progress panel, and a parked
@@ -611,7 +611,7 @@ defmodule ExampleWeb.Bulk.LiveView do
   defp maybe_attach_unresolved_bulk_action(socket) do
     with true <- connected?(socket),
          bulk_action when not is_nil(bulk_action) <- fetch_unresolved_bulk_action(socket) do
-      attach_bulk_action(socket, rescue_if_stuck(bulk_action))
+      attach_bulk_action(socket, bulk_action)
     else
       _ -> socket
     end
@@ -630,17 +630,6 @@ defmodule ExampleWeb.Bulk.LiveView do
         |> Ash.read_one!(authorize?: false)
     end
   end
-
-  # Mount-time check: if a `:queued`/`:running` bulk action's Oban job is
-  # in a terminal state (or its row is gone), the worker is provably dead.
-  # Flip the bulk action to `:failed` so the one-unresolved slot frees up and the
-  # user can submit afresh without waiting for the rescue cron. A parked
-  # `:completed_with_errors` bulk action passes through untouched — its job is
-  # legitimately terminal. The detection + flip live in
-  # `AshBulkDurable.Core.RescueStuckBulkActions` so the lazy (mount) and eager (cron)
-  # paths can never disagree on what "worker lost" means.
-  defp rescue_if_stuck(bulk_action),
-    do: AshBulkDurable.Core.RescueStuckBulkActions.rescue_if_stuck(bulk_action)
 
   defp attach_bulk_action(socket, bulk_action) do
     subscribe_to_bulk_action(bulk_action)

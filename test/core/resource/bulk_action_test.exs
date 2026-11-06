@@ -5,11 +5,9 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
   through a shell resource (`AshBulkDurable.Test.BulkAction`).
   """
   use AshBulkDurable.DataCase, async: true
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
 
   require Ash.Query
 
-  alias AshBulkDurable.Core.Worker
   alias AshBulkDurable.Test.{BulkAction, Row}
 
   @valid_rows [
@@ -40,14 +38,13 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
   end
 
   describe ":create" do
-    test "persists the bulk action, the rows, and an Oban job — all atomically" do
+    test "persists the bulk action and its rows, queued and never stamped alive" do
       bulk_action = create_bulk_action!()
 
       assert bulk_action.status == :queued
       assert bulk_action.total_rows == 2
       assert bulk_action.rows_done == 0
-      assert bulk_action.oban_job_id
-      assert is_integer(bulk_action.oban_job_id)
+      assert bulk_action.alive_at == nil
 
       rows =
         Row
@@ -61,9 +58,6 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
 
       assert rows |> Enum.sort_by(& &1.row_index) |> Enum.map(&Map.take(&1, [:input, :metadata])) ==
                @valid_rows
-
-      # Exactly one worker job was enqueued for this bulk action.
-      assert length(all_enqueued(worker: Worker, args: %{bulk_action_id: bulk_action.id})) == 1
     end
   end
 
@@ -74,11 +68,6 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
       _first = create_bulk_action!(%{user_id: user_id})
 
       rows_before = AshBulkDurable.Test.Repo.aggregate(Row, :count, :id)
-      # Count ALL worker jobs, not just the first bulk action's — the second create's
-      # job would carry the second bulk action's id, so a bulk_action_id-scoped count could
-      # never observe it and the rollback assertion would be vacuous. Sandbox
-      # isolation already scopes this to the current test under async.
-      jobs_before = length(all_enqueued(worker: Worker))
 
       assert {:error, %Ash.Error.Invalid{}} =
                Ash.create(BulkAction, create_attrs(%{user_id: user_id}),
@@ -86,12 +75,10 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
                  authorize?: false
                )
 
-      # The full create transaction (bulk action + rows + Oban job) rolled back
-      # because the unique violation raised inside the same Ash.create — the
-      # first bulk action's rows and job are untouched, and no stray job for the
-      # rejected second bulk action leaked out.
+      # The full create transaction (bulk action + rows) rolled back because
+      # the unique violation raised inside the same Ash.create — the first
+      # bulk action's rows are untouched.
       assert AshBulkDurable.Test.Repo.aggregate(Row, :count, :id) == rows_before
-      assert length(all_enqueued(worker: Worker)) == jobs_before
     end
 
     test "creating after the previous bulk action reached a terminal state succeeds" do

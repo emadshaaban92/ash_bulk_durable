@@ -1,15 +1,13 @@
 defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
   @moduledoc """
-  Tests for the companion-staging GC: the sweep (through `sweep/0`, and
-  through `Oban.Testing.perform_job/3` while the module is still the
-  crontab's worker) and the delete that abandoning does itself, against the in-memory
+  Tests for the companion-staging GC: the sweep (`sweep/0`, which each
+  node's poller runs) and the delete that abandoning does itself, against the in-memory
   `AshBulkDurable.TestStorage` adapter so deletions are observable without a
   real bucket.
 
   `async: false` — swaps the `:ash_bulk_durable` storage adapter globally.
   """
   use AshBulkDurable.DataCase, async: false
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
 
   import ExUnit.CaptureLog
 
@@ -91,7 +89,7 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       TestStorage.put(key_completed, "x", old())
       TestStorage.put(key_with_errors, "x", old())
 
-      assert :ok = perform_job(PurgeStaleStaging, %{})
+      assert :ok = PurgeStaleStaging.sweep()
 
       remaining = TestStorage.keys()
       refute key_orphan in remaining
@@ -112,7 +110,7 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       TestStorage.put(key_parked, "x", old())
       TestStorage.put(key_orphan, "x", old())
 
-      assert :ok = perform_job(PurgeStaleStaging, %{})
+      assert :ok = PurgeStaleStaging.sweep()
 
       remaining = TestStorage.keys()
       assert key_parked in remaining
@@ -123,7 +121,7 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       fresh_orphan = "#{@prefix}#{Ecto.UUID.generate()}/uuid-d/companions/logo.zip"
       TestStorage.put(fresh_orphan, "x", DateTime.utc_now())
 
-      assert :ok = perform_job(PurgeStaleStaging, %{})
+      assert :ok = PurgeStaleStaging.sweep()
 
       assert fresh_orphan in TestStorage.keys()
     end
@@ -132,7 +130,7 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       {_queued, [key]} = create_bulk_action!(["logo.zip"])
       TestStorage.put(key, "x", old())
 
-      assert :ok = perform_job(PurgeStaleStaging, %{})
+      assert :ok = PurgeStaleStaging.sweep()
 
       assert key in TestStorage.keys()
     end
@@ -153,7 +151,7 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       TestStorage.put(key_failed, "x", old())
       TestStorage.put(key_cancelled, "x", old())
 
-      assert :ok = perform_job(PurgeStaleStaging, %{})
+      assert :ok = PurgeStaleStaging.sweep()
 
       remaining = TestStorage.keys()
       refute key_failed in remaining
@@ -273,13 +271,12 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       }
     end
 
-    test "deletes the staged files once the cancel commits, enqueueing nothing", ctx do
+    test "deletes the staged files once the cancel commits", ctx do
       assert {:ok, %{status: :cancelled}} =
                AshBulkDurable.abandon(ctx.bulk_action, scope: ctx.scope)
 
       remaining = TestStorage.keys()
       for key <- ctx.keys, do: refute(key in remaining)
-      assert all_enqueued(worker: PurgeStaleStaging) == []
     end
 
     test "inside a caller's transaction, leaves the files for the sweep", ctx do
@@ -292,7 +289,6 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
 
       remaining = TestStorage.keys()
       for key <- ctx.keys, do: assert(key in remaining)
-      assert all_enqueued(worker: PurgeStaleStaging) == []
     end
 
     test "still cancels when storage raises, and logs a warning", ctx do

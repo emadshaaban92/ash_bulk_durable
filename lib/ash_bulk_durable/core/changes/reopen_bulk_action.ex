@@ -1,12 +1,14 @@
 defmodule AshBulkDurable.Core.Changes.ReopenBulkAction do
   @moduledoc """
   Implements `BulkAction.:enqueue_retry`: a finished bulk action takes its
-  corrected shared `input`, when given, and sheds how it finished.
+  corrected shared `input`, when given, and sheds how it finished, the
+  liveness hint its last run left included, so a poller starts it at once
+  rather than once that hint goes stale.
 
   Only a bulk action parked in `:completed_with_errors` or `:failed` matches
   the update. One `:queued` or `:running`, or already `:completed` or
   `:cancelled`, is rejected as `StaleRecord`, so a double-fired retry or a
-  stale tab cannot start a second job over the same rows.
+  stale tab cannot reopen rows a run is driving.
   """
   use Ash.Resource.Change
   require Ash.Expr
@@ -20,6 +22,7 @@ defmodule AshBulkDurable.Core.Changes.ReopenBulkAction do
     |> Ash.Changeset.force_change_attribute(:result, nil)
     |> Ash.Changeset.force_change_attribute(:error, nil)
     |> Ash.Changeset.force_change_attribute(:finished_at, nil)
+    |> Ash.Changeset.force_change_attribute(:alive_at, nil)
     |> put_input()
   end
 

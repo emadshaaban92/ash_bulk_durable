@@ -102,7 +102,6 @@ defmodule AshBulkDurable.Test.Repo.Migrations.Initial do
       add(:input, :binary)
       add(:staged_files, :map, null: false, default: %{})
       add(:metadata, :map, null: false, default: %{})
-      add(:oban_job_id, :bigint)
       add(:status, :text, null: false, default: "queued")
       add(:total_rows, :bigint, null: false)
       add(:mode, :text, null: false)
@@ -112,6 +111,7 @@ defmodule AshBulkDurable.Test.Repo.Migrations.Initial do
       add(:result, :map)
       add(:started_at, :utc_datetime_usec)
       add(:finished_at, :utc_datetime_usec)
+      add(:alive_at, :utc_datetime_usec)
 
       add(:inserted_at, :utc_datetime_usec,
         null: false,
@@ -128,6 +128,8 @@ defmodule AshBulkDurable.Test.Repo.Migrations.Initial do
              name: "bulk_actions_one_unresolved_per_user_index",
              where: "(status IN ('queued', 'running', 'completed_with_errors'))"
            )
+
+    create index(:bulk_actions, [:inserted_at, :id], where: "status IN ('queued', 'running')")
 
     create table(:memberships, primary_key: false) do
       add(:id, :uuid, null: false, default: fragment("uuid_generate_v7()"), primary_key: true)
@@ -315,6 +317,8 @@ defmodule AshBulkDurable.Test.Repo.Migrations.Initial do
 
     drop(table(:memberships))
 
+    drop_if_exists(index(:bulk_actions, [:inserted_at, :id]))
+
     drop_if_exists(
       unique_index(:bulk_actions, [:user_id], name: "bulk_actions_one_unresolved_per_user_index")
     )
@@ -322,6 +326,7 @@ defmodule AshBulkDurable.Test.Repo.Migrations.Initial do
     alter table(:bulk_actions) do
       remove(:updated_at)
       remove(:inserted_at)
+      remove(:alive_at)
       remove(:finished_at)
       remove(:started_at)
       remove(:result)
@@ -331,7 +336,6 @@ defmodule AshBulkDurable.Test.Repo.Migrations.Initial do
       remove(:mode)
       remove(:total_rows)
       remove(:status)
-      remove(:oban_job_id)
       remove(:metadata)
       remove(:staged_files)
       remove(:input)

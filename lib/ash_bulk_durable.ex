@@ -6,8 +6,8 @@ defmodule AshBulkDurable do
   spreadsheets are `AshBulkDurable.Sheet`'s.
 
   The verbs are Ash's, with its argument orders, and each returns `{:ok,
-  bulk_action}` once the bulk action, its rows and its job are written in
-  one transaction; the worker runs it afterwards. A verb takes a list of
+  bulk_action}` once the bulk action and its rows are written in one
+  transaction; a node's `AshBulkDurable.Core.Poller` runs it afterwards. A verb takes a list of
   inputs or a `%AshBulkDurable.Sheet{}` from `read_sheet/2`, told apart by
   the argument:
 

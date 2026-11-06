@@ -109,18 +109,6 @@
       "type": "map"
     },
     {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "oban_job_id",
-      "type": "bigint"
-    },
-    {
       "allow_nil?": false,
       "default": "\"queued\"",
       "generated?": false,
@@ -229,6 +217,18 @@
       "type": "utc_datetime_usec"
     },
     {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "alive_at",
+      "type": "utc_datetime_usec"
+    },
+    {
       "allow_nil?": false,
       "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
       "generated?": false,
@@ -256,10 +256,39 @@
   "base_filter": null,
   "check_constraints": [],
   "create_table_options": null,
-  "custom_indexes": [],
+  "custom_indexes": [
+    {
+      "all_tenants?": false,
+      "concurrently": false,
+      "error_fields": [
+        "inserted_at",
+        "id"
+      ],
+      "fields": [
+        {
+          "type": "atom",
+          "value": "inserted_at"
+        },
+        {
+          "type": "atom",
+          "value": "id"
+        }
+      ],
+      "include": null,
+      "include_base_filter?": true,
+      "message": null,
+      "name": null,
+      "nulls_distinct": true,
+      "prefix": null,
+      "table": null,
+      "unique": false,
+      "using": null,
+      "where": "status IN ('queued', 'running')"
+    }
+  ],
   "custom_statements": [],
   "has_create_action": true,
-  "hash": "B16AD0893E1686E07F3C36A72695E07049DD296C5E3FCD53D418251A75C7AAD3",
+  "hash": "484125E8CD1651565A2641FF4BC9C38E9D62329BCC5736A34C5132D38B1746E8",
   "identities": [
     {
       "all_tenants?": false,

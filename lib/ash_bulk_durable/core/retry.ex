@@ -2,9 +2,11 @@ defmodule AshBulkDurable.Core.Retry do
   @moduledoc """
   Puts a finished bulk action's rows back to the worker: `retry/2` every row
   that has not succeeded, `retry_row/2` one failed row alone. Both write the
-  corrections and the bulk action's job in one transaction, and the worker
-  then runs the rows that are no longer finished, as it ran them the first
-  time.
+  corrections and queue the bulk action again in one transaction, and the
+  worker then runs the rows that are no longer finished, as it ran them the
+  first time. Once that transaction returns, this node's poller is nudged to
+  start it (`AshBulkDurable.Core.Poller.nudge/0`), unless the call ran inside
+  a transaction of the caller's, when the next poll starts it.
 
   A retry first locks the bulk action (`AshBulkDurable.Core.BulkActionLock`),
   before any of its rows, and reads the rows and the bulk action's state under
@@ -29,7 +31,7 @@ defmodule AshBulkDurable.Core.Retry do
   require Ash.Query
 
   alias AshBulkDurable.Core
-  alias AshBulkDurable.Core.{BulkActionLock, Introspection, Owner, Runner}
+  alias AshBulkDurable.Core.{BulkActionLock, Introspection, Owner, Poller, Runner}
 
   @doc """
   Reruns every row of `bulk_action` that has not succeeded. Returns `{:ok,
@@ -59,9 +61,9 @@ defmodule AshBulkDurable.Core.Retry do
 
   @doc """
   Reruns one failed `row` alone, the bulk action's other rows staying as
-  they are, through the same job: its result is read as `retry/2`'s is.
+  they are, through the same run: its result is read as `retry/2`'s is.
 
-  The job runs every row left unprocessed, so a bulk action that failed
+  The run runs every row left unprocessed, so a bulk action that failed
   before reaching them is refused with `{:error, %{unprocessed: count}}`,
   nothing written: `retry/2` resumes them.
 
@@ -128,7 +130,7 @@ defmodule AshBulkDurable.Core.Retry do
            Ash.transaction(resources, fn ->
              under_lock(resources, bulk_action, corrections, shared, opts, rows)
            end) do
-      result
+      Poller.nudge_after(result)
     end
   end
 
