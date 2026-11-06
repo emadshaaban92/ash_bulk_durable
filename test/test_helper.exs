@@ -1,5 +1,6 @@
 # Passing tests run many refusals on purpose; their logs print only with a failure.
-ExUnit.start(capture_log: true)
+# The stress test runs only when asked for: `mix test --only stress`.
+ExUnit.start(capture_log: true, exclude: [:stress])
 
 alias AshBulkDurable.Test.{PubSub, ReadRepo, Repo}
 
