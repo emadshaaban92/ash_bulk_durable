@@ -268,6 +268,39 @@ defmodule AshBulkDurable.Core.PollerTest do
       assert created(ctx) == codes(ctx, 1..2)
     end
 
+    test "on shutdown, a run it kills whose lock stays held past the wait is logged, " <>
+           "the poller still stops, and the next start counts a stall",
+         ctx do
+      bulk_action = submit!(ctx, 2, chunk_size: 2)
+      slow_chunk(bulk_action, 5_000)
+      start_poller!(shutdown_grace: 200)
+
+      Poller.nudge()
+      assert_receive {:chunk_started, run}, 2_000
+      assert %{stalled_starts: 0} = reload(bulk_action)
+
+      # Queued behind the run's chunk, another connection takes the lock the
+      # moment the killed run lets go, and keeps it past the poller's wait.
+      locker = lock_elsewhere(bulk_action.id, wait?: true)
+      assert eventually(&waiting_for_lock?/0)
+
+      monitor = Process.monitor(run)
+      log = capture_log(fn -> stop_supervised!(Poller) end)
+      assert_receive {:DOWN, ^monitor, :process, ^run, :killed}, 1_000
+      assert_receive :locked, 1_000
+      refute Process.whereis(Poller)
+
+      assert log =~
+               "bulk action #{bulk_action.id} was stopped by shutdown, but couldn't be marked"
+
+      release(locker)
+      assert %{status: :running, shutdown_stopped: false} = reload(bulk_action)
+
+      capture_log(fn -> assert :ok = Worker.run_now(bulk_action.id) end)
+      assert %{status: :completed, stalled_starts: 1} = reload(bulk_action)
+      assert created(ctx) == codes(ctx, 1..2)
+    end
+
     test "sets the child spec's shutdown above the grace period" do
       assert %{shutdown: shutdown} = Poller.child_spec(shutdown_grace: 20_000)
       assert shutdown > 20_000
@@ -690,7 +723,8 @@ defmodule AshBulkDurable.Core.PollerTest do
   end
 
   # Holds the bulk action's row lock from a connection of its own until told.
-  defp lock_elsewhere(id) do
+  # With `wait?: true` it waits for the lock rather than for having it.
+  defp lock_elsewhere(id, opts \\ []) do
     test_pid = self()
 
     pid =
@@ -712,7 +746,7 @@ defmodule AshBulkDurable.Core.PollerTest do
         send(test_pid, :released)
       end)
 
-    assert_receive :locked, 2_000
+    unless opts[:wait?], do: assert_receive(:locked, 2_000)
     pid
   end
 

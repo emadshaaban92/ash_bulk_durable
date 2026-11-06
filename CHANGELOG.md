@@ -63,3 +63,8 @@
   worker `:max_row_attempts` times (2) fails alone with
   `Core.CrashedRowError` while the rest run on; an all-or-nothing one fails
   with reason `:crashed`. A run the poller kills at shutdown is not counted.
+- `abandon/2` writes `:cancelled` under the bulk action lock, like every
+  other verdict: one whose lock another transaction holds, such as a retry's,
+  is refused at once, and one its caller doesn't own is refused before
+  anything is written. It deletes the staged files itself once its own
+  transaction commits, as before.

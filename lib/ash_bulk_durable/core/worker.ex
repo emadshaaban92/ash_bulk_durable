@@ -1475,7 +1475,6 @@ defmodule AshBulkDurable.Core.Worker do
   defp reason_atom("atomic_phase1_failed"), do: :atomic_phase1_failed
   defp reason_atom("atomic_chunk_rolled_back"), do: :atomic_chunk_rolled_back
   defp reason_atom("staged_file_download_error"), do: :staged_file_download_error
-  defp reason_atom("worker_lost"), do: :worker_lost
   defp reason_atom("crashed"), do: :crashed
   defp reason_atom(_reason), do: nil
 

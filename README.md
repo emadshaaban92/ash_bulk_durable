@@ -78,6 +78,11 @@ defmodule MyApp.BulkActions.Row do
 end
 ```
 
+Every resource a bulk action writes must live in the same repo as these two.
+A chunk's target writes share the transaction that holds the bulk action's
+lock; a target in another repo writes on another connection, outside it, and
+silently loses the lock's protection.
+
 Name them in config, with an owner and a storage adapter:
 
 ```elixir
@@ -128,9 +133,9 @@ A run stamps its bulk action's liveness hint (`alive_at`) as it goes, and at
 least every `:alive_interval` (30 seconds by default). Two runs of one bulk
 action are harmless, since each chunk runs under the bulk action's row lock,
 so the hint only decides when to start one. Each running bulk action takes one
-connection, and up to `:phase1_concurrency` more while it resolves references,
-plus a brief one each `:alive_interval` for its stamp: size the repo's pool for
-`:max_running` times that.
+connection, up to `:phase1_concurrency` more while it resolves references, and
+one more for its ticker's stamp, held briefly each `:alive_interval`: size the
+repo's pool for `:max_running` times `:phase1_concurrency + 2`.
 
 ## Other config
 

@@ -3,8 +3,13 @@ defmodule AshBulkDurable.Core.BulkActionLock do
   Holds a bulk action's row for the rest of the current transaction.
 
   Nothing writes a bulk action's rows without first holding the lock on that
-  bulk action's row. The lock order is always: the bulk action, then its
-  rows. Two writers taking them in that order wait on the bulk action alone,
+  bulk action's row, with one exception: phase 1's single-row
+  compare-and-sets (a row's `:resolve`, and phase 1's `:mark_failed` and
+  `:forget_resolutions`), which run outside any transaction while a resolver
+  does its I/O, and are guarded by the row's status instead
+  (`AshBulkDurable.Core.Changes.RequireStatus`). They touch one row and never
+  wait on the bulk action. The lock order is always: the bulk action, then
+  its rows. Two writers taking them in that order wait on the bulk action alone,
   so neither can hold a row the other is waiting for.
 
   The lock is `FOR NO KEY UPDATE`: it excludes another writer of the bulk

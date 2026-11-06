@@ -23,6 +23,37 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     def finish(nil), do: :ok
   end
 
+  defmodule PrepareRefusingResolver do
+    @moduledoc "Can't ready its references."
+    @behaviour AshBulkDurable.Core.Resolver
+
+    @impl true
+    def prepare(_args, _context), do: {:error, :prepare_refused}
+
+    @impl true
+    def resolve(value, nil, _context), do: {:ok, value}
+
+    @impl true
+    def finish(nil), do: :ok
+  end
+
+  defmodule RefusingResolver do
+    @moduledoc "Refuses every reference."
+    @behaviour AshBulkDurable.Core.Resolver
+
+    @impl true
+    def prepare(_args, _context), do: {:ok, nil}
+
+    @impl true
+    def resolve(_value, nil, _context),
+      do:
+        {:error,
+         Ash.Error.Changes.InvalidAttribute.exception(field: :native_name, message: "refused")}
+
+    @impl true
+    def finish(nil), do: :ok
+  end
+
   alias AshBulkDurable.Core.Worker
   alias AshBulkDurable.Test.{BulkAction, Region, Repo, Row, Scope, User}
 
@@ -163,6 +194,95 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       assert statuses(bulk_action) == [:resolved, :resolved]
       assert created(ctx) == []
       assert_untouched(bulk_action)
+    end
+  end
+
+  # Phase 1 runs outside the lock, but its verdicts are written under it: a
+  # run that finds another transaction holding it writes none, and the next
+  # run writes it.
+  describe "phase 1's verdicts, while another transaction holds the lock" do
+    test ":resolver_prepare_error", ctx do
+      bulk_action = resolving!(ctx, PrepareRefusingResolver)
+      locker = lock_after_start(bulk_action)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      release(locker)
+      assert statuses(bulk_action) == [:pending, :pending]
+      assert_no_verdict(bulk_action)
+
+      assert_verdict_next_run(bulk_action, "resolver_prepare_error")
+    end
+
+    test ":staged_file_download_error", ctx do
+      bulk_action =
+        resolving!(ctx, EchoResolver,
+          mode: :all_or_nothing,
+          staged_files: %{"a.zip" => "bulk-staging/gone"}
+        )
+
+      locker = lock_after_start(bulk_action)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      release(locker)
+      assert statuses(bulk_action) == [:pending, :pending]
+      assert_no_verdict(bulk_action)
+
+      assert_verdict_next_run(bulk_action, "staged_file_download_error")
+    end
+
+    test ":atomic_phase1_failed, from a row its caller refused", ctx do
+      bulk_action = resolving!(ctx, EchoResolver, mode: :all_or_nothing, refused: true)
+      locker = lock_after_start(bulk_action)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      release(locker)
+      assert statuses(bulk_action) == [:failed, :pending]
+      assert_no_verdict(bulk_action)
+
+      assert_verdict_next_run(bulk_action, "atomic_phase1_failed")
+    end
+
+    test ":atomic_phase1_failed, from a row that failed to resolve", ctx do
+      bulk_action = resolving!(ctx, RefusingResolver, mode: :all_or_nothing)
+      locker = lock_after_start(bulk_action)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      release(locker)
+      # The row's own failure is one of phase 1's single-row writes, which
+      # take no lock; the verdict is not.
+      assert :failed in statuses(bulk_action)
+      assert created(ctx) == []
+      assert_no_verdict(bulk_action)
+
+      assert_verdict_next_run(bulk_action, "atomic_phase1_failed")
+    end
+
+    test ":unreadable", ctx do
+      bulk_action = submit!(ctx, 2)
+
+      # A shared input naming an atom this release doesn't have.
+      gone = "gone_atom_#{System.unique_integer([:positive])}"
+
+      Repo.query!("UPDATE bulk_actions SET input = $1 WHERE id = $2", [
+        <<131, 119, byte_size(gone)>> <> gone,
+        Ecto.UUID.dump!(bulk_action.id)
+      ])
+
+      locker = lock_elsewhere(bulk_action.id)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      release(locker)
+      assert statuses(bulk_action) == [:resolved, :resolved]
+      assert created(ctx) == []
+      assert_untouched(bulk_action)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :failed, result: %{"reason" => "unreadable"}} = reload(bulk_action)
     end
   end
 
@@ -496,6 +616,73 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
 
     on_exit(fn -> :telemetry.detach(handler) end)
     fn -> :counters.get(counter, 1) end
+  end
+
+  # Two rows whose native names `resolver` resolves in phase 1; with
+  # `refused: true`, the first was refused by its caller before it was stored.
+  # Takes `:mode` and `:staged_files` too.
+  defp resolving!(ctx, resolver, opts \\ []) do
+    rows =
+      Enum.map(1..2, fn i ->
+        row = %{
+          input: %{
+            code: "#{ctx.tag}-#{i}",
+            name: "#{ctx.tag} N#{i}",
+            native_name: {:resolve, resolver, "#{ctx.tag} A#{i}"}
+          }
+        }
+
+        if i == 1 and opts[:refused], do: Map.put(row, :error, "unreadable cell"), else: row
+      end)
+
+    Ash.create!(
+      BulkAction,
+      %{
+        user_id: ctx.user.id,
+        resource_name: inspect(Region),
+        action_name: :create,
+        action_type: :create,
+        total_rows: 2,
+        mode: Keyword.get(opts, :mode, :per_row),
+        chunk_size: 1,
+        staged_files: Keyword.get(opts, :staged_files, %{}),
+        rows: rows
+      },
+      action: :create,
+      authorize?: false
+    )
+  end
+
+  # From the moment the run's start transaction commits, another connection
+  # holds the bulk action's lock, until told.
+  defp lock_after_start(bulk_action) do
+    test_pid = self()
+    handler = "lock-after-start-#{bulk_action.id}"
+
+    :telemetry.attach(
+      handler,
+      [:ash_bulk_durable, :test, :repo, :query],
+      fn _event, _measurements, %{query: query}, _config ->
+        if self() == test_pid and query == "commit" do
+          :telemetry.detach(handler)
+          send(test_pid, {:locker, lock_elsewhere(bulk_action.id)})
+        end
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    fn ->
+      assert_received {:locker, locker}
+      locker
+    end
+  end
+
+  # The verdict the held lock kept back, written by the next run.
+  defp assert_verdict_next_run(bulk_action, reason) do
+    assert :ok = Worker.run_now(bulk_action.id)
+    assert %{status: :failed, result: %{"reason" => ^reason}} = reload(bulk_action)
   end
 
   # A run of the bulk action in a process of its own, as another node's would be.

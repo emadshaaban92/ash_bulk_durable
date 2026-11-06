@@ -375,11 +375,6 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
   # detail map). `{:failed, term}` bulk actions have no `"reason"` → generic copy.
   defp failure_message(%{} = result) do
     case result["reason"] do
-      "worker_lost" ->
-        gettext(
-          "The bulk action stopped before finishing. To run what's left, download the errors sheet and upload it under Retry with corrections. Rows already saved won't run again."
-        )
-
       "atomic_chunk_rolled_back" ->
         gettext(
           "A row failed, so the whole bulk action was rolled back (\"Apply all rows or none\" was on)."

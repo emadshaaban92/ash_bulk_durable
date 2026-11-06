@@ -1,8 +1,9 @@
 defmodule AshBulkDurable.Core.BulkActionLockTest do
   @moduledoc """
-  `BulkActionLock`, and `Retry` taking it before any row. A lock held by
-  another transaction needs a second real connection, so this test runs
-  outside the sandbox and deletes what it wrote.
+  `BulkActionLock`, `Retry` taking it before any row, and `abandon/2` taking
+  it before its write. A lock held by another transaction needs a second
+  real connection, so this test runs outside the sandbox and deletes what it
+  wrote.
   """
   use ExUnit.Case, async: false
 
@@ -156,6 +157,120 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
     assert Enum.map(rows(bulk_action), & &1.status) == [:failed, :failed]
     assert Enum.all?(rows(bulk_action), &unlocked?/1)
     assert Ash.get!(BulkAction, bulk_action.id, authorize?: false) == bulk_action
+  end
+
+  describe "abandon/2" do
+    setup do
+      AshBulkDurable.StorageHelpers.put_config(:storage, AshBulkDurable.TestStorage)
+      start_supervised!(AshBulkDurable.TestStorage)
+      :ok
+    end
+
+    test "while a retry's transaction holds the bulk action, is refused at once, " <>
+           "changing nothing",
+         ctx do
+      bulk_action = with_staged_file!(finished_with_errors!(ctx), ctx)
+      test_pid = self()
+
+      retry =
+        spawn_link(fn ->
+          :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
+          send(test_pid, {:retried, AshBulkDurable.retry(bulk_action, scope: ctx.scope)})
+        end)
+
+      # The retry stops at its first row write, its lock held.
+      handler = "abandon-during-retry-#{ctx.tag}"
+
+      :telemetry.attach(
+        handler,
+        [:ash_bulk_durable, :test, :repo, :query],
+        fn _event, _measurements, %{source: source, query: query}, _config ->
+          if self() == retry and source == "bulk_action_rows" and
+               String.starts_with?(query, "UPDATE") do
+            :telemetry.detach(handler)
+            send(test_pid, :retrying)
+
+            receive do
+              :go -> :ok
+            end
+          end
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+      assert_receive :retrying, 2_000
+
+      abandon =
+        Task.async(fn ->
+          :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
+          AshBulkDurable.abandon(bulk_action, scope: ctx.scope)
+        end)
+
+      result = Task.yield(abandon, 500) || Task.shutdown(abandon, :brutal_kill)
+
+      assert {:ok, {:error, %Ash.Error.Invalid{errors: [%Ash.Error.Changes.StaleRecord{}]}}} =
+               result
+
+      assert Ash.get!(BulkAction, bulk_action.id, authorize?: false) == bulk_action
+      assert "bulk-staging/#{ctx.tag}/a.zip" in AshBulkDurable.TestStorage.keys()
+
+      send(retry, :go)
+      assert_receive {:retried, {:ok, %{status: :running}}}, 2_000
+      assert "bulk-staging/#{ctx.tag}/a.zip" in AshBulkDurable.TestStorage.keys()
+    end
+
+    test "by a caller who doesn't own it, is refused before any write", ctx do
+      bulk_action = with_staged_file!(finished_with_errors!(ctx), ctx)
+      stranger = Scope.new(actor: create_user!("stranger-#{ctx.tag}"))
+      writes = count_bulk_action_writes()
+
+      assert {:error, %Ash.Error.Invalid{errors: [%Ash.Error.Changes.StaleRecord{}]}} =
+               AshBulkDurable.abandon(bulk_action, scope: stranger)
+
+      assert writes.() == 0
+      assert Ash.get!(BulkAction, bulk_action.id, authorize?: false) == bulk_action
+      assert "bulk-staging/#{ctx.tag}/a.zip" in AshBulkDurable.TestStorage.keys()
+
+      # Its owner's abandon writes once, and deletes the file after it commits.
+      assert {:ok, %{status: :cancelled}} = AshBulkDurable.abandon(bulk_action, scope: ctx.scope)
+      assert writes.() == 1
+      refute "bulk-staging/#{ctx.tag}/a.zip" in AshBulkDurable.TestStorage.keys()
+    end
+  end
+
+  # One file staged for `bulk_action`, in the store and on the record.
+  defp with_staged_file!(bulk_action, ctx) do
+    key = "bulk-staging/#{ctx.tag}/a.zip"
+    AshBulkDurable.TestStorage.put(key)
+
+    Repo.query!("UPDATE bulk_actions SET staged_files = $1 WHERE id = $2", [
+      %{"a.zip" => key},
+      Ecto.UUID.dump!(bulk_action.id)
+    ])
+
+    Ash.get!(BulkAction, bulk_action.id, authorize?: false)
+  end
+
+  # The writes to `bulk_actions` the test process makes from now on.
+  defp count_bulk_action_writes do
+    test_pid = self()
+    counter = :counters.new(1, [])
+    handler = "bulk-action-writes-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:ash_bulk_durable, :test, :repo, :query],
+      fn _event, _measurements, %{source: source, query: query}, _config ->
+        if self() == test_pid and source == "bulk_actions" and
+             String.starts_with?(query, "UPDATE"),
+           do: :counters.add(counter, 1, 1)
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    fn -> :counters.get(counter, 1) end
   end
 
   # Whether another connection can lock `row` without waiting.

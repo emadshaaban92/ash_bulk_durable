@@ -47,10 +47,11 @@ defmodule AshBulkDurable.Core.Poller do
   nothing while it runs and so reads as stale; picked oldest first, such
   bulk actions would take every slot and starve the newer ones.
 
-  Each running bulk action takes one connection, and up to
-  `:phase1_concurrency` more while phase 1 resolves its rows, so size the
-  repo's pool for `:max_running` times that, plus a connection for the
-  ticker each run keeps.
+  Each running bulk action takes one connection, up to
+  `:phase1_concurrency` more while phase 1 resolves its rows, and one more
+  for its ticker's stamp (`AshBulkDurable.Core.Liveness`), held briefly each
+  `:alive_interval`: size the repo's pool for `:max_running` times
+  `:phase1_concurrency + 2`.
 
   ## Without a poller
 
@@ -305,12 +306,22 @@ defmodule AshBulkDurable.Core.Poller do
           :ok
       end
     end)
+    |> case do
+      {:ok, _marked} -> :ok
+      {:error, error} -> warn_unmarked(id, error)
+    end
   rescue
-    exception ->
-      Logger.warning(
-        "ash_bulk_durable: bulk action #{id} was stopped by shutdown, but couldn't be " <>
-          "marked so; its next start counts it as stalled: #{Exception.message(exception)}"
-      )
+    exception -> warn_unmarked(id, exception)
+  end
+
+  # `Ash.transaction/2` returns a lock timeout as an error rather than raising.
+  defp warn_unmarked(id, error) do
+    message = if is_exception(error), do: Exception.message(error), else: inspect(error)
+
+    Logger.warning(
+      "ash_bulk_durable: bulk action #{id} was stopped by shutdown, but couldn't be " <>
+        "marked so; its next start counts it as stalled: #{message}"
+    )
   end
 
   defp await_runs(state, _deadline) when map_size(state.running) == 0, do: state

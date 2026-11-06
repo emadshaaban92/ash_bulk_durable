@@ -12,7 +12,11 @@ defmodule AshBulkDurable.Core.Resolver do
 
   A resolved value that needs the record it was written to (a staged file
   the record now references) implements `c:after_write/3`, which runs inside
-  the row's transaction: an error fails the row.
+  the row's transaction: an error fails the row. That is the chunk's
+  transaction, which holds the bulk action lock
+  (`AshBulkDurable.Core.BulkActionLock`), so `c:after_write/3` must do no
+  storage or network I/O: do that in `c:resolve/3`, before the transaction
+  opens, and only write to the database here, through the bulk action's repo.
 
   A resolved value kept on a row can stop being usable while the row waits for
   a correction: a staged file's object swept because no record references it
@@ -32,7 +36,10 @@ defmodule AshBulkDurable.Core.Resolver do
   @doc "Releases what `c:prepare/2` opened."
   @callback finish(state :: term()) :: :ok
 
-  @doc "Runs in the row's transaction once `record` is written with `resolved`."
+  @doc """
+  Runs in the row's transaction once `record` is written with `resolved`.
+  That transaction holds the bulk action lock: no storage or network I/O here.
+  """
   @callback after_write(record :: Ash.Resource.record(), resolved :: term(), Context.t()) ::
               :ok | {:error, term()}
 
