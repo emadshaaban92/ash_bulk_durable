@@ -26,3 +26,13 @@
   lock. A retry while another transaction holds the bulk action, or by a
   caller who doesn't own it, is refused at once with the usual `StaleRecord`,
   before reading any row.
+- The worker runs each chunk in a transaction that first locks the bulk
+  action, reads its rows under that lock, and writes the verdict in the same
+  transaction once no row is left. Every verdict is written under the lock,
+  and per-row recovery runs each row in a locked transaction of its own. A
+  run that finds the bulk action locked stops at once, writing nothing, so two
+  runs of one bulk action take turns rather than both writing it. The worker
+  no longer marks the bulk action `:running` before phase 1: the first locked
+  transaction does, so it stays `:queued` while its references resolve, and
+  `started_at` is when its first chunk started, leaving phase 1 out of the
+  run's duration. Every target must live in the bulk action's repo.

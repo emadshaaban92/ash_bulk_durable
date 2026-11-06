@@ -17,6 +17,31 @@ defmodule AshBulkDurable.Core.Worker do
   run's `Heartbeat` stops, and `RescueStuckBulkActions` fails the bulk action
   for its owner to retry, which resumes the same way.
 
+  ## The bulk action lock
+
+  Every phase-2 chunk runs in a transaction of its own that first locks the
+  bulk action's row (`AshBulkDurable.Core.BulkActionLock`, `FOR NO KEY UPDATE
+  SKIP LOCKED`) while it is `:queued` or `:running`, and only then reads its
+  next rows, writes their targets, flips them and bumps `rows_done`. The first
+  such transaction takes the bulk action from `:queued` to `:running`. The
+  one that finds no row left, or writes the last, writes the verdict. Every
+  verdict, phase 1's included, is written under the lock, from the record
+  read under it. A chunk that fails rolls back with the lock; per row, its
+  rows then run one at a time, each in a locked transaction of its own, and
+  one that still fails is marked in a further one.
+
+  Postgres releases the lock at commit, at rollback and when a connection
+  dies, so a run that lost it has nothing left that can commit. A lock
+  another transaction holds stops the run at once, writing nothing; the job
+  ends `:ok`.
+
+  The lock covers only what is written on the bulk action's own connection,
+  so every target must live in the bulk action's repo.
+
+  Phase 1 runs outside the lock: it reaches for files and lookups, which can
+  take minutes a row. Its single-row flips are compare-and-sets instead (see
+  below).
+
   ## Failure surface
 
   - A bulk action storing what no longer decodes (`StoredTerm`) →
@@ -67,8 +92,8 @@ defmodule AshBulkDurable.Core.Worker do
   terminal state. This closes the window where an attempt's BEAM
   process dies *after* `mark_finished` committed but *before* Oban
   acked the job: Oban will retry, but the next attempt sees a
-  terminal bulk action and no-ops instead of re-running `mark_running`, which
-  has no filter of its own and would take it back to `:running`.
+  terminal bulk action and no-ops. A bulk action that turns terminal after
+  that read is found so under the lock, and left as it is.
 
   It does the same for a later attempt of a job the bulk action no longer
   names. A retry enqueues a new job while an attempt of the old one can still
@@ -77,10 +102,17 @@ defmodule AshBulkDurable.Core.Worker do
   ## Overlapping runs
 
   Two runs can still overlap: an old attempt still running after a retry
-  queued a new job, or a run declared `worker_lost` while it was alive. Each
-  row status flip is a compare-and-set (`AshBulkDurable.Core.Changes.RequireStatus`),
-  so the run that comes second to a row is refused, and the transaction
-  holding the refused flip rolls back with whatever it wrote. The run then
+  queued a new job, or a run declared `worker_lost` while it was alive.
+  Between chunks a run holds nothing, so two runs take turns: each chunk
+  reads the rows the last one left, and only one verdict is written, since a
+  bulk action the other run finished no longer locks as running. Both may
+  resolve the same rows in phase 1, which costs work, not data.
+
+  Each row status flip is also a compare-and-set
+  (`AshBulkDurable.Core.Changes.RequireStatus`), which is phase 1's only
+  guard, and catches any phase-2 write that slips past the lock: the run that
+  comes second to a row is refused, and the transaction holding the refused
+  flip rolls back with whatever it wrote. The run then
   stops without writing anything more, and no verdict: if the bulk action is
   terminal or names another job, this job is superseded and cancels;
   otherwise this job is the current run, a stale one got to the row first,
@@ -97,6 +129,7 @@ defmodule AshBulkDurable.Core.Worker do
   use Oban.Worker, queue: :bulk_actions, max_attempts: 3
 
   alias AshBulkDurable.Core.{
+    BulkActionLock,
     Heartbeat,
     Reference,
     Runner,
@@ -152,12 +185,11 @@ defmodule AshBulkDurable.Core.Worker do
 
   defp attempt(bulk_action, job, attempt) do
     if StoredTerm.unreadable?(bulk_action) do
-      mark_finished(bulk_action, {:failed, %{reason: :unreadable}})
+      finish_locked(bulk_action, {:failed, %{reason: :unreadable}})
       :ok
     else
       emit_worker_attempt_start(bulk_action, attempt)
       scope = reconstruct_scope(bulk_action)
-      bulk_action = mark_running(bulk_action)
 
       Heartbeat.beating(job, fn -> drive_with_telemetry(bulk_action, scope) end)
     end
@@ -204,14 +236,14 @@ defmodule AshBulkDurable.Core.Worker do
           run_without_staged_files(bulk_action, settings, reason)
       end
 
-    maybe_delete_staging(terminal_bulk_action)
+    if terminal_bulk_action, do: maybe_delete_staging(terminal_bulk_action)
     :ok
   end
 
   # One transaction can't lose some rows, so all or nothing stops. Per row, a
   # row a resolver no longer has to reach for the files runs as it would.
   defp run_without_staged_files(%{mode: :all_or_nothing} = bulk_action, _settings, reason) do
-    mark_finished(
+    finish_locked(
       bulk_action,
       {:failed, %{reason: :staged_file_download_error, term: inspect(reason)}}
     )
@@ -231,29 +263,30 @@ defmodule AshBulkDurable.Core.Worker do
   end
 
   # Drives phase 1 + phase 2 and returns the terminal `BulkAction` from
-  # the `:mark_finished` call that closed the attempt — every path
-  # reaches one. That fresh record is threaded back to `drive/2` so
-  # `maybe_delete_staging/1` can act on it without a re-fetch window
-  # between the terminal write and the purge decision.
+  # the `:mark_finished` call that closed the attempt, or nil when another
+  # transaction held the bulk action and this run stopped without one. That
+  # fresh record is threaded back to `drive/2` so `maybe_delete_staging/1`
+  # can act on it without a re-fetch window between the terminal write and
+  # the purge decision.
   defp run_rows(bulk_action, settings) do
     with nil <- refused_row(bulk_action),
          :ok <- resolve_pending_rows(bulk_action, settings) do
       run_chunks(bulk_action, settings)
     else
       %{row_index: row_index, error: error} ->
-        mark_finished(
+        finish_locked(
           bulk_action,
           {:failed, atomic_failure_detail(:atomic_phase1_failed, error, row_index)}
         )
 
       {:atomic_phase1_failed, {row_index, err}} ->
-        mark_finished(
+        finish_locked(
           bulk_action,
           {:failed, atomic_failure_detail(:atomic_phase1_failed, err, row_index)}
         )
 
       {:prepare_failed, error} ->
-        mark_finished(
+        finish_locked(
           bulk_action,
           {:failed, %{reason: :resolver_prepare_error, term: inspect(error)}}
         )
@@ -281,12 +314,66 @@ defmodule AshBulkDurable.Core.Worker do
   defp reconstruct_scope(bulk_action),
     do: AshBulkDurable.Core.Owner.scope_from_worker_key(bulk_action.user_id, bulk_action.tenant)
 
-  defp mark_running(bulk_action) do
-    Ash.update!(bulk_action, %{}, action: :mark_running, authorize?: false)
-  end
-
   defp mark_finished(bulk_action, result) do
     Ash.update!(bulk_action, %{result: result}, action: :mark_finished, authorize?: false)
+  end
+
+  # ── The bulk action lock ───────────────────────────────────────────────
+
+  @writing {__MODULE__, :writing}
+  @chunk_span {__MODULE__, :chunk_span}
+
+  # Runs `fun` in a transaction of its own that first locks the bulk action
+  # (`BulkActionLock`, `SKIP LOCKED`) while it is queued or running, and gives
+  # it the locked record, taken from `:queued` to `:running` the first time.
+  # Returns `{:ok, result}`; `:busy`, nothing written, when another
+  # transaction holds the lock or the bulk action is no longer queued or
+  # running; or `{:rolled_back, writing, error}` when rows `write_rows/5` was
+  # writing failed, which rolls back the whole transaction, `writing` being
+  # what it was given to remember. Ash announces what the transaction wrote
+  # once it commits.
+  defp locked(bulk_action_id, fun) do
+    Process.delete(@writing)
+
+    Ash.transaction(
+      [bulk_action_resource(), row_resource()],
+      fn ->
+        case BulkActionLock.lock(bulk_action_id, [:queued, :running]) do
+          {:ok, locked} -> {:ok, fun.(start_running(locked))}
+          :none -> :busy
+        end
+      end
+    )
+    |> case do
+      {:ok, result} ->
+        Process.delete(@writing)
+        result
+
+      {:error, error} ->
+        rolled_back(Process.delete(@writing), error, bulk_action_id)
+    end
+  end
+
+  # A refused flip fails a batch like a row failure would, but it is not one:
+  # another run wrote the row, so this one stops. Rolled back anywhere else,
+  # the transaction raises as `Ash.update!/3` would.
+  defp rolled_back(writing, error, bulk_action_id) do
+    raise_if_moved_on!(error, bulk_action_id)
+    if writing, do: {:rolled_back, writing, error}, else: raise(Ash.Error.to_error_class(error))
+  end
+
+  defp start_running(%{status: :queued} = locked),
+    do: Ash.update!(locked, %{}, action: :mark_running, authorize?: false)
+
+  defp start_running(locked), do: locked
+
+  # A verdict written under the lock, read from the locked record: the
+  # terminal bulk action, or nil when the lock was not taken.
+  defp finish_locked(bulk_action, result) do
+    case locked(bulk_action.id, &mark_finished(&1, result)) do
+      {:ok, terminal} -> terminal
+      :busy -> nil
+    end
   end
 
   # ── Kept resolutions ───────────────────────────────────────────────────
@@ -603,121 +690,193 @@ defmodule AshBulkDurable.Core.Worker do
 
   # ── Phase 2: chunk loop ────────────────────────────────────────────────
 
-  defp run_chunks(bulk_action, settings),
-    do: do_run_chunks(bulk_action, settings, 0)
+  # Each chunk runs in a transaction of its own that holds the bulk action
+  # lock (`locked/2`): its rows are read under the lock, written, and the
+  # verdict written in the same transaction once no row is left. Between
+  # chunks nothing is held, so another run may take a turn; each reads what
+  # the last committed. Returns the terminal bulk action, or nil when another
+  # transaction held the lock and this run stopped.
+  defp run_chunks(bulk_action, settings), do: run_chunks(bulk_action, settings, 0)
 
-  # Each chunk's transaction gets its own `[:ash_bulk_durable, :chunk, …]` span.
-  # The recursion lives *outside* the span so chunks are siblings,
-  # not nested — and `run_chunk/5` returns `:continue` / `:halt` so an
-  # all-or-nothing rollback stops the loop while per-row keeps going.
-  defp do_run_chunks(bulk_action, settings, chunk_index) do
-    chunk =
-      row_resource()
-      |> Ash.Query.for_read(:next_resolved_chunk, %{
-        bulk_action_id: bulk_action.id,
-        chunk_size: rows_per_chunk(bulk_action)
-      })
-      |> Ash.read!(authorize?: false)
-
-    case chunk do
-      [] ->
-        finalize_bulk_action(bulk_action)
-
-      chunk ->
-        case run_chunk(bulk_action, settings, chunk, chunk_index) do
-          :continue -> do_run_chunks(bulk_action, settings, chunk_index + 1)
-          {:halt, terminal_bulk_action} -> terminal_bulk_action
-        end
+  defp run_chunks(bulk_action, settings, chunk_index) do
+    case run_chunk(bulk_action, settings, chunk_index) do
+      :continue -> run_chunks(bulk_action, settings, chunk_index + 1)
+      {:done, terminal} -> terminal
+      :busy -> nil
     end
   end
 
-  defp run_chunk(bulk_action, settings, chunk, chunk_index) do
-    start_metadata = %{
-      bulk_action_id: bulk_action.id,
-      chunk_index: chunk_index,
-      rows_in_chunk: length(chunk)
-    }
+  # A chunk that fails rolls back its transaction and releases the lock, so
+  # what follows (recovery, a rollback verdict) runs in transactions of its
+  # own. A raise anywhere after the chunk started, its commit and a row that
+  # moved on included, closes its telemetry span with `:exception`.
+  defp run_chunk(bulk_action, settings, chunk_index) do
+    case locked(bulk_action.id, &write_next_chunk(&1, settings, chunk_index)) do
+      {:ok, {:done, terminal}} ->
+        {:done, terminal}
 
-    :telemetry.span([:ash_bulk_durable, :chunk], start_metadata, fn ->
-      process_chunk(bulk_action, settings, chunk, chunk_index)
-    end)
+      {:ok, {:written, span, notifications, terminal}} ->
+        Ash.Notifier.notify(notifications)
+        chunk_stop(span, chunk_measurements(span.rows, span.rows, 0), :ok, :none)
+        if terminal, do: {:done, terminal}, else: :continue
+
+      {:rolled_back, {span, rows}, error} ->
+        chunk_failed(bulk_action, settings, span, rows, error)
+
+      :busy ->
+        :busy
+    end
+  rescue
+    exception -> chunk_exception(exception, __STACKTRACE__)
   end
 
-  defp finalize_bulk_action(bulk_action) do
-    fresh = Ash.get!(bulk_action_resource(), bulk_action.id, authorize?: false)
+  defp write_next_chunk(locked, settings, chunk_index) do
+    case next_resolved_rows(locked, rows_per_chunk(locked)) do
+      [] ->
+        {:done, finalize_bulk_action(locked, 0)}
 
-    final_status =
-      if fresh.rows_done == fresh.total_rows do
-        :completed
-      else
-        :completed_with_errors
-      end
+      rows ->
+        span = chunk_start(locked, chunk_index, rows)
 
-    mark_finished(fresh, final_status)
-  end
-
-  # All-or-nothing: the whole bulk action is one chunk, run in one transaction, so any
-  # failure fails the bulk action. `bulk_run/5` drives the `:run` action over the chunk
-  # — the action's after_batch creates the targets, flips row status, and bumps
-  # rows_done, so the worker never opens a transaction itself.
-  defp process_chunk(bulk_action, settings, chunk, chunk_index)
-       when bulk_action.mode == :all_or_nothing do
-    case bulk_run(chunk, settings, bulk_action, stop_on_error?: true) do
-      :ok ->
-        {:continue, chunk_measurements(length(chunk), length(chunk), 0),
-         chunk_metadata(bulk_action, chunk_index, :ok, :none)}
-
-      {:error, error} ->
-        terminal =
-          mark_finished(
-            bulk_action,
-            {:failed,
-             atomic_failure_detail(:atomic_chunk_rolled_back, error, error_row_index(error))}
+        notifications =
+          write_rows(rows, settings, locked, {span, rows},
+            stop_on_error?: locked.mode == :all_or_nothing
           )
 
-        {{:halt, terminal}, chunk_measurements(length(chunk), 0, length(chunk)),
-         chunk_metadata(bulk_action, chunk_index, :rolled_back, :none)}
+        {:written, span, notifications, finalize_if_last(locked, length(rows))}
     end
   end
 
-  # Per row: try the chunk as one atomic batch; on any failure the batch
-  # rolled back (every row back to :resolved), so re-run the rows one at a
-  # time — good rows commit individually and only the bad ones land :failed.
-  defp process_chunk(bulk_action, settings, chunk, chunk_index) do
-    case bulk_run(chunk, settings, bulk_action, stop_on_error?: false) do
-      :ok ->
-        {:continue, chunk_measurements(length(chunk), length(chunk), 0),
-         chunk_metadata(bulk_action, chunk_index, :ok, :none)}
-
-      {:error, _error} ->
-        succeeded = recover_row_by_row(chunk, settings, bulk_action)
-
-        {:continue, chunk_measurements(length(chunk), succeeded, length(chunk) - succeeded),
-         chunk_metadata(bulk_action, chunk_index, :rolled_back, :row_by_row)}
-    end
+  defp next_resolved_rows(locked, count) do
+    row_resource()
+    |> Ash.Query.for_read(:next_resolved_chunk, %{bulk_action_id: locked.id, chunk_size: count})
+    |> Ash.read!(authorize?: false)
   end
 
-  # Re-run each row of a rolled-back chunk as its own batch of 1. A row that
-  # still fails lands :failed with the clean error from the bulk result; the
-  # `:run` action already marked the rest :succeeded and bumped rows_done.
-  defp recover_row_by_row(chunk, settings, bulk_action) do
-    Enum.reduce(chunk, 0, fn row, succeeded ->
-      case bulk_run([row], settings, bulk_action, stop_on_error?: false) do
-        :ok ->
-          succeeded + 1
+  # The verdict, in the transaction that wrote the last rows.
+  defp finalize_if_last(locked, written) do
+    if next_resolved_rows(locked, 1) == [], do: finalize_bulk_action(locked, written)
+  end
 
-        {:error, error} ->
-          mark_row_failed(row, error)
-          succeeded
+  # From the locked record and what this transaction wrote since it read it,
+  # which the record it returns (and announces) counts too.
+  defp finalize_bulk_action(locked, written) do
+    locked = %{locked | rows_done: locked.rows_done + written}
+
+    final_status =
+      if locked.rows_done == locked.total_rows,
+        do: :completed,
+        else: :completed_with_errors
+
+    mark_finished(locked, final_status)
+  end
+
+  # All or nothing: the whole bulk action is one chunk, so any failure fails
+  # it, with the verdict written under the lock again: unless another run
+  # holds it, or finished the bulk action meanwhile. The lock matches
+  # `:queued` too, since the rollback undid the chunk's `:queued` to
+  # `:running`.
+  defp chunk_failed(%{mode: :all_or_nothing} = bulk_action, _settings, span, _rows, error) do
+    terminal =
+      finish_locked(
+        bulk_action,
+        {:failed, atomic_failure_detail(:atomic_chunk_rolled_back, error, error_row_index(error))}
+      )
+
+    chunk_stop(span, chunk_measurements(span.rows, 0, span.rows), :rolled_back, :none)
+    if terminal, do: {:done, terminal}, else: :busy
+  end
+
+  # Per row: the chunk rolled back (every row back to :resolved), so re-run
+  # its rows one at a time: good rows commit individually and only the bad
+  # ones land :failed.
+  defp chunk_failed(bulk_action, settings, span, rows, _error) do
+    {status, succeeded, failed} = recover_row_by_row(rows, settings, bulk_action)
+
+    chunk_stop(
+      span,
+      chunk_measurements(span.rows, succeeded, failed),
+      :rolled_back,
+      :row_by_row
+    )
+
+    status
+  end
+
+  # Each row runs alone in a locked transaction of its own, and a row that
+  # still fails is marked in a further one. A row no longer `:resolved` when
+  # read under the lock was run by another run meanwhile, and is skipped; a
+  # lock another transaction holds stops the recovery, since that run reads
+  # these same rows and recovers them itself.
+  defp recover_row_by_row(rows, settings, bulk_action) do
+    Enum.reduce_while(rows, {:continue, 0, 0}, fn row, {:continue, succeeded, failed} ->
+      case recover_row(row, settings, bulk_action) do
+        :succeeded -> {:cont, {:continue, succeeded + 1, failed}}
+        :failed -> {:cont, {:continue, succeeded, failed + 1}}
+        :skipped -> {:cont, {:continue, succeeded, failed}}
+        :busy -> {:halt, {:busy, succeeded, failed}}
       end
     end)
   end
 
-  # Drives the `:run` action over a batch of Rows. The settings ride in on
-  # the action context so the change doesn't rebuild them per chunk. `transaction: :all` makes the batch atomic.
-  # What the batch wrote is announced once it commits: left queued, a page's
-  # progress would stand still until the bulk action finished.
-  defp bulk_run(rows, settings, bulk_action, opts) do
+  defp recover_row(row, settings, bulk_action) do
+    case locked(bulk_action.id, &write_row_alone(&1, row, settings)) do
+      {:ok, :skipped} ->
+        :skipped
+
+      {:ok, notifications} ->
+        Ash.Notifier.notify(notifications)
+        :succeeded
+
+      {:rolled_back, row, error} ->
+        mark_failed_locked(row, error, bulk_action)
+
+      :busy ->
+        :busy
+    end
+  end
+
+  defp write_row_alone(locked, row, settings) do
+    case still_resolved(row) do
+      nil -> :skipped
+      fresh -> write_rows([fresh], settings, locked, fresh, stop_on_error?: false)
+    end
+  end
+
+  defp still_resolved(row) do
+    row_resource()
+    |> Ash.Query.filter(id == ^row.id and status == :resolved)
+    |> Ash.read_one!(authorize?: false)
+  end
+
+  # Only while the row, read again under the lock, is still `:resolved`: one
+  # another run ran, or a retry reopened, since its own transaction rolled
+  # back is skipped.
+  defp mark_failed_locked(row, error, bulk_action) do
+    case locked(bulk_action.id, fn _locked -> mark_if_resolved(row, error) end) do
+      {:ok, :skipped} -> :skipped
+      {:ok, _row} -> :failed
+      :busy -> :busy
+    end
+  end
+
+  defp mark_if_resolved(row, error) do
+    case still_resolved(row) do
+      nil -> :skipped
+      fresh -> mark_row_failed(fresh, error)
+    end
+  end
+
+  # Drives the `:run` action over a batch of Rows, inside the locked
+  # transaction. The settings and the locked bulk action ride in on the
+  # action context so the change doesn't rebuild them per chunk. Returns what
+  # the batch would announce, to send once the transaction commits. A failed
+  # batch rolls back the whole transaction, and with it anything the
+  # transaction would return, so `writing` is kept aside for `locked/2` to
+  # hand back.
+  defp write_rows(rows, settings, locked, writing, opts) do
+    Process.put(@writing, writing)
+
     result =
       Ash.bulk_update(
         rows,
@@ -730,25 +889,82 @@ defmodule AshBulkDurable.Core.Worker do
           return_errors?: true,
           return_notifications?: true,
           authorize?: false,
-          context: %{ash_bulk_durable: %{settings: settings, bulk_action: bulk_action}}
+          context: %{ash_bulk_durable: %{settings: settings, bulk_action: locked}}
         ] ++ opts
       )
 
     case result.status do
       :success ->
-        Ash.Notifier.notify(result.notifications)
-        :ok
+        Process.delete(@writing)
+        result.notifications || []
 
-      # A refused flip rolled the batch back like a row failure would, but
-      # it is not one: another run wrote the row, so this one stops.
-      _ ->
-        raise_if_moved_on!(result.errors || [], bulk_action.id)
-        {:error, first_error(result)}
+      _failed ->
+        Ash.DataLayer.rollback(bulk_action_resource(), first_error(result))
     end
   end
 
   defp first_error(%{errors: [error | _]}), do: error
   defp first_error(_result), do: :unknown
+
+  # `[:ash_bulk_durable, :chunk, :start | :stop | :exception]`, as
+  # `:telemetry.span/3` would emit them, but split: a chunk starts once its
+  # rows are read under the lock, and stops after its transaction commits,
+  # or after its recovery.
+  defp chunk_start(locked, chunk_index, rows) do
+    start = System.monotonic_time()
+
+    metadata = %{
+      bulk_action_id: locked.id,
+      chunk_index: chunk_index,
+      rows_in_chunk: length(rows),
+      telemetry_span_context: make_ref()
+    }
+
+    :telemetry.execute(
+      [:ash_bulk_durable, :chunk, :start],
+      %{monotonic_time: start, system_time: System.system_time()},
+      metadata
+    )
+
+    span = %{start: start, metadata: metadata, rows: length(rows)}
+    Process.put(@chunk_span, span)
+    span
+  end
+
+  defp chunk_stop(span, measurements, outcome, recovery) do
+    Process.delete(@chunk_span)
+    stop = System.monotonic_time()
+
+    :telemetry.execute(
+      [:ash_bulk_durable, :chunk, :stop],
+      Map.merge(measurements, %{duration: stop - span.start, monotonic_time: stop}),
+      %{
+        bulk_action_id: span.metadata.bulk_action_id,
+        chunk_index: span.metadata.chunk_index,
+        outcome: outcome,
+        recovery: recovery,
+        telemetry_span_context: span.metadata.telemetry_span_context
+      }
+    )
+  end
+
+  defp chunk_exception(exception, stacktrace) do
+    case Process.delete(@chunk_span) do
+      nil ->
+        :ok
+
+      span ->
+        stop = System.monotonic_time()
+
+        :telemetry.execute(
+          [:ash_bulk_durable, :chunk, :exception],
+          %{duration: stop - span.start, monotonic_time: stop},
+          Map.merge(span.metadata, %{kind: :error, reason: exception, stacktrace: stacktrace})
+        )
+    end
+
+    reraise exception, stacktrace
+  end
 
   # An all-or-nothing failure names the first offending row (0-based, when
   # identifiable) and keeps its error, so the progress panel can tell the
@@ -779,15 +995,6 @@ defmodule AshBulkDurable.Core.Worker do
 
   defp chunk_measurements(rows_in_chunk, succeeded, failed) do
     %{rows_in_chunk: rows_in_chunk, rows_succeeded: succeeded, rows_failed: failed}
-  end
-
-  defp chunk_metadata(bulk_action, chunk_index, outcome, recovery) do
-    %{
-      bulk_action_id: bulk_action.id,
-      chunk_index: chunk_index,
-      outcome: outcome,
-      recovery: recovery
-    }
   end
 
   # ── Row mutators ───────────────────────────────────────────────────────
@@ -829,7 +1036,7 @@ defmodule AshBulkDurable.Core.Worker do
 
   # ── Telemetry ────────────────────────────────────────────────────
 
-  # Emitted before `mark_running` so the attempt is observable even if the
+  # Emitted before any write, so the attempt is observable even if the
   # bulk action never starts. `pending_rows_at_start == total_rows` on attempt 1 is
   # a cold start; a smaller count on a later attempt is a crash resume.
   defp emit_worker_attempt_start(bulk_action, attempt) do
