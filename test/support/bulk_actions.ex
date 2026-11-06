@@ -27,7 +27,7 @@ defmodule AshBulkDurable.Test.BulkAction do
 
   postgres do
     table "bulk_actions"
-    repo AshBulkDurable.Test.Repo
+    repo fn _resource, type -> AshBulkDurable.Test.ReadRepo.for_type(type) end
 
     identity_wheres_to_sql one_unresolved_per_user:
                              "status IN ('queued', 'running', 'completed_with_errors')"
@@ -51,7 +51,7 @@ defmodule AshBulkDurable.Test.Row do
 
   postgres do
     table "bulk_action_rows"
-    repo AshBulkDurable.Test.Repo
+    repo fn _resource, type -> AshBulkDurable.Test.ReadRepo.for_type(type) end
   end
 
   policies do

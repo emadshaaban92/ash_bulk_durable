@@ -1,9 +1,10 @@
 # Passing tests run many refusals on purpose; their logs print only with a failure.
 ExUnit.start(capture_log: true)
 
-alias AshBulkDurable.Test.{PubSub, Repo}
+alias AshBulkDurable.Test.{PubSub, ReadRepo, Repo}
 
 {:ok, _pid} = Repo.start_link()
+{:ok, _pid} = ReadRepo.start_link()
 {:ok, _pid} = Supervisor.start_link([PubSub], strategy: :one_for_one)
 
 Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
@@ -34,3 +35,4 @@ after
 end
 
 Ecto.Adapters.SQL.Sandbox.mode(Repo, :manual)
+Ecto.Adapters.SQL.Sandbox.mode(ReadRepo, :manual)

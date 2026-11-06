@@ -291,6 +291,10 @@ defmodule AshBulkDurable.Core.Poller do
   # The killed run's transaction rolls back as its connection notices, so
   # this waits for the lock, briefly: a run of a bulk action that's still
   # running elsewhere may hold it longer, and is left to count.
+  # Not filtered on the run's pass, which the poller doesn't know: a run that
+  # outlived a retry and is killed here marks the retry's pass, costing it one
+  # stalled-start count. That needs a stale run and a shutdown at once, and
+  # is accepted.
   defp mark_shutdown_stopped(id) do
     Ash.transaction([Core.config(:bulk_action_resource)], fn ->
       case BulkActionLock.lock(id, [:queued, :running], wait: @shutdown_lock_wait) do

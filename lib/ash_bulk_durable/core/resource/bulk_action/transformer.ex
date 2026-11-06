@@ -57,6 +57,7 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
        default: false
      )
      |> add_attribute(:isolating_row_id, :uuid, allow_nil?: true, public?: true)
+     |> add_attribute(:pass, :integer, allow_nil?: false, public?: true, default: 0)
      |> add_create_timestamp(:inserted_at)
      |> add_update_timestamp(:updated_at)
      |> add_one_unresolved_identity()

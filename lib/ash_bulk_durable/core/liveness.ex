@@ -70,14 +70,16 @@ defmodule AshBulkDurable.Core.Liveness do
 
   @doc """
   Starts a process linked to the caller that stamps the bulk action
-  `bulk_action_id` every `:alive_interval` until `stop_ticker/1`. It runs
-  with the caller's `$callers`, so a test's sandboxed connection reaches it.
+  `bulk_action_id` every `:alive_interval` until `stop_ticker/1`, while the
+  bulk action is still in `pass`: once a retry has moved it on, the stamps
+  belong to that pass's runs. It runs with the caller's `$callers`, so a
+  test's sandboxed connection reaches it.
   """
-  def start_ticker(bulk_action_id) do
+  def start_ticker(bulk_action_id, pass) do
     interval = Core.config(:alive_interval, @alive_interval)
+    run = {bulk_action_id, pass}
 
-    {:ok, pid} =
-      Task.start_link(fn -> tick(bulk_action_id, interval, next_tick(interval), false) end)
+    {:ok, pid} = Task.start_link(fn -> tick(run, interval, next_tick(interval), false) end)
 
     pid
   end
@@ -130,7 +132,7 @@ defmodule AshBulkDurable.Core.Liveness do
 
   # Ticks keep to their schedule however often the run holds and releases
   # the ticker; a tick that falls while it is held is skipped.
-  defp tick(bulk_action_id, interval, next_at, held?) do
+  defp tick(run, interval, next_at, held?) do
     wait = max(next_at - System.monotonic_time(:millisecond), 0)
 
     receive do
@@ -139,23 +141,23 @@ defmodule AshBulkDurable.Core.Liveness do
 
       {:hold, from, ref} ->
         send(from, {ref, :held})
-        tick(bulk_action_id, interval, next_at, true)
+        tick(run, interval, next_at, true)
 
       :release ->
-        tick(bulk_action_id, interval, next_at, false)
+        tick(run, interval, next_at, false)
     after
       wait ->
-        unless held?, do: stamp_unless_busy(bulk_action_id)
-        tick(bulk_action_id, interval, next_tick(interval), held?)
+        unless held?, do: stamp_unless_busy(run)
+        tick(run, interval, next_tick(interval), held?)
     end
   end
 
   defp next_tick(interval), do: System.monotonic_time(:millisecond) + interval
 
   # A stamp that fails is only a missed hint: the run goes on.
-  defp stamp_unless_busy(bulk_action_id) do
+  defp stamp_unless_busy({bulk_action_id, pass}) do
     Ash.transaction([Core.config(:bulk_action_resource)], fn ->
-      case BulkActionLock.lock(bulk_action_id, [:queued, :running]) do
+      case BulkActionLock.lock(bulk_action_id, [:queued, :running], filter: expr(pass == ^pass)) do
         {:ok, locked} -> stamp!(locked)
         :none -> :skipped
       end
