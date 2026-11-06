@@ -42,3 +42,8 @@
   cancel commits, instead of through a one-shot `PurgeStaleStaging` job; inside
   a caller's own transaction, or when storage fails, it leaves them to the
   daily sweep. `PurgeStaleStaging.sweep/0` and `delete_staging/1` are public.
+- `Worker.run_now/1` and `Worker.drain/0` run bulk actions in the calling
+  process, for a host's tests and scripts: `run_now/1` runs one, `drain/0`
+  every queued or running bulk action, oldest first, each at most once per
+  call, returning how many it ran. The run itself is `Worker.run/2`, a plain
+  function; the Oban job's `perform/1` wraps it.

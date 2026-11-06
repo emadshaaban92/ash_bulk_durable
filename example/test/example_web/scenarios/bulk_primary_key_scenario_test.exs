@@ -7,10 +7,10 @@ defmodule ExampleWeb.Scenarios.BulkPrimaryKeyScenarioTest do
   is corrected on the errors sheet.
   """
   use ExampleWeb.ConnCase, async: true
-  use Oban.Testing, repo: Example.Repo
 
   import Phoenix.LiveViewTest
 
+  alias AshBulkDurable.Core.Worker
   alias Example.BulkActions.BulkAction
   alias Example.Test.{Booking, Region, RoleTestHelpers}
 
@@ -55,7 +55,7 @@ defmodule ExampleWeb.Scenarios.BulkPrimaryKeyScenarioTest do
 
     wrong = Ash.UUIDv7.generate()
     bulk_action = submit(view, super_user, "id\n#{found.id}\n#{wrong}\n")
-    assert %{success: 1, failure: 0} = drain()
+    assert 1 = drain()
 
     assert reload(bulk_action).status == :completed_with_errors
     assert render(view) =~ "1 of 2 rows done"
@@ -68,7 +68,7 @@ defmodule ExampleWeb.Scenarios.BulkPrimaryKeyScenarioTest do
 
     upload_correction(view, String.replace(sheet, wrong, mistyped.id))
     view |> element("#bulk-action-panel button", "Retry failed rows") |> render_click()
-    assert %{success: 1, failure: 0} = drain()
+    assert 1 = drain()
 
     assert reload(bulk_action).status == :completed
     assert Ash.reload!(mistyped, authorize?: false).refreshed
@@ -87,7 +87,7 @@ defmodule ExampleWeb.Scenarios.BulkPrimaryKeyScenarioTest do
     {:ok, view, _html} = conn |> login_as(officer) |> live(~p"/bulk")
     choose(view, "booking", "release", "primary_key")
     bulk_action = submit(view, officer, "id\n#{own.id}\n#{theirs.id}\n")
-    assert %{success: 1, failure: 0} = drain()
+    assert 1 = drain()
 
     assert reload(bulk_action).status == :completed_with_errors
     html = render(view)
@@ -120,7 +120,7 @@ defmodule ExampleWeb.Scenarios.BulkPrimaryKeyScenarioTest do
       "id,name\n#{first.id},#{renamed}\nnot-a-key,Malformed\n,Blank\n#{second.id},#{also_renamed}\n"
 
     bulk_action = submit(view, super_user, csv)
-    assert %{success: 1, failure: 0} = drain()
+    assert 1 = drain()
 
     assert reload(bulk_action).status == :completed_with_errors
     html = render(view)
@@ -140,7 +140,7 @@ defmodule ExampleWeb.Scenarios.BulkPrimaryKeyScenarioTest do
     {:ok, view, _html} = conn |> login_as(super_user) |> live(~p"/bulk")
     choose(view, "region", "destroy", "primary_key")
     destroyed = submit(view, super_user, "id\n#{second.id}\n")
-    assert %{success: 1, failure: 0} = drain()
+    assert 1 = drain()
 
     assert reload(destroyed).status == :completed
     assert {:error, _gone} = Ash.get(Region, second.id, authorize?: false)
@@ -160,7 +160,7 @@ defmodule ExampleWeb.Scenarios.BulkPrimaryKeyScenarioTest do
         "all_or_nothing" => "on"
       })
 
-    assert %{success: 1, failure: 0} = drain()
+    assert 1 = drain()
 
     assert reload(bulk_action).status == :failed
     html = render(view)
@@ -237,5 +237,5 @@ defmodule ExampleWeb.Scenarios.BulkPrimaryKeyScenarioTest do
   end
 
   defp reload(%BulkAction{id: id}), do: Ash.get!(BulkAction, id, authorize?: false)
-  defp drain, do: Oban.drain_queue(queue: :bulk_actions)
+  defp drain, do: Worker.drain()
 end

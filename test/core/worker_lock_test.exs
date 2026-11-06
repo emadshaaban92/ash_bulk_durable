@@ -101,8 +101,6 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     assert running.started_at
   end
 
-  defp job(bulk_action), do: Repo.get!(Oban.Job, bulk_action.oban_job_id)
-
   defp perform_as_current(bulk_action) do
     Worker
     |> build_job(%{"bulk_action_id" => bulk_action.id})
@@ -115,6 +113,8 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       bulk_action = submit!(ctx, 2)
       locker = lock_elsewhere(bulk_action.id)
 
+      assert :busy = Worker.run_now(bulk_action.id)
+      # The Oban job ends `:ok`.
       assert :ok = perform_as_current(bulk_action)
 
       release(locker)
@@ -156,7 +156,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       phase1 = count_events(bulk_action, [:ash_bulk_durable, :phase1, :start])
       locker = lock_elsewhere(bulk_action.id)
 
-      assert :ok = perform_as_current(bulk_action)
+      assert :busy = Worker.run_now(bulk_action.id)
 
       release(locker)
       assert phase1.() == 0
@@ -169,7 +169,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       bulk_action = submit!(ctx, 2, mode: :all_or_nothing)
       locker = lock_elsewhere(bulk_action.id)
 
-      assert :ok = perform_as_current(bulk_action)
+      assert :busy = Worker.run_now(bulk_action.id)
 
       release(locker)
       assert statuses(bulk_action) == [:resolved, :resolved]
@@ -199,10 +199,9 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
 
       on_exit(fn -> :telemetry.detach(handler) end)
 
-      job = job(bulk_action)
-      a = start_run(job)
+      a = start_run(bulk_action)
       assert_receive {:committed, ^a}, 5_000
-      b = start_run(job)
+      b = start_run(bulk_action)
       assert_receive {:committed, ^b}, 5_000
       send(a, :go)
       assert_receive {:committed, ^a}, 5_000
@@ -225,17 +224,16 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     test "one starting while the other is inside a chunk writes nothing, and the other finishes",
          ctx do
       bulk_action = submit!(ctx, 2)
-      job = job(bulk_action)
       test_pid = self()
 
       # Inside A's first chunk, under its lock: B runs to its end.
       at_first_chunk(bulk_action, fn ->
-        b = start_run(job)
-        assert_receive {:done, ^b, :ok}, 5_000
+        b = start_run(bulk_action)
+        assert_receive {:done, ^b, :busy}, 5_000
         send(test_pid, :b_done)
       end)
 
-      assert :ok = perform_as_current(bulk_action)
+      assert :ok = Worker.run_now(bulk_action.id)
       assert_received :b_done
 
       assert statuses(bulk_action) == [:succeeded, :succeeded]
@@ -245,7 +243,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
 
     test "a run that finds every row done writes the verdict, once", ctx do
       bulk_action = submit!(ctx, 1)
-      assert :ok = perform_as_current(bulk_action)
+      assert :ok = Worker.run_now(bulk_action.id)
       finished = reload(bulk_action)
       assert finished.status == :completed
 
@@ -257,7 +255,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
         [id]
       )
 
-      assert :ok = perform_as_current(bulk_action)
+      assert :ok = Worker.run_now(bulk_action.id)
       assert %{status: :completed, rows_done: 1} = again = reload(bulk_action)
       assert again.finished_at
 
@@ -287,7 +285,8 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
 
       on_exit(fn -> :telemetry.detach(handler) end)
 
-      assert :ok = perform_as_current(bulk_action)
+      # Its start finds the bulk action no longer running.
+      assert :busy = Worker.run_now(bulk_action.id)
       :telemetry.detach(handler)
 
       assert %{status: :completed_with_errors, result: %{"outcome" => "elsewhere"}} =
@@ -314,13 +313,11 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
 
       on_exit(fn -> :telemetry.detach(handler) end)
 
-      job = job(bulk_action)
-
       {pid, monitor} =
         spawn_monitor(fn ->
           :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
           Process.put(:run?, true)
-          Worker.perform(job)
+          Worker.run_now(bulk_action.id)
         end)
 
       assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}, 5_000
@@ -333,7 +330,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       # Its lock went with its connection.
       assert eventually(fn -> lockable?(bulk_action.id) end)
 
-      assert :ok = perform_as_current(bulk_action)
+      assert :ok = Worker.run_now(bulk_action.id)
       assert statuses(bulk_action) == [:succeeded, :succeeded]
       assert created(ctx) == codes(ctx, 1..2)
       assert %{status: :completed, rows_done: 2} = reload(bulk_action)
@@ -351,7 +348,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       locker = lock_after_batch(bulk_action, 2)
       locks = count_locks()
 
-      assert :ok = perform_as_current(bulk_action)
+      assert :ok = Worker.run_now(bulk_action.id)
 
       # The start's, the chunk's, row 1's, and row 2's refused one: row 3 is
       # not tried.
@@ -361,7 +358,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       assert created(ctx) == codes(ctx, [1])
 
       # The next run recovers the rest: row 2 fails alone.
-      assert :ok = perform_as_current(bulk_action)
+      assert :ok = Worker.run_now(bulk_action.id)
       assert statuses(bulk_action) == [:succeeded, :failed, :succeeded]
       assert created(ctx) == codes(ctx, [1, 3])
       assert %{status: :completed_with_errors, rows_done: 2} = reload(bulk_action)
@@ -373,7 +370,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       [_r1, _r2, r3] = rows(bulk_action)
       after_batch(1, fn -> apply_elsewhere(r3) end)
 
-      assert :ok = perform_as_current(bulk_action)
+      assert :ok = Worker.run_now(bulk_action.id)
 
       assert [
                %{status: :succeeded},
@@ -394,7 +391,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       # retry reopens it.
       after_batch(3, fn -> reopen_elsewhere(r2) end)
 
-      assert :ok = perform_as_current(bulk_action)
+      assert :ok = Worker.run_now(bulk_action.id)
 
       assert [%{status: :succeeded}, %{status: :pending, error: nil}] = rows(bulk_action)
     end
@@ -404,7 +401,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       bulk_action = submit!(ctx, 2, chunk_size: 2)
       locker = lock_after_batch(bulk_action, 3)
 
-      assert :ok = perform_as_current(bulk_action)
+      assert :ok = Worker.run_now(bulk_action.id)
 
       release(locker)
       assert [%{status: :succeeded}, %{status: :resolved, error: nil}] = rows(bulk_action)
@@ -418,14 +415,14 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       bulk_action = submit!(ctx, 2, mode: :all_or_nothing)
       locker = lock_after_batch(bulk_action, 1)
 
-      assert :ok = perform_as_current(bulk_action)
+      assert :ok = Worker.run_now(bulk_action.id)
 
       release(locker)
       assert statuses(bulk_action) == [:resolved, :resolved]
       assert created(ctx) == []
       assert_no_verdict(bulk_action)
 
-      assert :ok = perform_as_current(bulk_action)
+      assert :ok = Worker.run_now(bulk_action.id)
       assert created(ctx) == []
 
       assert %{status: :failed, result: %{"reason" => "atomic_chunk_rolled_back"}} =
@@ -489,7 +486,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       after_batch(3, fn -> apply_elsewhere(r2) end)
       spans = count_chunk_events(bulk_action)
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
       assert spans.() == %{start: 1, stop: 1, exception: 0}
 
       # Row 1 committed alone before; row 2 keeps the other run's write.
@@ -522,12 +519,12 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
   end
 
   # A run of `job` in a process of its own, as another node's would be.
-  defp start_run(job) do
+  defp start_run(bulk_action) do
     test_pid = self()
 
     spawn_link(fn ->
       :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
-      send(test_pid, {:done, self(), Worker.perform(job)})
+      send(test_pid, {:done, self(), Worker.run_now(bulk_action.id)})
     end)
   end
 
@@ -609,7 +606,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     end
   end
 
-  # The bulk action locks the test process (the run, under `perform_job`)
+  # The bulk action locks the test process (the run, under `Worker.run_now/1`)
   # tried to take.
   defp count_locks do
     test_pid = self()

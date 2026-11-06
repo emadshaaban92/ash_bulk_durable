@@ -10,6 +10,7 @@ defmodule ExampleWeb.Scenarios.BulkActionSourceScenarioTest do
 
   require Ash.Query
 
+  alias AshBulkDurable.Core.Worker
   alias Example.BulkActions.Row
   alias Example.Accounts.User
   alias Example.Test.RoleTestHelpers
@@ -45,7 +46,7 @@ defmodule ExampleWeb.Scenarios.BulkActionSourceScenarioTest do
         scope: Example.Scope.new(actor: super_user)
       )
 
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
 
     session
     |> visit(~p"/bulk")

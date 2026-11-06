@@ -16,7 +16,7 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
   import ExUnit.CaptureLog
   import Phoenix.LiveViewTest
 
-  alias AshBulkDurable.Core.PurgeStaleStaging
+  alias AshBulkDurable.Core.{PurgeStaleStaging, Worker}
   alias Example.BulkActions.BulkAction
   alias Example.Test.{SlowStorage, TestStorage}
 
@@ -404,7 +404,7 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
   end
 
   defp drain_finished(bulk_action) do
-    assert %{failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    Worker.drain()
     Ash.get!(BulkAction, bulk_action.id, authorize?: false)
   end
 

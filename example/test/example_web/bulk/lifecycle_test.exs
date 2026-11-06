@@ -3,8 +3,8 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
   Step 9 (#41) durability suite for `/bulk`. Unlike
   `DurableBulkActionTest` — which exercises the LV wiring with manually-flipped
   bulk action states — these tests drive the **real** `AshBulkDurable.Core.Worker`
-  through `Oban.drain_queue/1`, proving the durability claims the whole
-  Oban design exists to provide:
+  through `AshBulkDurable.Core.Worker.drain/0`, proving the durability claims
+  the whole design exists to provide:
 
     * a submitted bulk action completes even after its LiveView is killed;
     * a reconnecting user re-renders the bulk action from persisted DB state;
@@ -95,7 +95,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
     bulk_action
   end
 
-  defp drain, do: Oban.drain_queue(queue: :bulk_actions)
+  defp drain, do: Worker.drain()
 
   # Kill the LiveView process to simulate a dropped/closed tab. The test
   # process is linked to the LV and owns the sandbox connection, so trap exits
@@ -155,7 +155,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
       assert_enqueued(worker: Worker, args: %{bulk_action_id: bulk_action.id})
 
       # One Oban job (the bulk action worker) drains successfully.
-      assert %{success: 1, failure: 0} = drain()
+      assert 1 = drain()
 
       fresh = reload(bulk_action)
       assert fresh.status == :completed
@@ -181,7 +181,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
       codes = Enum.map(rows, & &1.code)
 
       {view, bulk_action} = submit_bulk_action(conn, user, rows, &("\uFEFF" <> to_csv(&1)))
-      assert %{success: 1, failure: 0} = drain()
+      assert 1 = drain()
 
       assert reload(bulk_action).status == :completed
       assert render(view) =~ "Completed"
@@ -212,7 +212,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
       rows = List.update_at(rows, -1, &%{&1 | code: "#{tag}1"})
 
       {view, bulk_action} = submit_bulk_action(conn, user, rows)
-      assert %{success: 1, failure: 0} = drain()
+      assert 1 = drain()
 
       fresh = reload(bulk_action)
       assert fresh.status == :completed_with_errors
@@ -298,7 +298,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
       {view, bulk_action} = submit_destroy(conn, user, codes, %{})
       assert bulk_action.action_type == :destroy
       assert bulk_action.mode == :per_row
-      assert %{success: 1, failure: 0} = drain()
+      assert 1 = drain()
 
       fresh = reload(bulk_action)
       assert fresh.status == :completed_with_errors
@@ -325,7 +325,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
 
       {view, bulk_action} = submit_destroy(conn, user, codes, %{"all_or_nothing" => "on"})
       assert bulk_action.mode == :all_or_nothing
-      assert %{success: 1, failure: 0} = drain()
+      assert 1 = drain()
 
       fresh = reload(bulk_action)
       assert fresh.status == :failed
@@ -352,7 +352,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
         submit_by_code(conn, user, "update", "code,name\n" <> csv, %{"all_or_nothing" => "on"})
 
       assert bulk_action.action_type == :update
-      assert %{success: 1, failure: 0} = drain()
+      assert 1 = drain()
 
       fresh = reload(bulk_action)
       assert fresh.status == :failed
@@ -392,7 +392,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
       :ok = kill(view.pid)
 
       # The worker runs to completion with no LV attached — the durability claim.
-      assert %{success: 1, failure: 0} = drain()
+      assert 1 = drain()
       assert reload(bulk_action).status == :completed
 
       # Reconnecting after completion: the slot is free (terminal status
@@ -413,7 +413,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
       assert render(view2) =~ "bulk-action-panel"
 
       # Now the worker runs; its terminal broadcast reaches the reconnected LV.
-      assert %{success: 1, failure: 0} = drain()
+      assert 1 = drain()
       assert reload(bulk_action).status == :completed
 
       html = render(view2)
@@ -549,7 +549,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
         {_view, bulk_action} =
           submit_bulk_action(conn, user, [first, %{second | code: first.code}])
 
-        assert %{success: 1, failure: 0} = drain()
+        assert 1 = drain()
         assert reload(bulk_action).status == :completed_with_errors
 
         rename_stored!(bulk_action, column, name)
@@ -594,7 +594,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
         {_view, bulk_action} =
           submit_bulk_action(conn, user, [first, %{second | code: first.code}])
 
-        assert %{success: 1, failure: 0} = drain()
+        assert 1 = drain()
         [_good, failed] = list_rows(bulk_action.id)
 
         case table do
@@ -615,7 +615,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
          %{conn: conn, super_user: user} do
       [first, second, _third] = region_rows()
       {_view, bulk_action} = submit_bulk_action(conn, user, [first, %{second | code: first.code}])
-      assert %{success: 1, failure: 0} = drain()
+      assert 1 = drain()
       [_good, failed] = list_rows(bulk_action.id)
       store_vanished!("bulk_action_rows", "input", failed.id)
 
@@ -653,7 +653,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
         {_view, bulk_action} =
           submit_bulk_action(conn, user, [first, %{second | code: first.code}])
 
-        assert %{success: 1, failure: 0} = drain()
+        assert 1 = drain()
         store_vanished!("bulk_actions", column, bulk_action.id)
 
         assert {:error, :gone} =
@@ -680,7 +680,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
       [_first, unreadable, _third] = list_rows(bulk_action.id)
       store_vanished!("bulk_action_rows", "input", unreadable.id)
 
-      assert %{success: 1, failure: 0} = drain()
+      assert 1 = drain()
 
       assert reload(bulk_action).status == :completed_with_errors
       assert Enum.map(list_rows(bulk_action.id), & &1.status) == [:succeeded, :failed, :succeeded]
@@ -701,7 +701,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
       [_first, unreadable] = list_rows(bulk_action.id)
       store_vanished!("bulk_action_rows", "input", unreadable.id)
 
-      assert %{success: 1, failure: 0} = drain()
+      assert 1 = drain()
 
       assert %{status: :failed, result: %{"row_index" => 1}} = reload(bulk_action)
       assert Ash.read!(Region, authorize?: false) |> Enum.all?(&(&1.code != first.code))
@@ -714,7 +714,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
       {_view, bulk_action} = submit_bulk_action(conn, user)
       store_vanished!("bulk_actions", "input", bulk_action.id)
 
-      assert %{success: 1, failure: 0} = drain()
+      assert 1 = drain()
 
       assert reload(bulk_action).status == :failed
       assert Enum.all?(list_rows(bulk_action.id), &(&1.status != :succeeded))
@@ -738,7 +738,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
         {_view, bulk_action} =
           submit_bulk_action(conn, user, [first, %{second | code: first.code}])
 
-        assert %{success: 1, failure: 0} = drain()
+        assert 1 = drain()
         [_good, failed] = list_rows(bulk_action.id)
 
         rename_stored!(bulk_action, column, name)

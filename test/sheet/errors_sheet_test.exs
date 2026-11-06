@@ -29,7 +29,7 @@ defmodule AshBulkDurable.Sheet.ErrorsSheetTest do
     do: %{code: tag, name: "Region #{tag}", native_name: "منطقة #{tag}"}
 
   defp run!(bulk_action) do
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
     Ash.get!(BulkAction, bulk_action.id, authorize?: false)
   end
 

@@ -6,10 +6,10 @@ defmodule AshBulkDurable.FacadeTest do
   sends.
   """
   use AshBulkDurable.DataCase, async: true
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
 
   require Ash.Query
 
+  alias AshBulkDurable.Core.Worker
   alias AshBulkDurable.Test.{Book, Shelf}
   alias AshBulkDurable.Test.{BulkAction, Row}
   alias AshBulkDurable.Test.Branch
@@ -51,7 +51,7 @@ defmodule AshBulkDurable.FacadeTest do
 
   defp run!(bulk_action) do
     assert bulk_action.status == :queued
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
     {Ash.get!(BulkAction, bulk_action.id, authorize?: false), rows(bulk_action)}
   end
 
@@ -273,7 +273,7 @@ defmodule AshBulkDurable.FacadeTest do
       corrected = Enum.map(sheet.rows, &Map.put(&1, "email", to_string(person.email)))
 
       {:ok, retried} = AshBulkDurable.retry(bulk_action, %{sheet | rows: corrected}, scope: scope)
-      assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+      assert 1 = Worker.drain()
       assert Ash.reload!(retried, authorize?: false).status == :completed
     end
 
@@ -314,7 +314,7 @@ defmodule AshBulkDurable.FacadeTest do
         AshBulkDurable.destroy_many(sheet, Branch, :destroy, scope: scope)
       end
 
-      assert %{success: 0} = Oban.drain_queue(queue: :bulk_actions)
+      assert 0 = Worker.drain()
       assert exists?(branch, user)
       refute hd(reloaded([branch], user)).name == "Renamed"
     end
@@ -498,7 +498,7 @@ defmodule AshBulkDurable.FacadeTest do
 
       # A selected record stays the one selected, so nothing moves the row on.
       {:ok, _retried} = AshBulkDurable.retry(bulk_action, scope: ctx.scope)
-      assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+      assert 1 = Worker.drain()
       bulk_action = Ash.get!(BulkAction, bulk_action.id, authorize?: false)
 
       assert bulk_action.status == :completed_with_errors

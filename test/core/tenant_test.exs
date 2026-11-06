@@ -10,7 +10,6 @@ defmodule AshBulkDurable.Core.TenantTest do
   inside the test's sandbox transaction and vanish with it.
   """
   use AshBulkDurable.DataCase, async: true
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
 
   require Ash.Query
 
@@ -87,7 +86,7 @@ defmodule AshBulkDurable.Core.TenantTest do
         Keyword.merge([scope: AshBulkDurable.Test.Scope.new(actor: user), chunk_size: 10], opts)
       )
 
-    assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+    assert :ok = Worker.run_now(bulk_action.id)
     {Ash.get!(BulkAction, bulk_action.id, authorize?: false), rows(bulk_action)}
   end
 
@@ -210,7 +209,7 @@ defmodule AshBulkDurable.Core.TenantTest do
           rows: Map.new(stored, &{&1.id, fixed(&1)})
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
       assert Ash.get!(BulkAction, bulk_action.id, authorize?: false).status == :completed
 
       {w1, w2} = {ctx.w1.id, ctx.w2.id}
@@ -237,7 +236,7 @@ defmodule AshBulkDurable.Core.TenantTest do
 
       Process.delete(:refuse_writes)
       {:ok, _retried} = AshBulkDurable.Core.retry(bulk_action, scope: scope(ctx.user))
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       assert_received {:resolved, _tenant, "expired name"}
       refute_received {:resolved, _tenant, ^root}
@@ -266,7 +265,7 @@ defmodule AshBulkDurable.Core.TenantTest do
                )
 
       flush_resolved()
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       assert_received {:resolved, _tenant, "expired"}
       assert Ash.get!(BulkAction, bulk_action.id, authorize?: false).status == :completed
@@ -288,7 +287,7 @@ defmodule AshBulkDurable.Core.TenantTest do
           input: %{shared | parent_id: nil}
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
       assert Ash.get!(BulkAction, bulk_action.id, authorize?: false).status == :completed
 
       w1 = ctx.w1.id
@@ -344,7 +343,7 @@ defmodule AshBulkDurable.Core.TenantTest do
           scope: AshBulkDurable.Test.Scope.new(actor: ctx.user)
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       assert Ash.get!(BulkAction, bulk_action.id, authorize?: false).status == :completed
       assert Enum.map(rows(bulk_action), & &1.target.tenant) == [ctx.w1.id, ctx.w2.id]
@@ -368,7 +367,7 @@ defmodule AshBulkDurable.Core.TenantTest do
 
       assert [row] = rows(bulk_action)
       assert row.target == %{lookup: %{id: queried.id}, tenant: ctx.w1.id}
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
       assert Map.keys(widgets(ctx.w1)) == ["From a query"]
 
       {:ok, bulk_action} =
@@ -378,7 +377,7 @@ defmodule AshBulkDurable.Core.TenantTest do
           scope: scope
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
       assert Map.keys(widgets(ctx.w2)) == ["From an ID"]
     end
 
@@ -397,7 +396,7 @@ defmodule AshBulkDurable.Core.TenantTest do
           scope: AshBulkDurable.Test.Scope.new(actor: ctx.user)
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       assert [%{name: "Shared"}] = Ash.read!(Gadget, tenant: first)
       assert [%{name: "Shared"}] = Ash.read!(Gadget, tenant: second)
@@ -435,7 +434,7 @@ defmodule AshBulkDurable.Core.TenantTest do
           )
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
       {Ash.get!(BulkAction, bulk_action.id, authorize?: false), rows(bulk_action)}
     end
 
@@ -501,7 +500,7 @@ defmodule AshBulkDurable.Core.TenantTest do
           scope: scope(ctx.user)
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
       assert Ash.reload!(other, tenant: ctx.w1.id).parent_id == other.id
     end
 
@@ -518,7 +517,7 @@ defmodule AshBulkDurable.Core.TenantTest do
           ]
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
       {Ash.get!(BulkAction, bulk_action.id, authorize?: false), rows(bulk_action)}
     end
 
@@ -537,7 +536,7 @@ defmodule AshBulkDurable.Core.TenantTest do
 
       corrected = %{errors | rows: [%{cells | "tenant.code" => "W2"}]}
       {:ok, _retried} = AshBulkDurable.retry(bulk_action, corrected, scope: scope(ctx.user))
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       assert Ash.get!(BulkAction, bulk_action.id, authorize?: false).status == :completed
       assert Map.keys(widgets(ctx.w2)) == ["lost"]
@@ -553,7 +552,7 @@ defmodule AshBulkDurable.Core.TenantTest do
 
       corrected = %{errors | rows: [Map.put(cells, "name", "named")]}
       {:ok, _retried} = AshBulkDurable.retry(bulk_action, corrected, scope: scope(ctx.user))
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       assert Map.keys(widgets(ctx.w2)) == ["named"]
       assert widgets(ctx.w1) == %{}
@@ -591,7 +590,7 @@ defmodule AshBulkDurable.Core.TenantTest do
           tenant: ctx.w2.id
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       assert Map.keys(widgets(ctx.w1)) == ["given"]
       assert widgets(ctx.w2) |> Map.keys() |> Enum.sort() == ["default", "looked up"]
@@ -623,7 +622,7 @@ defmodule AshBulkDurable.Core.TenantTest do
           }
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       assert %{"moved" => moved} = widgets(ctx.w2)
       assert moved.parent_id == ctx.roots[ctx.w2.id].id
@@ -641,7 +640,7 @@ defmodule AshBulkDurable.Core.TenantTest do
           input: %{name: "moved"}
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => row.bulk_action_id})
+      assert :ok = Worker.run_now(row.bulk_action_id)
       assert Map.keys(widgets(ctx.w2)) == ["moved"]
     end
 
@@ -651,7 +650,7 @@ defmodule AshBulkDurable.Core.TenantTest do
       {:ok, bulk_action} =
         AshBulkDurable.bulk_update([record], :update, %{name: nil}, scope: scope(ctx.user))
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
       [row] = rows(bulk_action)
       assert row.status == :failed
 
@@ -685,7 +684,7 @@ defmodule AshBulkDurable.Core.TenantTest do
           }
         )
 
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
+      assert :ok = Worker.run_now(bulk_action.id)
 
       refute_received {:resolved, _tenant, "held"}
       assert Map.keys(widgets(ctx.w1)) == ["held"]
