@@ -85,6 +85,60 @@ jobs:
       - name: Run tests
         run: mix test --warnings-as-errors
 
+  # Runs the whole system under chaos (test/stress/overlap_stress_test.exs),
+  # at a small, fixed size. Locally, set STRESS_SEED, STRESS_BULK_ACTIONS and
+  # STRESS_ITERATIONS to run it longer.
+  stress:
+    name: Stress (overlapping runs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      db:
+        image: postgres:18
+        env:
+          POSTGRES_USER: admin
+          POSTGRES_PASSWORD: admin
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U admin"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      STRESS_SEED: "1"
+      STRESS_BULK_ACTIONS: "12"
+      STRESS_ITERATIONS: "3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Elixir / OTP
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20"
+          otp-version: "29"
+
+      - name: Cache deps and _build
+        uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-29-1.20-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-29-1.20-
+
+      - name: Map the "db" host to localhost
+        run: echo "127.0.0.1 db" | sudo tee -a /etc/hosts
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Run the stress test
+        run: mix test --only stress --warnings-as-errors
+
   # Version-independent checks, once.
   quality:
     name: Quality (format · credo · audits)
