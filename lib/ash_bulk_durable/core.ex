@@ -14,9 +14,18 @@ defmodule AshBulkDurable.Core do
   """
 
   require Ash.Expr
+  require Logger
   import Ash.Expr, only: [expr: 1]
 
-  alias AshBulkDurable.Core.{Introspection, Owner, Poller, Retry, Runner}
+  alias AshBulkDurable.Core.{
+    BulkActionLock,
+    Introspection,
+    Owner,
+    Poller,
+    PurgeStaleStaging,
+    Retry,
+    Runner
+  }
 
   @doc """
   Creates a bulk action running `action` of `resource` over `rows`, writing
@@ -87,14 +96,66 @@ defmodule AshBulkDurable.Core do
   with failed rows is abandoned; one queued or running, or already
   finished, is refused, as is one `scope`'s owner does not own. Returns
   `{:ok, bulk_action}` or `{:error, error}`.
+
+  The cancel is a verdict, so it is written under the bulk action lock
+  (`AshBulkDurable.Core.BulkActionLock`), its status read there. One whose
+  lock another transaction holds, such as a retry's, is refused at once
+  rather than waiting for it; so is one its caller does not own, before
+  anything is written. Once the cancel commits, the bulk action's staged
+  files are deleted (`AshBulkDurable.Core.PurgeStaleStaging.delete_staging/1`),
+  unless it ran inside a transaction of the caller's, which could still roll
+  back, or storage fails: the daily sweep then reclaims them.
   """
   def abandon(bulk_action, opts) do
     owner = Owner.worker_key(Keyword.fetch!(opts, :scope))
+    resource = config(:bulk_action_resource)
+    callers_transaction? = AshPostgres.DataLayer.Info.repo(resource, :mutate).in_transaction?()
 
-    bulk_action
-    |> Ash.Changeset.for_update(:mark_finished, %{result: :cancelled}, authorize?: false)
-    |> Ash.Changeset.filter(expr(status == :completed_with_errors and user_id == ^owner))
-    |> Ash.update(authorize?: false)
+    case Ash.transaction([resource], fn -> cancel(bulk_action, owner, resource) end) do
+      {:ok, {:ok, cancelled}} ->
+        unless callers_transaction?, do: delete_staging(cancelled)
+        {:ok, cancelled}
+
+      {:ok, {:error, _error} = refused} ->
+        refused
+
+      {:error, _error} = failed ->
+        failed
+    end
+  end
+
+  # A refusal is returned as the transaction's value, nothing written; a
+  # failed write rolls back.
+  defp cancel(bulk_action, owner, resource) do
+    case BulkActionLock.lock(bulk_action.id, [:completed_with_errors],
+           filter: expr(user_id == ^owner)
+         ) do
+      {:ok, locked} ->
+        case Ash.update(locked, %{result: :cancelled}, action: :mark_finished, authorize?: false) do
+          {:ok, cancelled} -> {:ok, cancelled}
+          {:error, error} -> Ash.DataLayer.rollback([resource], error)
+        end
+
+      :none ->
+        {:error,
+         Ash.Error.to_error_class(
+           Ash.Error.Changes.StaleRecord.exception(
+             resource: resource,
+             filter: %{id: bulk_action.id, status: :completed_with_errors, user_id: owner}
+           )
+         )}
+    end
+  end
+
+  # Best-effort: the cancel stands whatever storage does.
+  defp delete_staging(bulk_action) do
+    PurgeStaleStaging.delete_staging(bulk_action)
+  rescue
+    error ->
+      Logger.warning(
+        "could not delete the staged files of abandoned bulk action #{bulk_action.id}, " <>
+          "the daily sweep will: " <> Exception.message(error)
+      )
   end
 
   @doc "Reruns the rows that have not succeeded; see `AshBulkDurable.Core.Retry.retry/2`."

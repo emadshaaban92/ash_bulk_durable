@@ -1,10 +1,12 @@
 defmodule AshBulkDurable.Core.PurgeStaleStaging do
   @moduledoc """
   Staged-file garbage collector. The worker deletes a bulk action's
-  staging keys itself when it finishes `:completed` or `:cancelled`, and
-  leaves them for a retry when it finishes `:completed_with_errors` or
-  `:failed`; it can't reach states where it never ran or already exited.
-  `sweep/0` reclaims those.
+  staging keys itself when it finishes `:completed`, and leaves them for a
+  retry when it finishes `:completed_with_errors` or `:failed`. The worker
+  never writes `:cancelled`: abandoning does (`AshBulkDurable.Core.abandon/2`),
+  and deletes the files itself. Nothing deletes them for a bulk action that
+  never ran, or whose delete was skipped or failed; `sweep/0` reclaims
+  those.
 
   ## Daily sweep (`sweep/0`)
 
@@ -38,10 +40,10 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
 
   Abandoning flips a `:completed_with_errors` bulk action to `:cancelled`
   long after the worker exited, so nothing on the worker's code path can
-  drop its staged files. `AshBulkDurable.Core.Changes.ApplyMarkFinished`
-  calls `delete_staging/1` itself once the cancel commits; when it can't
-  (the cancel ran inside a caller's transaction, or storage failed), the
-  next sweep reclaims the `:cancelled` bulk action's files.
+  drop its staged files. `AshBulkDurable.Core.abandon/2` calls
+  `delete_staging/1` itself once the cancel commits; when it can't (the
+  cancel ran inside a caller's transaction, or storage failed), the next
+  sweep reclaims the `:cancelled` bulk action's files.
   """
   require Ash.Query
 

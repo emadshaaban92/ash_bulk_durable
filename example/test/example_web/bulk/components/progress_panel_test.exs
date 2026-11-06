@@ -217,10 +217,20 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanelTest do
     end
 
     test ":failed renders reason-derived copy" do
+      html =
+        render_panel(
+          bulk_action(%{status: :failed, result: %{"reason" => "atomic_phase1_failed"}})
+        )
+
+      assert html =~ "stopped before any rows were written"
+      assert html =~ "alert-error"
+    end
+
+    test ":failed with a reason it doesn't know says only that it failed" do
       html = render_panel(bulk_action(%{status: :failed, result: %{"reason" => "worker_lost"}}))
 
-      assert html =~ "stopped before finishing"
-      assert html =~ "under Retry with corrections"
+      assert html =~ "The bulk action failed."
+      refute html =~ "stopped before finishing"
       assert html =~ "alert-error"
     end
 
