@@ -90,11 +90,16 @@ defmodule AshBulkDurable.Core.Retry do
     Core.config(:row_resource)
     |> Ash.Query.filter(bulk_action_id == ^bulk_action.id and status != :succeeded)
     |> Ash.Query.sort(row_index: :asc)
+    |> BulkActionLock.pin()
     |> Ash.read!(authorize?: false)
   end
 
   defp failed(row) do
-    case Ash.get!(Core.config(:row_resource), row.id, authorize?: false) do
+    Core.config(:row_resource)
+    |> Ash.Query.filter(id == ^row.id)
+    |> BulkActionLock.pin()
+    |> Ash.read_one!(authorize?: false)
+    |> case do
       %{status: :failed} = fresh -> [fresh]
       _finished -> []
     end
@@ -106,6 +111,7 @@ defmodule AshBulkDurable.Core.Retry do
   defp nothing_unprocessed(%{status: :failed} = bulk_action) do
     Core.config(:row_resource)
     |> Ash.Query.filter(bulk_action_id == ^bulk_action.id and status in [:pending, :resolved])
+    |> BulkActionLock.pin()
     |> Ash.count!(authorize?: false)
     |> case do
       0 -> :ok

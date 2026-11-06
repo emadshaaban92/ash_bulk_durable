@@ -68,3 +68,9 @@
   is refused at once, and one its caller doesn't own is refused before
   anything is written. It deletes the staged files itself once its own
   transaction commits, as before.
+- A retry bumps the bulk action's new `pass` column, and a run acts only on
+  the pass it started: a run that outlived a verdict and a retry stops at its
+  next lock instead of applying the new pass's rows with the old shared
+  input. The verdict waits until no row is `:pending` or `:resolved`, and
+  lost resolutions are put back under the lock. Every read made under the
+  lock goes to the mutate repo, never a read replica.

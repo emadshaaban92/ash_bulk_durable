@@ -4,11 +4,14 @@ defmodule AshBulkDurable.Core.BulkActionLock do
 
   Nothing writes a bulk action's rows without first holding the lock on that
   bulk action's row, with one exception: phase 1's single-row
-  compare-and-sets (a row's `:resolve`, and phase 1's `:mark_failed` and
-  `:forget_resolutions`), which run outside any transaction while a resolver
-  does its I/O, and are guarded by the row's status instead
+  compare-and-sets (a row's `:resolve`, and phase 1's `:mark_failed`), which
+  run while a resolver does its I/O, each in a short transaction of its own,
+  and are guarded by the row's status instead
   (`AshBulkDurable.Core.Changes.RequireStatus`). They touch one row and never
-  wait on the bulk action. The lock order is always: the bulk action, then
+  wait on the bulk action. A suspect row resolved alone takes the lock with
+  `SKIP LOCKED` before its row write, to stop naming it as the row being
+  isolated, and goes on without that when the lock is held. The lock order
+  is always: the bulk action, then
   its rows. Two writers taking them in that order wait on the bulk action alone,
   so neither can hold a row the other is waiting for.
 
@@ -55,6 +58,24 @@ defmodule AshBulkDurable.Core.BulkActionLock do
       bulk_action -> {:ok, bulk_action}
     end
   end
+
+  @doc """
+  Points `query` at its resource's mutate repo (an AshPostgres resource's;
+  any other is left as it is), the one a lock's transaction
+  runs on. Every read made under the lock goes through it: a read routed to
+  a `:read` repo, a replica on hosts that configure one, would run on
+  another connection, seeing neither the lock nor what the transaction wrote.
+  """
+  def pin(%Ash.Query{resource: resource} = query) do
+    if Ash.DataLayer.data_layer(resource) == AshPostgres.DataLayer do
+      repo = AshPostgres.DataLayer.Info.repo(resource, :mutate)
+      Ash.Query.set_context(query, %{data_layer: %{repo: repo}})
+    else
+      query
+    end
+  end
+
+  def pin(resource) when is_atom(resource), do: resource |> Ash.Query.new() |> pin()
 
   defp lock_clause(_repo, nil), do: "FOR NO KEY UPDATE SKIP LOCKED"
 

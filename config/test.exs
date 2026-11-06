@@ -31,6 +31,16 @@ config :ash_bulk_durable, Test.Repo,
   timeout: 60_000,
   ownership_timeout: 120_000
 
+# A stand-in read replica on the same database, for the tests that point
+# the bulk action resources' reads at it.
+config :ash_bulk_durable, Test.ReadRepo,
+  username: System.get_env("DATABASE_USER", "admin"),
+  password: System.get_env("DATABASE_PASSWORD", "admin"),
+  hostname: System.get_env("DATABASE_HOST", "db"),
+  database: "ash_bulk_durable_test#{System.get_env("MIX_TEST_PARTITION")}",
+  pool: Ecto.Adapters.SQL.Sandbox,
+  pool_size: 4
+
 config :ash,
   allow_forbidden_field_for_relationships_by_default?: true,
   include_embedded_source_by_default?: false,

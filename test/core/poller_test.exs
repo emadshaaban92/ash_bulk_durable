@@ -404,6 +404,27 @@ defmodule AshBulkDurable.Core.PollerTest do
       assert DateTime.diff(later, before, :millisecond) >= 300
     end
 
+    test "the ticker stamps only the pass it was started for", ctx do
+      bulk_action = submit!(ctx, 1)
+      set_running!(bulk_action, "(now() AT TIME ZONE 'utc') - interval '1 hour'")
+      before = committed_alive_at(bulk_action.id)
+      put_config(:alive_interval, 50)
+
+      # A retry has moved the bulk action on to its next pass.
+      Repo.query!("UPDATE bulk_actions SET pass = pass + 1 WHERE id = $1", [
+        Ecto.UUID.dump!(bulk_action.id)
+      ])
+
+      stale = Liveness.start_ticker(bulk_action.id, bulk_action.pass)
+      Process.sleep(300)
+      assert committed_alive_at(bulk_action.id) == before
+      assert :ok = Liveness.stop_ticker(stale)
+
+      current = Liveness.start_ticker(bulk_action.id, bulk_action.pass + 1)
+      assert eventually(fn -> committed_alive_at(bulk_action.id) != before end)
+      assert :ok = Liveness.stop_ticker(current)
+    end
+
     test "the ticker skips its stamp, without waiting, while another transaction holds the lock",
          ctx do
       bulk_action = submit!(ctx, 1)
@@ -412,7 +433,7 @@ defmodule AshBulkDurable.Core.PollerTest do
       put_config(:alive_interval, 50)
 
       locker = lock_elsewhere(bulk_action.id)
-      ticker = Liveness.start_ticker(bulk_action.id)
+      ticker = Liveness.start_ticker(bulk_action.id, bulk_action.pass)
 
       for _ <- 1..10 do
         Process.sleep(30)

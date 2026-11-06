@@ -21,8 +21,9 @@ defmodule AshBulkDurable.Core.Changes.ResolveRow do
   is left `:pending` and the worker marks it `:failed`).
   """
   use Ash.Resource.Change
+  require Ash.Expr
 
-  alias AshBulkDurable.Core.Runner
+  alias AshBulkDurable.Core.{BulkActionLock, Runner}
 
   @impl true
   def change(changeset, _opts, _context) do
@@ -37,7 +38,7 @@ defmodule AshBulkDurable.Core.Changes.ResolveRow do
           |> Ash.Changeset.force_change_attribute(:resolved_data, merged)
           |> keep_tenant(settings)
           |> Ash.Changeset.force_change_attribute(:status, :resolved)
-          |> give_back_attempt()
+          |> give_back_attempt(settings)
 
         {:error, error} ->
           Ash.Changeset.add_error(cs, resolve_error(error))
@@ -49,10 +50,43 @@ defmodule AshBulkDurable.Core.Changes.ResolveRow do
   # for its own: this run's bump goes back, so one run counts once. Bumps
   # earlier runs died with stay, so a row whose resolution is lost between
   # runs still reaches the cap. Chunks only hold rows with no attempts.
-  defp give_back_attempt(%{data: %{attempts: attempts}} = changeset) when attempts > 0,
-    do: Ash.Changeset.force_change_attribute(changeset, :attempts, attempts - 1)
+  #
+  # The give-back is `attempts - 1` on the committed count, never below 0,
+  # and the same transaction stops naming the row as the one being isolated,
+  # so a later shutdown can't give the bump back again.
+  defp give_back_attempt(%{data: %{attempts: attempts}} = changeset, settings)
+       when attempts > 0 do
+    changeset
+    |> Ash.Changeset.atomic_update(
+      :attempts,
+      Ash.Expr.expr(if attempts > 0, do: attempts - 1, else: 0)
+    )
+    |> Ash.Changeset.before_action(&stop_isolating(&1, settings))
+  end
 
-  defp give_back_attempt(changeset), do: changeset
+  defp give_back_attempt(changeset, _settings), do: changeset
+
+  # The bulk action first, then the row (R1), and never waiting: under a
+  # lock another transaction holds, or once the bulk action has moved on to
+  # another row or pass, there is nothing of this run's to clear.
+  defp stop_isolating(%{data: row} = changeset, settings) do
+    filter = Ash.Expr.expr(pass == ^settings.pass and isolating_row_id == ^row.id)
+
+    case BulkActionLock.lock(row.bulk_action_id, [:running], filter: filter) do
+      {:ok, locked} ->
+        {:ok, _cleared, _notifications} =
+          Ash.update(locked, %{isolating_row_id: nil},
+            action: :count_crashes,
+            authorize?: false,
+            return_notifications?: true
+          )
+
+      :none ->
+        :ok
+    end
+
+    changeset
+  end
 
   # Only a tenant the row's target named by reference needs keeping; any
   # other is read from the target or the bulk action again.

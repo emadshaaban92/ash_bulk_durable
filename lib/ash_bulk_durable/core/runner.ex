@@ -38,6 +38,7 @@ defmodule AshBulkDurable.Core.Runner do
   import AshBulkDurable.Core.Reference, only: [is_composite: 1]
 
   alias AshBulkDurable.Core.{
+    BulkActionLock,
     Introspection,
     NoMatchError,
     Reference,
@@ -54,8 +55,9 @@ defmodule AshBulkDurable.Core.Runner do
     @moduledoc """
     What every row of one bulk action shares: the action, the mode, who runs
     it, the tenant a row naming none acts in, the input a row with none of
-    its own runs with, and the files staged for it, downloaded to local paths
-    and keyed as they were staged.
+    its own runs with, the files staged for it, downloaded to local paths
+    and keyed as they were staged, and the bulk action's `pass` they were
+    read in.
     """
 
     @enforce_keys [:resource, :action_name, :action_type, :scope]
@@ -67,7 +69,8 @@ defmodule AshBulkDurable.Core.Runner do
       :scope,
       tenant: nil,
       input: nil,
-      staged_files: %{}
+      staged_files: %{},
+      pass: 0
     ]
 
     @type t :: %__MODULE__{
@@ -78,7 +81,8 @@ defmodule AshBulkDurable.Core.Runner do
             scope: term(),
             tenant: term(),
             input: map() | nil,
-            staged_files: %{optional(term()) => Path.t()}
+            staged_files: %{optional(term()) => Path.t()},
+            pass: non_neg_integer()
           }
   end
 
@@ -92,7 +96,8 @@ defmodule AshBulkDurable.Core.Runner do
       scope: scope,
       tenant: bulk_action.tenant,
       input: bulk_action.input,
-      staged_files: staged_files
+      staged_files: staged_files,
+      pass: bulk_action.pass
     }
   end
 
@@ -470,6 +475,7 @@ defmodule AshBulkDurable.Core.Runner do
     case settings.resource
          |> Ash.Query.for_read(read_action, %{}, opts)
          |> Ash.Query.filter_input(lookup)
+         |> BulkActionLock.pin()
          |> Ash.read_one(opts) do
       {:ok, %{} = record} -> {:ok, record}
       {:ok, nil} -> {:error, not_found(settings, lookup)}

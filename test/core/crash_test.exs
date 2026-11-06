@@ -41,6 +41,33 @@ defmodule AshBulkDurable.Core.CrashTest do
     def finish(nil), do: :ok
   end
 
+  defmodule ResettingResolver do
+    @moduledoc """
+    Resolves while another writer takes every bump back from the pending rows
+    of the bulk actions of the user it is given.
+    """
+    @behaviour AshBulkDurable.Core.Resolver
+
+    alias AshBulkDurable.Test.Repo
+
+    @impl true
+    def prepare(_args, _context), do: {:ok, nil}
+
+    @impl true
+    def resolve(user_id, nil, _context) do
+      Repo.query!(
+        "UPDATE bulk_action_rows SET attempts = 0 WHERE status = 'pending' AND bulk_action_id IN " <>
+          "(SELECT id FROM bulk_actions WHERE user_id = $1)",
+        [Ecto.UUID.dump!(user_id)]
+      )
+
+      {:ok, "resolved #{user_id}"}
+    end
+
+    @impl true
+    def finish(nil), do: :ok
+  end
+
   alias AshBulkDurable.Core.{CrashedRowError, Retry, Worker}
   alias AshBulkDurable.Test.{BulkAction, Region, Repo, Row, Scope, User}
 
@@ -213,10 +240,9 @@ defmodule AshBulkDurable.Core.CrashTest do
       assert attempts(bulk_action) == [0, 0, 2]
       assert statuses(bulk_action) == [:succeeded, :succeeded, :succeeded]
 
-      assert %{status: :completed, stalled_starts: 0, isolating_row_id: isolating} =
+      # Its run alone recorded how it went, and stopped naming it.
+      assert %{status: :completed, stalled_starts: 0, isolating_row_id: nil} =
                reload(bulk_action)
-
-      assert isolating == r3.id
     end
   end
 
@@ -274,6 +300,57 @@ defmodule AshBulkDurable.Core.CrashTest do
       # The reopened row's attempts go; the one that succeeded keeps its own.
       assert [%{status: :succeeded, attempts: 1}, %{status: :resolved, attempts: 0}] =
                rows(bulk_action)
+    end
+  end
+
+  describe "giving a bump back" do
+    test "a shutdown after a suspect resolved alone, while the run goes on, leaves its attempts",
+         ctx do
+      bulk_action = submit_resolving!(ctx, [{EchoResolver, "a"}, {KillingResolver, "b"}])
+      [r1, _r2] = rows(bulk_action)
+      # A run died on row 1 once, while running it alone.
+      set_row!(r1, "attempts = 1")
+
+      # Row 1 resolves alone, bumped and given back, which ends its isolation;
+      # then row 2 stops the run as it resolves with the rest.
+      assert :killed = attempt(bulk_action)
+      assert [%{status: :resolved, attempts: 1}, %{status: :pending}] = rows(bulk_action)
+      assert %{isolating_row_id: nil} = reload(bulk_action)
+
+      # As if the poller's shutdown had stopped that run.
+      set!(bulk_action, "shutdown_stopped = true")
+      assert :killed = attempt(bulk_action)
+
+      # Its bump was given back once already, so its earlier death still counts.
+      assert [%{status: :resolved, attempts: 1}, _r2] = rows(bulk_action)
+    end
+
+    test "a shutdown's give-back never takes a row below 0", ctx do
+      bulk_action = submit!(ctx, 1)
+      [r1] = rows(bulk_action)
+
+      # A shutdown stopped the last run while it named row 1, whose bump is
+      # already gone.
+      set!(bulk_action, "status = 'running', shutdown_stopped = true, isolating_row_id = $2", [
+        Ecto.UUID.dump!(r1.id)
+      ])
+
+      assert {:ran, :ok} = attempt(bulk_action)
+      assert [%{status: :succeeded, attempts: 0}] = rows(bulk_action)
+      assert %{status: :completed} = reload(bulk_action)
+    end
+
+    test "a resolve's give-back takes one from the committed count, never going below 0", ctx do
+      bulk_action = submit_resolving!(ctx, [{ResettingResolver, ctx.user.id}])
+      [r1] = rows(bulk_action)
+      # A suspect: bumped to 2 to resolve alone, its bumps taken back meanwhile.
+      set_row!(r1, "attempts = 1")
+
+      assert {:ran, :ok} = attempt(bulk_action)
+
+      # No attempts left, so it ran with the rest in phase 2.
+      assert [%{status: :succeeded, attempts: 0}] = rows(bulk_action)
+      assert %{status: :completed} = reload(bulk_action)
     end
   end
 

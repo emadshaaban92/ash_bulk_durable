@@ -54,8 +54,32 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     def finish(nil), do: :ok
   end
 
+  defmodule UnpreparableResolver do
+    @moduledoc """
+    Can't be readied, failing its bulk action. In a run told to hold (a test
+    pid under `:hold` in its process), it first says so and waits for `:go`.
+    """
+    @behaviour AshBulkDurable.Core.Resolver
+
+    @impl true
+    def prepare(_args, _context) do
+      with pid when is_pid(pid) <- Process.get(:hold) do
+        send(pid, {:preparing, self()})
+        receive do: (:go -> :ok)
+      end
+
+      {:error, :unprepared}
+    end
+
+    @impl true
+    def resolve(_value, _state, _context), do: {:error, :never}
+
+    @impl true
+    def finish(_state), do: :ok
+  end
+
   alias AshBulkDurable.Core.Worker
-  alias AshBulkDurable.Test.{BulkAction, Region, Repo, Row, Scope, User}
+  alias AshBulkDurable.Test.{Branch, BulkAction, Region, Repo, Row, Scope, User}
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
@@ -598,6 +622,96 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     end
   end
 
+  describe "a run that outlives a retry" do
+    test "phase 2: stops at its next lock, writing no row and no verdict; the retry's pass runs with its input",
+         ctx do
+      [old, new] = Enum.map(1..2, &region!(ctx, "R#{&1}"))
+      [_b1, _b2, b3] = branches = Enum.map(1..3, &branch!(ctx, &1))
+
+      {:ok, bulk_action} =
+        AshBulkDurable.bulk_update(branches, :update, %{region_id: old.id},
+          scope: ctx.scope,
+          chunk_size: 1
+        )
+
+      a = start_held_run(bulk_action)
+      assert_receive {:committed, ^a}, 5_000
+
+      # Run B, while A waits between chunks: row 3's branch is gone, so B
+      # ends `:completed_with_errors`. Its owner brings the branch back and
+      # retries with a new shared input.
+      gone = take_away!(b3)
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :completed_with_errors, pass: 0} = reload(bulk_action)
+      bring_back!(gone)
+
+      assert {:ok, %{status: :running, pass: 1}} =
+               AshBulkDurable.retry(bulk_action, scope: ctx.scope, input: %{region_id: new.id})
+
+      send(a, :go)
+      assert_receive {:done, ^a, :ok}, 5_000
+
+      # A applied nothing of the new pass, and wrote no verdict.
+      assert region_of(b3) == nil
+      assert statuses(bulk_action) == [:succeeded, :succeeded, :resolved]
+      assert %{status: :running, result: nil, finished_at: nil} = reload(bulk_action)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert region_of(b3) == new.id
+      assert %{status: :completed, rows_done: 3} = reload(bulk_action)
+    end
+
+    test "phase 1: writes no verdict of its own pass into the retry's", ctx do
+      bulk_action = submit_unpreparable!(ctx)
+
+      a = start_held_run(bulk_action)
+      assert_receive {:preparing, ^a}, 5_000
+
+      # Run B fails the bulk action as A is about to, and its owner retries it.
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      assert %{status: :failed, result: %{"reason" => "resolver_prepare_error"}} =
+               reload(bulk_action)
+
+      assert {:ok, %{status: :running, pass: 1}} =
+               AshBulkDurable.retry(bulk_action, scope: ctx.scope)
+
+      send(a, :go)
+      assert_receive {:done, ^a, :ok}, 5_000
+
+      assert %{status: :running, result: nil, finished_at: nil, pass: 1} = reload(bulk_action)
+    end
+  end
+
+  describe "the verdict" do
+    test "waits for a row another run put back to :pending between chunks", ctx do
+      bulk_action = submit!(ctx, 3)
+
+      a = start_held_run(bulk_action)
+      assert_receive {:committed, ^a}, 5_000
+
+      # As another run's `forget_resolutions` leaves a row whose resolutions it lost.
+      [_r1, _r2, r3] = rows(bulk_action)
+      reopen_elsewhere(r3)
+
+      send(a, :go)
+      assert_receive {:committed, ^a}, 5_000
+      send(a, :go)
+      assert_receive {:done, ^a, :ok}, 5_000
+
+      assert statuses(bulk_action) == [:succeeded, :succeeded, :pending]
+
+      assert %{status: :running, result: nil, finished_at: nil, rows_done: 2} =
+               reload(bulk_action)
+
+      # The next run resolves and applies it, then writes the verdict.
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert statuses(bulk_action) == List.duplicate(:succeeded, 3)
+      assert created(ctx) == codes(ctx, 1..3)
+      assert %{status: :completed, rows_done: 3} = reload(bulk_action)
+    end
+  end
+
   # ── Helpers ─────────────────────────────────────────────────────────────
 
   # How many times `event` fired for the bulk action.
@@ -683,6 +797,90 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
   defp assert_verdict_next_run(bulk_action, reason) do
     assert :ok = Worker.run_now(bulk_action.id)
     assert %{status: :failed, result: %{"reason" => ^reason}} = reload(bulk_action)
+  end
+
+  # A run of the bulk action in a process of its own that, after each of its
+  # chunks commits and in phase 1 as `UnpreparableResolver` readies, says so
+  # and waits for `:go`.
+  defp start_held_run(bulk_action) do
+    test_pid = self()
+    handler = "held-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:ash_bulk_durable, :chunk, :stop],
+      fn _event, _measurements, %{bulk_action_id: id}, _config ->
+        if id == bulk_action.id and Process.get(:hold) do
+          send(test_pid, {:committed, self()})
+          receive do: (:go -> :ok)
+        end
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    spawn_link(fn ->
+      :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
+      Process.put(:hold, test_pid)
+      send(test_pid, {:done, self(), Worker.run_now(bulk_action.id)})
+    end)
+  end
+
+  defp submit_unpreparable!(ctx) do
+    Ash.create!(
+      BulkAction,
+      %{
+        user_id: ctx.user.id,
+        resource_name: inspect(Region),
+        action_name: :create,
+        action_type: :create,
+        total_rows: 1,
+        mode: :per_row,
+        chunk_size: 1,
+        rows: [
+          %{
+            input: %{
+              code: "#{ctx.tag}-1",
+              name: "#{ctx.tag} N1",
+              native_name: {:resolve, UnpreparableResolver, "a"}
+            }
+          }
+        ]
+      },
+      action: :create,
+      authorize?: false
+    )
+  end
+
+  defp region!(ctx, suffix) do
+    Ash.create!(
+      Region,
+      %{code: "#{ctx.tag}-#{suffix}", name: "#{ctx.tag} X#{suffix}", native_name: "X#{suffix}"},
+      authorize?: false
+    )
+  end
+
+  defp branch!(ctx, i), do: Ash.create!(Branch, %{name: "#{ctx.tag} B#{i}"}, authorize?: false)
+
+  defp region_of(branch) do
+    %{rows: [[region_id]]} =
+      Repo.query!("SELECT region_id FROM branches WHERE id = $1", [Ecto.UUID.dump!(branch.id)])
+
+    region_id && Ecto.UUID.load!(region_id)
+  end
+
+  # Deletes `branch`, and returns what brings it back with the same id.
+  defp take_away!(branch) do
+    Repo.query!("DELETE FROM branches WHERE id = $1", [Ecto.UUID.dump!(branch.id)])
+    branch
+  end
+
+  defp bring_back!(branch) do
+    Repo.query!("INSERT INTO branches (id, name) VALUES ($1, $2)", [
+      Ecto.UUID.dump!(branch.id),
+      branch.name
+    ])
   end
 
   # A run of the bulk action in a process of its own, as another node's would be.
@@ -895,6 +1093,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     email = "#{tag}@example.test"
 
     Repo.query!("DELETE FROM bulk_actions WHERE user_id IN (#{users})", [email])
+    Repo.query!("DELETE FROM branches WHERE name LIKE $1 || ' %'", [tag])
     Repo.query!("DELETE FROM regions WHERE code LIKE $1 || '-%'", [tag])
     Repo.query!("DELETE FROM users WHERE id IN (#{users})", [email])
   end

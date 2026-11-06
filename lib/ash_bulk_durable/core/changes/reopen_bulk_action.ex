@@ -5,7 +5,10 @@ defmodule AshBulkDurable.Core.Changes.ReopenBulkAction do
   liveness hint its last run left included, so a poller starts it at once
   rather than once that hint goes stale. Its crash count starts again
   (`stalled_starts`, `progress_at_start`, `shutdown_stopped` and
-  `isolating_row_id`; see "Crashes" in `AshBulkDurable.Core.Worker`).
+  `isolating_row_id`; see "Crashes" in `AshBulkDurable.Core.Worker`). Its
+  `pass` goes up by one, so a run that started before the retry stops at its
+  next lock instead of carrying on into this pass with the last one's
+  settings (see "Passes" in `AshBulkDurable.Core.Worker`).
 
   Only a bulk action parked in `:completed_with_errors` or `:failed` matches
   the update. One `:queued` or `:running`, or already `:completed` or
@@ -29,6 +32,7 @@ defmodule AshBulkDurable.Core.Changes.ReopenBulkAction do
     |> Ash.Changeset.force_change_attribute(:progress_at_start, nil)
     |> Ash.Changeset.force_change_attribute(:shutdown_stopped, false)
     |> Ash.Changeset.force_change_attribute(:isolating_row_id, nil)
+    |> Ash.Changeset.atomic_update(:pass, Ash.Expr.expr(pass + 1))
     |> put_input()
   end
 
