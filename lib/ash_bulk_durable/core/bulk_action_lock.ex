@@ -24,6 +24,11 @@ defmodule AshBulkDurable.Core.BulkActionLock do
   `{:ok, bulk_action}`, or `:none` when it is locked by another transaction,
   missing, in another status, or not matching `:filter`.
 
+  With `:wait`, milliseconds, it waits that long for another transaction's
+  lock instead (`SET LOCAL lock_timeout`), then raises. Only the poller's
+  shutdown does, for a run it has just killed, whose transaction lets go a
+  moment later: everything else refuses at once.
+
   Raises `ArgumentError` outside a transaction, where the lock would hold
   nothing.
   """
@@ -38,11 +43,18 @@ defmodule AshBulkDurable.Core.BulkActionLock do
     resource
     |> Ash.Query.filter(id == ^id and status in ^statuses)
     |> Ash.Query.do_filter(Keyword.get(opts, :filter, true))
-    |> Ash.Query.lock("FOR NO KEY UPDATE SKIP LOCKED")
+    |> Ash.Query.lock(lock_clause(repo, opts[:wait]))
     |> Ash.read_one!(authorize?: false)
     |> case do
       nil -> :none
       bulk_action -> {:ok, bulk_action}
     end
+  end
+
+  defp lock_clause(_repo, nil), do: "FOR NO KEY UPDATE SKIP LOCKED"
+
+  defp lock_clause(repo, wait) when is_integer(wait) and wait > 0 do
+    repo.query!("SET LOCAL lock_timeout = '#{wait}ms'")
+    "FOR NO KEY UPDATE"
   end
 end

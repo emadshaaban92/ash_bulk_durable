@@ -94,6 +94,13 @@ defmodule AshBulkDurable.Core.Poller do
   to finish, and kills those that haven't. A killed run's transaction rolls
   back, and its rows resume on another node, or this one once restarted,
   when its hint goes stale.
+
+  A killed run didn't crash, so the poller then sets `shutdown_stopped` on
+  its bulk action, and the next start doesn't count it as stalled (see
+  "Crashes" in `AshBulkDurable.Core.Worker`). It takes the bulk action's
+  lock to do so, waiting at most 2 seconds for the killed run's transaction
+  to let go of it: the one wait on the lock anywhere. A node stopped without
+  this shutdown (out of memory, `kill -9`) counts as a crash.
   """
   use GenServer
 
@@ -101,21 +108,23 @@ defmodule AshBulkDurable.Core.Poller do
   require Logger
 
   alias AshBulkDurable.Core
-  alias AshBulkDurable.Core.{Liveness, PurgeStaleStaging, Worker}
+  alias AshBulkDurable.Core.{BulkActionLock, Liveness, PurgeStaleStaging, Worker}
 
   @poll_interval :timer.seconds(5)
   @max_running 2
   @stale_after :timer.minutes(2)
   @staging_sweep_interval :timer.hours(24)
   @shutdown_grace :timer.seconds(20)
+  @shutdown_lock_wait :timer.seconds(2)
 
   def child_spec(opts) do
     grace = option(opts, :shutdown_grace, @shutdown_grace)
+    marks = option(opts, :max_running, @max_running) * @shutdown_lock_wait
 
     %{
       id: Keyword.get(opts, :name, __MODULE__),
       start: {__MODULE__, :start_link, [opts]},
-      shutdown: grace + :timer.seconds(5)
+      shutdown: grace + marks + :timer.seconds(5)
     }
   end
 
@@ -241,6 +250,8 @@ defmodule AshBulkDurable.Core.Poller do
     deadline = System.monotonic_time(:millisecond) + state.shutdown_grace
     state = await_runs(state, deadline)
 
+    runs = Map.values(state.running)
+
     Enum.each(state.running, fn {ref, run} ->
       Process.demonitor(ref, [:flush])
 
@@ -248,9 +259,58 @@ defmodule AshBulkDurable.Core.Poller do
         "ash_bulk_durable: bulk action #{run.id} was still running at shutdown; " <>
           "it resumes once its liveness hint goes stale"
       )
-
-      Process.exit(run.pid, :kill)
     end)
+
+    # All die at once, then each is marked, waiting at most
+    # `@shutdown_lock_wait` for its lock: the child spec allows for both.
+    kill_all(runs)
+    Enum.each(runs, &mark_shutdown_stopped(&1.id))
+  end
+
+  defp kill_all(runs) do
+    deadline = System.monotonic_time(:millisecond) + @shutdown_lock_wait
+
+    runs
+    |> Enum.map(fn %{pid: pid} ->
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      {ref, pid}
+    end)
+    |> Enum.each(fn {ref, pid} ->
+      remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+      receive do
+        {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+      after
+        remaining -> Process.demonitor(ref, [:flush])
+      end
+    end)
+  end
+
+  # The killed run's transaction rolls back as its connection notices, so
+  # this waits for the lock, briefly: a run of a bulk action that's still
+  # running elsewhere may hold it longer, and is left to count.
+  defp mark_shutdown_stopped(id) do
+    Ash.transaction([Core.config(:bulk_action_resource)], fn ->
+      case BulkActionLock.lock(id, [:queued, :running], wait: @shutdown_lock_wait) do
+        {:ok, locked} ->
+          {:ok, _marked, _notifications} =
+            Ash.update(locked, %{shutdown_stopped: true},
+              action: :count_crashes,
+              authorize?: false,
+              return_notifications?: true
+            )
+
+        :none ->
+          :ok
+      end
+    end)
+  rescue
+    exception ->
+      Logger.warning(
+        "ash_bulk_durable: bulk action #{id} was stopped by shutdown, but couldn't be " <>
+          "marked so; its next start counts it as stalled: #{Exception.message(exception)}"
+      )
   end
 
   defp await_runs(state, _deadline) when map_size(state.running) == 0, do: state

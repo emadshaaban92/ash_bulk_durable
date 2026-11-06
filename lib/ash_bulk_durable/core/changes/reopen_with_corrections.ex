@@ -18,7 +18,8 @@ defmodule AshBulkDurable.Core.Changes.ReopenWithCorrections do
   value, so the resolve phase reruns only what genuinely needs redoing.
 
   The row returns to `:pending` while it holds a reference, `:resolved`
-  otherwise; a correction its caller already refused (`error`) leaves it
+  otherwise, its `attempts` back to 0, so runs that died on it before the
+  correction count no more; a correction its caller already refused (`error`) leaves it
   `:failed` and `refused` with that error.
   """
   use Ash.Resource.Change
@@ -52,6 +53,7 @@ defmodule AshBulkDurable.Core.Changes.ReopenWithCorrections do
     |> Ash.Changeset.force_change_attribute(:metadata, corrected.metadata)
     |> Ash.Changeset.force_change_attribute(:error, corrected.error)
     |> Ash.Changeset.force_change_attribute(:refused, not is_nil(corrected.error))
+    |> Ash.Changeset.force_change_attribute(:attempts, 0)
     |> Ash.Changeset.force_change_attribute(
       :resolved_data,
       kept_resolutions(row, corrected, ran_with, will_run_with)

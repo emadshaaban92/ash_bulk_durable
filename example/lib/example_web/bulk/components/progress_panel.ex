@@ -391,6 +391,11 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
       "staged_file_download_error" ->
         gettext("A companion file couldn't be downloaded from storage.")
 
+      "crashed" ->
+        gettext(
+          "The bulk action kept stopping before it could finish, so it was not run again. No rows were saved (\"Apply all rows or none\" was on)."
+        )
+
       "unreadable" ->
         gettext("What this bulk action held no longer exists, so it can't run.")
 

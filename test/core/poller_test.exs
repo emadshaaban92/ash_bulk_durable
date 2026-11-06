@@ -219,6 +219,55 @@ defmodule AshBulkDurable.Core.PollerTest do
       assert %{status: :running, rows_done: 0} = reload(bulk_action)
     end
 
+    test "on shutdown marks a run it kills, so its next start counts no stall and gives a bump back",
+         ctx do
+      bulk_action = submit!(ctx, 2, chunk_size: 2)
+      [r1, _r2] = rows(bulk_action)
+      test_pid = self()
+
+      # Three starts without progress so far, both rows `:resolved` at each:
+      # the next start runs the rows alone.
+      Repo.query!(
+        "UPDATE bulk_actions SET stalled_starts = 3, progress_at_start = 2 WHERE id = $1",
+        [Ecto.UUID.dump!(bulk_action.id)]
+      )
+
+      # The poller's run of row 1, alone, outlasts the grace period.
+      attach([:ash_bulk_durable, :test, :repo, :query], fn metadata ->
+        if self() != test_pid and metadata.source == "regions" and
+             String.starts_with?(metadata.query, "INSERT") do
+          send(test_pid, {:row_running, self()})
+          Process.sleep(5_000)
+        end
+      end)
+
+      start_poller!(shutdown_grace: 200)
+      Poller.nudge()
+      assert_receive {:row_running, run}, 2_000
+      monitor = Process.monitor(run)
+      log = capture_log(fn -> stop_supervised!(Poller) end)
+      assert_receive {:DOWN, ^monitor, :process, ^run, :killed}, 1_000
+      refute log =~ "couldn't be marked"
+
+      assert %{status: :running, stalled_starts: 4, shutdown_stopped: true, isolating_row_id: id} =
+               reload(bulk_action)
+
+      assert id == r1.id
+
+      assert [%{status: :resolved, attempts: 1}, %{status: :resolved, attempts: 0}] =
+               rows(bulk_action)
+
+      # The next start counts no stall, and row 1 runs alone again with its
+      # bump given back first.
+      capture_log(fn -> assert :ok = Worker.run_now(bulk_action.id) end)
+
+      assert %{status: :completed, stalled_starts: 4, shutdown_stopped: false} =
+               reload(bulk_action)
+
+      assert [%{status: :succeeded, attempts: 1}, %{attempts: 1}] = rows(bulk_action)
+      assert created(ctx) == codes(ctx, 1..2)
+    end
+
     test "sets the child spec's shutdown above the grace period" do
       assert %{shutdown: shutdown} = Poller.child_spec(shutdown_grace: 20_000)
       assert shutdown > 20_000

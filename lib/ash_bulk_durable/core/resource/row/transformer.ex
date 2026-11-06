@@ -34,6 +34,7 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
      |> add_attribute(:error, AshBulkDurable.Core.StoredErrors, allow_nil?: true, public?: true)
      |> add_attribute(:refused, :boolean, allow_nil?: false, public?: true, default: false)
      |> add_attribute(:record_id, :string, allow_nil?: true, public?: true)
+     |> add_attribute(:attempts, :integer, allow_nil?: false, public?: true, default: 0)
      |> add_create_timestamp(:inserted_at)
      |> add_bulk_action_relationship()
      |> add_default_accept()
@@ -46,6 +47,7 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
      |> add_mark_succeeded_action()
      |> add_mark_failed_action()
      |> add_run_action()
+     |> add_bump_attempts_action()
      |> add_reopen_with_corrections_action()
      |> add_postgres_reference()
      |> add_status_index()}
@@ -416,6 +418,43 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
           accept: [],
           require_atomic?: false,
           changes: [change]
+        )
+
+      Transformer.add_entity(dsl_state, [:actions], action, type: :append)
+    end
+  end
+
+  # Counts a row's runs that started alone (see "Crashes" in
+  # `AshBulkDurable.Core.Worker`): committed before the row runs, so a run
+  # that dies on it leaves the count behind. `by: -1` gives one back. Not a
+  # status flip: the worker filters it on the status it read the row in.
+  defp add_bump_attempts_action(dsl_state) do
+    if Info.action(dsl_state, :bump_attempts) do
+      dsl_state
+    else
+      import Ash.Expr
+
+      by_argument =
+        Transformer.build_entity!(Dsl, [:actions, :update], :argument,
+          name: :by,
+          type: :integer,
+          allow_nil?: false,
+          default: 1
+        )
+
+      bump =
+        Transformer.build_entity!(Dsl, [:actions, :update], :change,
+          change:
+            {Ash.Resource.Change.Atomic,
+             [attribute: :attempts, expr: expr(attempts + ^arg(:by)), cast_atomic?: true]}
+        )
+
+      {:ok, action} =
+        Transformer.build_entity(Dsl, [:actions], :update,
+          name: :bump_attempts,
+          accept: [],
+          arguments: [by_argument],
+          changes: [bump]
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)

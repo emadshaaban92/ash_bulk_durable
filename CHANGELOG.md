@@ -55,3 +55,11 @@
   every queued or running bulk action, oldest first, each at most once per
   call, returning how many it ran. The run itself is `Worker.run/2`, a plain
   function.
+- A run that dies without returning (killed, out of memory, a NIF crash) no
+  longer loops forever. Each start scores the bulk action's progress and
+  counts the starts that made none (`stalled_starts`). At
+  `:max_stalled_starts` (3) a per-row bulk action runs its rows alone, each
+  row's `attempts` committed before it runs, and a row that has stopped the
+  worker `:max_row_attempts` times (2) fails alone with
+  `Core.CrashedRowError` while the rest run on; an all-or-nothing one fails
+  with reason `:crashed`. A run the poller kills at shutdown is not counted.

@@ -3,7 +3,9 @@ defmodule AshBulkDurable.Core.Changes.ReopenBulkAction do
   Implements `BulkAction.:enqueue_retry`: a finished bulk action takes its
   corrected shared `input`, when given, and sheds how it finished, the
   liveness hint its last run left included, so a poller starts it at once
-  rather than once that hint goes stale.
+  rather than once that hint goes stale. Its crash count starts again
+  (`stalled_starts`, `progress_at_start`, `shutdown_stopped` and
+  `isolating_row_id`; see "Crashes" in `AshBulkDurable.Core.Worker`).
 
   Only a bulk action parked in `:completed_with_errors` or `:failed` matches
   the update. One `:queued` or `:running`, or already `:completed` or
@@ -23,6 +25,10 @@ defmodule AshBulkDurable.Core.Changes.ReopenBulkAction do
     |> Ash.Changeset.force_change_attribute(:error, nil)
     |> Ash.Changeset.force_change_attribute(:finished_at, nil)
     |> Ash.Changeset.force_change_attribute(:alive_at, nil)
+    |> Ash.Changeset.force_change_attribute(:stalled_starts, 0)
+    |> Ash.Changeset.force_change_attribute(:progress_at_start, nil)
+    |> Ash.Changeset.force_change_attribute(:shutdown_stopped, false)
+    |> Ash.Changeset.force_change_attribute(:isolating_row_id, nil)
     |> put_input()
   end
 
