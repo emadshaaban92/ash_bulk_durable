@@ -1,7 +1,22 @@
 defmodule AshBulkDurable.Core.Worker do
   @moduledoc """
-  Oban worker that drives a single `BulkAction` through phase 1
-  (resolving its rows' references) and phase 2 (the chunk loop).
+  Drives a single `BulkAction` through phase 1 (resolving its rows'
+  references) and phase 2 (the chunk loop).
+
+  ## The run and its Oban wrapper
+
+  `run/2` is the run: a plain function, given the bulk action's id, that knows
+  nothing about Oban jobs. `perform/1` is the Oban wrapper around it. It skips
+  a superseded job (see "Idempotency on terminal bulk actions"), keeps the job's
+  `Heartbeat` beating while the run goes, and turns what `run/2` returns into
+  the job's result: `:busy` ends the job `:ok`, and a run stopped by a row
+  another run moved on cancels or snoozes the job (see "Overlapping runs").
+
+  `run_now/1` and `drain/0` run bulk actions in the calling process, for a
+  host's tests and scripts: `run_now/1` runs one, and `drain/0` every bulk
+  action that is `:queued` or `:running`, oldest first. Phase 1's tasks
+  inherit the caller's `$callers`, so a test's sandboxed connection reaches
+  them.
 
   ## Crash-resume
 
@@ -90,8 +105,8 @@ defmodule AshBulkDurable.Core.Worker do
 
   ## Idempotency on terminal bulk actions
 
-  `perform/1` short-circuits to `:ok` when the bulk action is already in a
-  terminal state. This closes the window where an attempt's BEAM
+  `run/2`, and so `perform/1`, short-circuits to `:ok` when the bulk action is
+  already in a terminal state. This closes the window where an attempt's BEAM
   process dies *after* `mark_finished` committed but *before* Oban
   acked the job: Oban will retry, but the next attempt sees a
   terminal bulk action and no-ops. A bulk action that turns terminal after
@@ -155,17 +170,21 @@ defmodule AshBulkDurable.Core.Worker do
     if terminal?(bulk_action.status) or superseded?(job, bulk_action) do
       :ok
     else
-      try do
-        attempt(bulk_action, job, attempt)
-      rescue
-        error in RowMovedOnError -> row_moved_on(job, error)
-      end
+      job
+      |> Heartbeat.beating(fn -> run(bulk_action_id, attempt: attempt) end)
+      |> job_result(job, bulk_action_id)
     end
   end
 
+  defp job_result(:ok, _job, _bulk_action_id), do: :ok
+  defp job_result(:busy, _job, _bulk_action_id), do: :ok
+
+  defp job_result({:stopped, :row_moved_on}, job, bulk_action_id),
+    do: row_moved_on(job, bulk_action_id)
+
   # The run's transaction has rolled back and the heartbeat stopped; it
   # writes no verdict of its own.
-  defp row_moved_on(job, %RowMovedOnError{bulk_action_id: bulk_action_id}) do
+  defp row_moved_on(job, bulk_action_id) do
     bulk_action = fetch_bulk_action!(bulk_action_id)
 
     if terminal?(bulk_action.status) or bulk_action.oban_job_id != job.id do
@@ -185,20 +204,94 @@ defmodule AshBulkDurable.Core.Worker do
     end
   end
 
-  defp attempt(bulk_action, job, attempt) do
+  @doc """
+  Runs the bulk action `bulk_action_id` once, in the calling process: phase 1,
+  then phase 2, up to its verdict. Knows nothing about Oban jobs.
+
+  Returns `:ok` when the run reached a verdict, or found nothing left to do
+  (the bulk action is terminal); `:busy` when the run's start couldn't take
+  the bulk action's lock, another transaction holding it or the bulk action
+  no longer queued or running, and nothing was written; and
+  `{:stopped, :row_moved_on}` when another run had moved one of its rows on,
+  which stopped this one without a verdict. Raises what the run's own reads
+  and writes raise.
+
+  `opts`:
+
+    * `:attempt` - reported as `attempt` in the
+      `[:ash_bulk_durable, :worker_attempt, :start]` event's metadata. Nil
+      by default; `perform/1` passes the Oban job's attempt.
+  """
+  @spec run(Ash.UUID.t(), keyword()) :: :ok | :busy | {:stopped, :row_moved_on}
+  def run(bulk_action_id, opts \\ []) do
+    bulk_action = fetch_bulk_action!(bulk_action_id)
+
+    if terminal?(bulk_action.status) do
+      :ok
+    else
+      try do
+        attempt(bulk_action, Keyword.get(opts, :attempt))
+      rescue
+        RowMovedOnError -> {:stopped, :row_moved_on}
+      end
+    end
+  end
+
+  @doc """
+  Runs the bulk action `bulk_action_id` now, in the calling process, and
+  returns what `run/2` returns. Phase 1's tasks inherit the caller's
+  `$callers`, so a test's sandboxed connection reaches them.
+
+  For hosts' tests and scripts: a test runs the bulk action it just submitted
+  without a queue.
+  """
+  @spec run_now(Ash.UUID.t()) :: :ok | :busy | {:stopped, :row_moved_on}
+  def run_now(bulk_action_id), do: run(bulk_action_id)
+
+  @doc """
+  Runs, oldest first and in the calling process, every bulk action that is
+  `:queued` or `:running`, including any queued while it drains. Each runs at
+  most once per call, so one left `:running` (busy, or stopped by a row
+  another run moved on) can't loop forever. Returns how many it ran.
+
+  For hosts' tests and scripts, as `run_now/1`.
+  """
+  @spec drain() :: non_neg_integer()
+  def drain, do: drain(MapSet.new())
+
+  defp drain(ran) do
+    case next_runnable(ran) do
+      nil ->
+        MapSet.size(ran)
+
+      bulk_action ->
+        run_now(bulk_action.id)
+        drain(MapSet.put(ran, bulk_action.id))
+    end
+  end
+
+  defp next_runnable(ran) do
+    ran = MapSet.to_list(ran)
+
+    bulk_action_resource()
+    |> Ash.Query.filter(status in [:queued, :running] and id not in ^ran)
+    |> Ash.Query.sort(inserted_at: :asc, id: :asc)
+    |> Ash.Query.limit(1)
+    |> Ash.read_one!(authorize?: false)
+  end
+
+  defp attempt(bulk_action, attempt) do
     if StoredTerm.unreadable?(bulk_action) do
       finish_locked(bulk_action, {:failed, %{reason: :unreadable}})
       :ok
     else
       emit_worker_attempt_start(bulk_action, attempt)
-      bulk_action |> start_run() |> run_started(job, reconstruct_scope(bulk_action))
+      bulk_action |> start_run() |> run_started(reconstruct_scope(bulk_action))
     end
   end
 
-  defp run_started({:ok, running}, job, scope),
-    do: Heartbeat.beating(job, fn -> drive_with_telemetry(running, scope) end)
-
-  defp run_started(:busy, _job, _scope), do: :ok
+  defp run_started({:ok, running}, scope), do: drive_with_telemetry(running, scope)
+  defp run_started(:busy, _scope), do: :busy
 
   # A run starts in a short locked transaction of its own, before phase 1:
   # it takes the bulk action from `:queued` to `:running` and sets

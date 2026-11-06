@@ -10,6 +10,7 @@ defmodule ExampleWeb.Scenarios.BulkReferencesScenarioTest do
 
   require Ash.Query
 
+  alias AshBulkDurable.Core.Worker
   alias Example.BulkActions.{BulkAction, Row}
 
   @moduletag :scenario
@@ -126,7 +127,7 @@ defmodule ExampleWeb.Scenarios.BulkReferencesScenarioTest do
   end
 
   defp drain(session) do
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
     session
   end
 

@@ -64,7 +64,7 @@ defmodule AshBulkDurable.RetryTest do
   defp lookup(code), do: {:lookup, Region, :code, code}
 
   defp run!(bulk_action) do
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
     {reload(bulk_action), rows(bulk_action)}
   end
 
@@ -80,9 +80,12 @@ defmodule AshBulkDurable.RetryTest do
   defp region_id(branch, user), do: Ash.reload!(branch, actor: user).region_id
 
   # An old attempt Oban still has, as one that raised after the bulk action
-  # finished leaves it.
-  defp old_job(%{oban_job_id: job_id}),
-    do: %{AshBulkDurable.Test.Repo.get!(Oban.Job, job_id) | attempt: 2}
+  # finished leaves it. The bulk action ran in the test, so Oban never
+  # attempted the job: this one says it did.
+  defp old_job(%{oban_job_id: job_id}) do
+    job = AshBulkDurable.Test.Repo.get!(Oban.Job, job_id)
+    %{job | attempt: 2, attempted_at: DateTime.utc_now()}
+  end
 
   defp jobs(bulk_action),
     do: length(all_enqueued(worker: Worker, args: %{bulk_action_id: bulk_action.id}))
@@ -154,7 +157,7 @@ defmodule AshBulkDurable.RetryTest do
 
     assert reload(retried).status == :running
 
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
     assert reload(retried).status == :completed_with_errors
   end
 

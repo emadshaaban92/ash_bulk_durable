@@ -9,13 +9,14 @@ defmodule AshBulkDurable.PrimaryKeyTest do
 
   require Ash.Query
 
+  alias AshBulkDurable.Core.Worker
   alias AshBulkDurable.Test.{BulkAction, Row}
   alias AshBulkDurable.Test.{Plate, Seat}
 
   setup %{super_user: user}, do: %{scope: AshBulkDurable.Test.Scope.new(actor: user)}
 
   defp run!(bulk_action) do
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
 
     rows =
       Row

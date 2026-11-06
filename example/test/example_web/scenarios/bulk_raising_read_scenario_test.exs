@@ -12,10 +12,10 @@ defmodule ExampleWeb.Scenarios.BulkRaisingReadScenarioTest do
   `async: false`: the outage is application-wide.
   """
   use ExampleWeb.ConnCase, async: false
-  use Oban.Testing, repo: Example.Repo
 
   import Phoenix.LiveViewTest
 
+  alias AshBulkDurable.Core.Worker
   alias Example.BulkActions.BulkAction
   alias Example.Test.{Booking, RoleTestHelpers}
 
@@ -41,7 +41,7 @@ defmodule ExampleWeb.Scenarios.BulkRaisingReadScenarioTest do
     break_upstream(down)
 
     {view, bulk_action} = submit(conn, super_user, [healthy, broken, also_healthy])
-    assert %{success: 1, failure: 0} = drain()
+    assert 1 = drain()
 
     fresh = reload(bulk_action)
     assert fresh.status == :completed_with_errors
@@ -56,7 +56,7 @@ defmodule ExampleWeb.Scenarios.BulkRaisingReadScenarioTest do
     repair_upstream()
     upload_sheet_unchanged(view, bulk_action)
     view |> element("#bulk-action-panel button", "Retry failed rows") |> render_click()
-    assert %{success: 1, failure: 0} = drain()
+    assert 1 = drain()
 
     assert reload(bulk_action).status == :completed
     assert reload(bulk_action).rows_done == 3
@@ -75,7 +75,7 @@ defmodule ExampleWeb.Scenarios.BulkRaisingReadScenarioTest do
     break_upstream(down)
 
     {view, bulk_action} = submit(conn, officer, [broken])
-    assert %{success: 1, failure: 0} = drain()
+    assert 1 = drain()
 
     assert reload(bulk_action).status == :completed_with_errors
     assert render(view) =~ @unexpected
@@ -93,7 +93,7 @@ defmodule ExampleWeb.Scenarios.BulkRaisingReadScenarioTest do
     {view, bulk_action} =
       submit(conn, super_user, [healthy, broken], %{"all_or_nothing" => "on"})
 
-    assert %{success: 1, failure: 0} = drain()
+    assert 1 = drain()
 
     assert reload(bulk_action).status == :failed
 
@@ -162,5 +162,5 @@ defmodule ExampleWeb.Scenarios.BulkRaisingReadScenarioTest do
   end
 
   defp reload(%BulkAction{id: id}), do: Ash.get!(BulkAction, id, authorize?: false)
-  defp drain, do: Oban.drain_queue(queue: :bulk_actions)
+  defp drain, do: Worker.drain()
 end

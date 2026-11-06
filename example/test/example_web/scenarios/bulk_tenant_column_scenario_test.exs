@@ -12,6 +12,7 @@ defmodule ExampleWeb.Scenarios.BulkTenantColumnScenarioTest do
 
   import Phoenix.LiveViewTest
 
+  alias AshBulkDurable.Core.Worker
   alias AshBulkDurable.Sheet
   alias Example.Test.{Widget, Workspace}
   alias Example.BulkActions.BulkAction
@@ -56,7 +57,7 @@ defmodule ExampleWeb.Scenarios.BulkTenantColumnScenarioTest do
         ]
       )
 
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
 
     {:ok, view, _html} = conn |> login_as(user) |> live(~p"/bulk")
     html = render(view)
@@ -81,7 +82,7 @@ defmodule ExampleWeb.Scenarios.BulkTenantColumnScenarioTest do
     |> render_upload("corrections.csv")
 
     view |> element("#bulk-action-panel button", "Retry failed rows") |> render_click()
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
 
     assert render(view) =~ "2 of 2 rows done"
     assert names(north) == ["kept"]

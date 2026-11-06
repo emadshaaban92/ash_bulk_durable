@@ -10,6 +10,7 @@ defmodule ExampleWeb.Scenarios.BulkLookupBoundsScenarioTest do
   """
   use ExampleWeb.FeatureCase, async: false
 
+  alias AshBulkDurable.Core.Worker
   alias Example.Test.{Volume, Shelf, Vault}
   alias Example.Test.RoleTestHelpers
 
@@ -220,7 +221,7 @@ defmodule ExampleWeb.Scenarios.BulkLookupBoundsScenarioTest do
   end
 
   defp drain(session) do
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
     session
   end
 

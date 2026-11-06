@@ -7,6 +7,7 @@ defmodule ExampleWeb.BulkScenarioTest do
 
   import Phoenix.LiveViewTest
 
+  alias AshBulkDurable.Core.Worker
   alias Example.Accounts.User
   alias Example.BulkActions.{BulkAction, LocalStorage}
   alias Example.Library.{Author, Book}
@@ -70,7 +71,7 @@ defmodule ExampleWeb.BulkScenarioTest do
   end
 
   defp finish(view, user) do
-    assert %{failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    Worker.drain()
     _ = :sys.get_state(view.pid)
     render(view)
     latest(user)

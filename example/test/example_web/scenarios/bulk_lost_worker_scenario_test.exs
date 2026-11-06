@@ -132,7 +132,7 @@ defmodule ExampleWeb.Scenarios.BulkLostWorkerScenarioTest do
     {_view, next} =
       submit(conn, super_user, "region", "code,name,native_name\n#{code},N #{code},ا #{code}\n")
 
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
     assert %{status: :completed} = reload(next)
     assert region_count(code, super_user) == 1
   end
@@ -251,7 +251,7 @@ defmodule ExampleWeb.Scenarios.BulkLostWorkerScenarioTest do
     |> render_upload("corrections.csv")
 
     view |> element("#bulk-action-panel button", "Retry failed rows") |> render_click()
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
   end
 
   defp submit(conn, user, resource, csv, form_params \\ %{}) do

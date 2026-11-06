@@ -10,6 +10,7 @@ defmodule ExampleWeb.Bulk.BulkUploadBelongsToTest do
 
   require Ash.Query
 
+  alias AshBulkDurable.Core.Worker
   alias Example.Library.Book
 
   test "rows whose required belongs_to is left unmapped fail in the worker",
@@ -37,7 +38,7 @@ defmodule ExampleWeb.Bulk.BulkUploadBelongsToTest do
       |> click_button("Submit")
       |> assert_has("#bulk-action-panel", timeout: 2000)
 
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
 
     session
     |> assert_has("h2, h3, p, div", text: "Completed with errors")

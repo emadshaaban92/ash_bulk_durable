@@ -13,6 +13,7 @@ defmodule ExampleWeb.Scenarios.BulkActingOrganizationScenarioTest do
 
   require Ash.Query
 
+  alias AshBulkDurable.Core.Worker
   alias Example.BulkActions.BulkAction
   alias Example.Accounts.{Membership, User}
   alias Example.Test.RoleTestHelpers
@@ -93,7 +94,7 @@ defmodule ExampleWeb.Scenarios.BulkActingOrganizationScenarioTest do
       |> submit_names(owner, context)
       |> switch_organization(owner, other.id)
 
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
 
     session
     |> visit(~p"/bulk")
@@ -123,7 +124,7 @@ defmodule ExampleWeb.Scenarios.BulkActingOrganizationScenarioTest do
     |> Ash.read_one!(authorize?: false)
     |> Ash.destroy!(actor: super_user, authorize?: false)
 
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
 
     session
     |> visit(~p"/bulk")
@@ -142,7 +143,7 @@ defmodule ExampleWeb.Scenarios.BulkActingOrganizationScenarioTest do
     |> submit_names(super_user, context)
     |> switch_organization(super_user, organization.id)
 
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
 
     assert Ash.reload!(context.here, actor: super_user, authorize?: false).name == "Renamed here"
 
@@ -153,7 +154,7 @@ defmodule ExampleWeb.Scenarios.BulkActingOrganizationScenarioTest do
   defp update_names(conn, actor, context) do
     session = submit_names(conn, actor, context)
 
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
 
     assert_has(session, "*", text: "1 of 2 rows done")
   end
@@ -213,7 +214,7 @@ defmodule ExampleWeb.Scenarios.BulkActingOrganizationScenarioTest do
       end)
       |> click_button("Retry failed rows")
 
-    assert %{success: 1, failure: 0} = Oban.drain_queue(queue: :bulk_actions)
+    assert 1 = Worker.drain()
 
     session
   end
