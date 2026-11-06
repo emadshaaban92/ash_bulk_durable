@@ -195,6 +195,14 @@ defmodule AshBulkDurable.Core.Worker do
   or `:row_by_row` when halving is off, the chunk was at or below
   `:halving_min_rows`, or a half fell back to row by row.
 
+  ## Progress a page can see
+
+  Phase 1 commits rows but never the bulk action, and an all-or-nothing
+  write commits nothing until it ends, so neither shows on the bulk action's
+  own updates. Both send throttled `"progress"` broadcasts and telemetry
+  instead, as rows resolve and as the one transaction's slices run: see
+  `AshBulkDurable.Core.Progress`.
+
   ## Tenants
 
   A row acts in its target's tenant, or the bulk action's. Phase 1 resolves
@@ -270,6 +278,7 @@ defmodule AshBulkDurable.Core.Worker do
     BulkActionLock,
     CrashedRowError,
     Liveness,
+    Progress,
     Reference,
     Runner,
     StagedFileError,
@@ -528,7 +537,12 @@ defmodule AshBulkDurable.Core.Worker do
       [:ash_bulk_durable, :bulk_action],
       bulk_action_start_metadata(bulk_action),
       fn ->
-        drive(bulk_action, scope)
+        try do
+          drive(bulk_action, scope)
+        after
+          Progress.forget(bulk_action.id)
+        end
+
         {measurements, metadata} = bulk_action_stop(bulk_action)
         {:ok, measurements, metadata}
       end
@@ -903,8 +917,11 @@ defmodule AshBulkDurable.Core.Worker do
       concurrency: concurrency
     }
 
+    if to_resolve > 0, do: Progress.resolving_started(bulk_action, to_resolve)
+
     :telemetry.span([:ash_bulk_durable, :phase1], start_metadata, fn ->
       {status, failed} = resolve_chunks(bulk_action, settings, concurrency)
+      Progress.resolving_finished(bulk_action.id)
       measurements = %{rows_resolved: to_resolve - failed, rows_failed: failed}
       {status, measurements, %{bulk_action_id: bulk_action.id}}
     end)
@@ -945,6 +962,7 @@ defmodule AshBulkDurable.Core.Worker do
         end
 
       :crashed ->
+        Progress.row_resolved(bulk_action.id)
         do_resolve_chunks(bulk_action, settings, concurrency, atomic?, failed_acc + 1)
 
       :none ->
@@ -1066,18 +1084,24 @@ defmodule AshBulkDurable.Core.Worker do
     end)
   end
 
-  defp reduce_resolution({:ok, _resolved}, _row, status, failed, _settings, _atomic?),
-    do: {:cont, {status, failed}}
+  # Each row it is handed has been committed, resolved or failed, by the time
+  # it is counted for a page (`Progress`).
+  defp reduce_resolution({:ok, _resolved}, row, status, failed, _settings, _atomic?) do
+    Progress.row_resolved(row.bulk_action_id)
+    {:cont, {status, failed}}
+  end
 
   defp reduce_resolution({:error, err}, row, _status, failed, settings, true) do
     raise_if_moved_on!(err, row.bulk_action_id)
     mark_row_failed(row, err, settings.pass)
+    Progress.row_resolved(row.bulk_action_id)
     {:halt, {:atomic_phase1_failed, {row.row_index, err}, failed + 1}}
   end
 
   defp reduce_resolution({:error, err}, row, status, failed, settings, false) do
     raise_if_moved_on!(err, row.bulk_action_id)
     mark_row_failed(row, err, settings.pass)
+    Progress.row_resolved(row.bulk_action_id)
     {:cont, {status, failed + 1}}
   end
 

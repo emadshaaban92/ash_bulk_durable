@@ -151,13 +151,48 @@ repo's pool for `:max_running` times `:phase1_concurrency + 2`.
 | `:phase1_concurrency` | `4` | rows resolved at once |
 | `:field_handlers` | `[]` | handlers tried before the built-in ones |
 | `:disable_defaults` | `[]` | built-in handlers to drop |
-| `:pubsub_module` | none | broadcasts each update on `"bulk_action:<id>"` |
+| `:pubsub_module` | none | broadcasts each update, and progress hints, on `"bulk_action:<id>"` |
+| `:progress_interval` | 1000 ms | the least time between two progress hints of one kind from a run; `0` sends every one |
+
+## Progress hints
+
+A page following a bulk action sees its committed updates on
+`"bulk_action:<id>"`, as `Ash.Notifier.PubSub` notifications. Two stretches of
+a run update nothing there: phase 1, which commits rows as their references
+resolve but not the bulk action, and an all-or-nothing write, one transaction
+that commits only at its end. For those the worker also broadcasts event
+`"progress"` on the same topic, through `:pubsub_module` (as
+`pubsub_module.broadcast(topic, "progress", payload)`):
+
+```elixir
+# phase 1, both modes; each row counted is committed, resolved or failed
+%{bulk_action_id: id, pass: pass, phase: :resolving, committed: true,
+  rows_resolved: n, rows_to_resolve: m}
+
+# an all-or-nothing write; nothing is saved until the transaction commits
+%{bulk_action_id: id, pass: pass, phase: :writing, committed: false,
+  rows_processed: n, total_rows: m}
+```
+
+Each kind is sent at most once per `:progress_interval`, the first always,
+and phase 1's last always. Ignore a hint whose `pass` differs from the bulk
+action's (an older run's), and drop it once the bulk action's `status`,
+`pass` or `rows_done` changes; not on every update, since a run's liveness
+stamps update the bulk action too. Hints are best effort. A broadcast may be
+sent inside a locked transaction, so `:pubsub_module`'s `broadcast/3` must not
+block: the default local pubsub adapter doesn't, but one that publishes over
+the network (Redis, say) would hold the lock while it does.
+`AshBulkDurable.Core.Progress` has the details, and the example's `/bulk` page
+shows them.
 
 ## Telemetry
 
 `[:ash_bulk_durable, :bulk_action | :staged_files_download | :phase1 | :chunk]`
 spans, and `[:ash_bulk_durable, :worker_attempt, :start]`,
-`[:ash_bulk_durable, :isolation, :start]` and `[:ash_bulk_durable, :row, :crashed]`.
+`[:ash_bulk_durable, :isolation, :start]`, `[:ash_bulk_durable, :row, :crashed]`,
+and the progress hints above as `[:ash_bulk_durable, :phase1, :progress]` and
+`[:ash_bulk_durable, :all_or_nothing, :progress]` (the counts as measurements,
+`bulk_action_id` and `pass` as metadata).
 
 ## Contributing
 

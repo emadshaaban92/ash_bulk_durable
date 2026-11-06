@@ -53,6 +53,44 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanelTest do
     end
   end
 
+  describe "a progress hint" do
+    defp render_with_progress(bulk_action, progress) do
+      render_component(&ProgressPanel.progress_panel/1,
+        bulk_action: bulk_action,
+        progress: progress,
+        uploads: %{}
+      )
+    end
+
+    test "phase 1's shows the references resolved, in either mode" do
+      progress = %{phase: :resolving, committed: true, rows_resolved: 4, rows_to_resolve: 9}
+
+      for mode <- [:per_row, :all_or_nothing] do
+        html = render_with_progress(bulk_action(%{mode: mode}), progress)
+        assert html =~ "Resolving references: 4 of 9"
+      end
+    end
+
+    test "an all-or-nothing write's says nothing is saved yet" do
+      progress = %{phase: :writing, committed: false, rows_processed: 300, total_rows: 1000}
+      html = render_with_progress(bulk_action(%{mode: :all_or_nothing}), progress)
+
+      assert html =~ "300 of 1000 processed, not saved until the run finishes"
+      assert html =~ "Running as a single all-or-nothing transaction"
+    end
+
+    test "shows nothing once the bulk action isn't running" do
+      progress = %{phase: :writing, committed: false, rows_processed: 3, total_rows: 10}
+      html = render_with_progress(bulk_action(%{status: :completed, rows_done: 10}), progress)
+
+      refute html =~ "bulk-action-progress-hint"
+    end
+
+    test "no hint, no line" do
+      refute render_with_progress(bulk_action(%{}), nil) =~ "bulk-action-progress-hint"
+    end
+  end
+
   describe ":running" do
     test "a per-row bulk action shows a progress bar and the rows_done / total_rows counter" do
       html = render_panel(bulk_action(%{status: :running, rows_done: 3, total_rows: 10}))

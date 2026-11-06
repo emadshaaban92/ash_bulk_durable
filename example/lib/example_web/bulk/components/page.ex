@@ -29,6 +29,7 @@ defmodule ExampleWeb.Bulk.Components.Page do
   attr :errors, :list, default: []
   attr :companion_upload_names, :any, required: true
   attr :bulk_action, :any, default: nil
+  attr :bulk_action_progress, :map, default: nil
   attr :bulk_action_status, :atom, default: :ready
   attr :errors_sheet, :any, default: nil
   attr :failed_preview, :list, default: []
@@ -49,6 +50,7 @@ defmodule ExampleWeb.Bulk.Components.Page do
       <% @bulk_action -> %>
         <ProgressPanel.progress_panel
           bulk_action={@bulk_action}
+          progress={@bulk_action_progress}
           uploads={@uploads}
           errors_sheet={@errors_sheet}
           failed_preview={@failed_preview}

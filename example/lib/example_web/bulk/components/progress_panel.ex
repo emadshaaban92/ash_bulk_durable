@@ -16,6 +16,13 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
       progress bar: all-or-nothing keeps `rows_done` at `0`
       until the single commit, so a bar could only show 0% or snap to
       100% — worse than nothing.
+    * `:running`, either mode, with a `progress` hint (the worker's
+      `"progress"` broadcast, `AshBulkDurable.Core.Progress`) — a line
+      under the above: "Resolving references: n of m" in phase 1, or "n of
+      m processed, not saved until the run finishes" for an all-or-nothing
+      write. The host LV keeps only a hint for the bulk action's current
+      pass, and drops it when the bulk action's status, pass or `rows_done`
+      changes.
     * `:completed` / `:failed` / `:cancelled` — terminal badge + a
       "Dismiss" button (`phx-click="dismiss_bulk_action"`). A `:failed` bulk action
       additionally renders the captured root cause (first offending row +
@@ -45,6 +52,7 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
   use Gettext, backend: ExampleWeb.Gettext
 
   attr :bulk_action, :any, required: true
+  attr :progress, :map, default: nil
   attr :uploads, :any, default: %{}
   attr :errors_sheet, :any, default: nil
   attr :failed_preview, :list, default: []
@@ -107,6 +115,14 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
                 {rows_done_label(@bulk_action)}
               </p>
           <% end %>
+
+          <p
+            :if={progress_label(@bulk_action, @progress)}
+            id="bulk-action-progress-hint"
+            class="text-sm text-base-content/60"
+          >
+            {progress_label(@bulk_action, @progress)}
+          </p>
 
           <.failed_rows_preview
             :if={@bulk_action.status == :completed_with_errors and @failed_preview != []}
@@ -296,6 +312,25 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
         done: bulk_action.rows_done,
         total: bulk_action.total_rows
       )
+
+  # The worker's hint while nothing it commits shows here: phase 1's rows
+  # (committed, but the bulk action isn't updated), or an all-or-nothing
+  # write's rows (not committed at all yet).
+  defp progress_label(%{status: :running}, %{phase: :resolving} = progress),
+    do:
+      gettext("Resolving references: %{done} of %{total}",
+        done: progress.rows_resolved,
+        total: progress.rows_to_resolve
+      )
+
+  defp progress_label(%{status: :running}, %{phase: :writing} = progress),
+    do:
+      gettext("%{done} of %{total} processed, not saved until the run finishes",
+        done: progress.rows_processed,
+        total: progress.total_rows
+      )
+
+  defp progress_label(_bulk_action, _progress), do: nil
 
   # A few failed rows inline — the cells of the errors sheet that hold
   # something plus a clean error, so they can see what to fix before
