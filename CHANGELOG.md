@@ -74,3 +74,13 @@
   input. The verdict waits until no row is `:pending` or `:resolved`, and
   lost resolutions are put back under the lock. Every read made under the
   lock goes to the mutate repo, never a read replica.
+- Rows have a `pass` column too, and phase 1's row writes check it: a run's
+  `:resolve`, and its `:mark_failed` of a row that failed to resolve or lost
+  its staged files, match the row only while the row's `pass` is the run's
+  (`RequireStatus`, given the pass in the action context). A retry writes
+  its new pass onto every row it reopens, in the transaction that bumps the
+  bulk action's, so a run still in phase 1 when a retry reopens its row
+  stops instead of resolving it with the old shared input. A write given no
+  pass, such as a host's own, checks its status alone. A host that defines
+  its own `:reopen_with_corrections` or `:enqueue_retry` must accept the new
+  `pass` argument and set `pass` from it, or every retry fails.

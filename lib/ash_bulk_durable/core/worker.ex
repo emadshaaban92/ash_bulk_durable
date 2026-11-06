@@ -57,8 +57,11 @@ defmodule AshBulkDurable.Core.Worker do
   so every target must live in the bulk action's repo.
 
   Phase 1 runs outside the lock: it reaches for files and lookups, which can
-  take minutes a row. Its single-row flips are compare-and-sets instead (see
-  below).
+  take minutes a row. Its single-row writes (a row's `:resolve`, and the
+  `:mark_failed` of a row that failed to resolve or lost its staged files)
+  are compare-and-sets instead: each matches its row only while the row is
+  in the status it may leave, and on the run's pass (see "Overlapping runs"
+  and "Passes" below).
 
   ## Failure surface
 
@@ -199,6 +202,16 @@ defmodule AshBulkDurable.Core.Worker do
   lock refused, as if another run held it, and stops: it never applies the
   new pass's rows with the old pass's settings, or writes the old pass's
   verdict.
+
+  Phase 1's single-row writes take no lock, so they check the pass
+  themselves: each gives the run's pass in its action context, and
+  `AshBulkDurable.Core.Changes.RequireStatus` then matches the row only
+  while the row's own `pass` is that one. A retry writes its pass onto every
+  row it reopens, in the transaction that bumps the bulk action's. A run
+  still in phase 1 when a retry reopens its row to `:pending` has its write
+  of that row refused, as one another run moved on, and stops, even when the
+  write waited on the row while the retry held it: it never resolves the new
+  pass's row with the old pass's shared input.
 
   Every read made under the lock runs on the lock's connection
   (`AshBulkDurable.Core.BulkActionLock.pin/1`), never on a `:read` repo.
@@ -521,7 +534,7 @@ defmodule AshBulkDurable.Core.Worker do
     bulk_action
     |> pending_rows()
     |> Enum.filter(&Runner.resolver_pending?(settings, &1))
-    |> Enum.each(&mark_row_failed(&1, %StagedFileError{}))
+    |> Enum.each(&mark_row_failed(&1, %StagedFileError{}, settings.pass))
 
     run_rows(bulk_action, settings)
   end
@@ -932,7 +945,7 @@ defmodule AshBulkDurable.Core.Worker do
 
         refused
         |> Enum.reduce_while({:ok, 0}, fn {row, result}, {status, failed} ->
-          reduce_resolution(result, row, status, failed, atomic?)
+          reduce_resolution(result, row, status, failed, settings, atomic?)
         end)
         |> resolve_tenant_groups(tenanted, settings, concurrency, atomic?)
 
@@ -996,26 +1009,26 @@ defmodule AshBulkDurable.Core.Worker do
     )
     |> Enum.reduce_while({:ok, 0}, fn
       {:ok, {row, result}}, {status, failed} ->
-        reduce_resolution(result, row, status, failed, atomic?)
+        reduce_resolution(result, row, status, failed, settings, atomic?)
 
       {:exit, {row, :timeout}}, {status, failed} ->
         error = Runner.row_timed_out(timeout, row)
-        reduce_resolution({:error, error}, row, status, failed, atomic?)
+        reduce_resolution({:error, error}, row, status, failed, settings, atomic?)
     end)
   end
 
-  defp reduce_resolution({:ok, _resolved}, _row, status, failed, _atomic?),
+  defp reduce_resolution({:ok, _resolved}, _row, status, failed, _settings, _atomic?),
     do: {:cont, {status, failed}}
 
-  defp reduce_resolution({:error, err}, row, _status, failed, true) do
+  defp reduce_resolution({:error, err}, row, _status, failed, settings, true) do
     raise_if_moved_on!(err, row.bulk_action_id)
-    mark_row_failed(row, err)
+    mark_row_failed(row, err, settings.pass)
     {:halt, {:atomic_phase1_failed, {row.row_index, err}, failed + 1}}
   end
 
-  defp reduce_resolution({:error, err}, row, status, failed, false) do
+  defp reduce_resolution({:error, err}, row, status, failed, settings, false) do
     raise_if_moved_on!(err, row.bulk_action_id)
-    mark_row_failed(row, err)
+    mark_row_failed(row, err, settings.pass)
     {:cont, {status, failed + 1}}
   end
 
@@ -1027,7 +1040,9 @@ defmodule AshBulkDurable.Core.Worker do
     Ash.update(row, %{},
       action: :resolve,
       authorize?: false,
-      context: %{ash_bulk_durable: %{settings: settings, resolvers: resolvers}}
+      context: %{
+        ash_bulk_durable: %{settings: settings, resolvers: resolvers, pass: settings.pass}
+      }
     )
   rescue
     exception -> Runner.row_raised(exception, __STACKTRACE__, row)
@@ -1473,9 +1488,16 @@ defmodule AshBulkDurable.Core.Worker do
   # here, *outside* the row's own (rolled-back) `:run` transaction. The success
   # path — target write + `:succeeded` flip + `rows_done` bump — lives in the
   # `:run` action's after_batch (`AshBulkDurable.Core.Changes.RunRow`).
-  defp mark_row_failed(row, err) do
+  #
+  # Phase 1 marks a row outside the lock, so it gives the run's `pass`: the
+  # flip then matches only while the row is still on it (`RequireStatus`),
+  # and one a retry has reopened onto the next stops the run. Under the
+  # lock the pass is already checked, and none is given.
+  defp mark_row_failed(row, err, pass \\ nil) do
+    context = if pass, do: %{ash_bulk_durable: %{pass: pass}}, else: %{}
+
     row
-    |> Ash.update(%{error: err}, action: :mark_failed, authorize?: false)
+    |> Ash.update(%{error: err}, action: :mark_failed, authorize?: false, context: context)
     |> row_flipped!(row.bulk_action_id)
   end
 

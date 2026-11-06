@@ -423,6 +423,13 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
           allow_nil?: true
         )
 
+      pass_argument =
+        Transformer.build_entity!(Dsl, [:actions, :update], :argument,
+          name: :pass,
+          type: :integer,
+          allow_nil?: true
+        )
+
       reopen =
         Transformer.build_entity!(Dsl, [:actions, :update], :change,
           change: AshBulkDurable.Core.Changes.ReopenBulkAction
@@ -438,7 +445,7 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
           name: :enqueue_retry,
           accept: [],
           require_atomic?: false,
-          arguments: [input_argument],
+          arguments: [input_argument, pass_argument],
           changes: [reopen, set_status]
         )
 
