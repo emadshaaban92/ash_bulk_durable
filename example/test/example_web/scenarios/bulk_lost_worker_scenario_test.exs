@@ -117,8 +117,10 @@ defmodule ExampleWeb.Scenarios.BulkLostWorkerScenarioTest do
         }
       )
 
+    # Before its one transaction: one killed inside it would take the test's
+    # own shared connection down with it.
     job = job_running(bulk_action)
-    die(job, [:ash_bulk_durable, :chunk, :start])
+    die(job, [:ash_bulk_durable, :phase1, :start])
     silent_for_ages(job)
 
     assert :ok = perform_job(RescueStuckBulkActions, %{})
@@ -144,7 +146,9 @@ defmodule ExampleWeb.Scenarios.BulkLostWorkerScenarioTest do
       submit(conn, super_user, "region", "code,name,native_name\n#{code},N #{code},ا #{code}\n")
 
     job = job_running(bulk_action)
-    attach([:ash_bulk_durable, :chunk, :start], %{id: bulk_action.id}, {Process, :sleep, [900]})
+    # Slow outside a transaction, which would hold the test's own shared
+    # connection.
+    attach([:ash_bulk_durable, :phase1, :start], %{id: bulk_action.id}, {Process, :sleep, [900]})
     {worker, monitor} = spawn_monitor(fn -> Worker.perform(job) end)
 
     Process.sleep(600)
