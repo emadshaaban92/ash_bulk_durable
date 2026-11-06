@@ -93,3 +93,12 @@
   bad rows cost little more than before. The rows that succeed, those that
   fail and their errors are the same. The chunk `:stop` event's `recovery`
   is now `:halving` or `:row_by_row`, and it measures `transactions`.
+- Progress hints for the stretches a run commits nothing to its bulk action
+  (`Core.Progress`): phase 1 broadcasts `"progress"` with `phase: :resolving`
+  as rows resolve or fail, and an all-or-nothing write broadcasts it with
+  `phase: :writing, committed: false` as each slice of its one transaction
+  runs. They go out on `"bulk_action:<id>"` through `:pubsub_module`, carry
+  the run's `pass`, are throttled to one per `:progress_interval` (a second
+  by default; phase 1's last is always sent), never block or fail a run, and
+  also run as `[:ash_bulk_durable, :phase1 | :all_or_nothing, :progress]`
+  telemetry. The example's panel shows them.

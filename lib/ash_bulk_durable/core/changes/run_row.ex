@@ -14,12 +14,16 @@ defmodule AshBulkDurable.Core.Changes.RunRow do
   that — it runs a chunk as one batch and, on failure, re-runs the rows one at a
   time (each its own batch) so good rows commit and only the bad ones fail.
 
+  In all-or-nothing mode each slice also reports how many rows the open
+  transaction has written (`AshBulkDurable.Core.Progress`), since nothing is
+  announced until it commits.
+
   The bulk action's `Runner.Settings` ride in on the action context under
   `:ash_bulk_durable`, so the worker builds them once per bulk action.
   """
   use Ash.Resource.Change
 
-  alias AshBulkDurable.Core.Runner
+  alias AshBulkDurable.Core.{Progress, Runner}
 
   @impl true
   def batch_change(changesets, _opts, _context), do: changesets
@@ -43,7 +47,7 @@ defmodule AshBulkDurable.Core.Changes.RunRow do
         end
       end)
 
-    if succeeded > 0, do: bump_rows_done(bulk_action, succeeded)
+    if succeeded > 0, do: bulk_action |> bump_rows_done(succeeded) |> report_progress()
     results
   end
 
@@ -83,6 +87,15 @@ defmodule AshBulkDurable.Core.Changes.RunRow do
     |> Ash.Changeset.for_update(:bump_rows_done, %{n: n}, authorize?: false)
     |> Ash.update!(authorize?: false)
   end
+
+  # An all-or-nothing run is one transaction, so the bump above is announced
+  # only when it commits. Until then a page is told how far the slices have
+  # got, as a hint (`Progress`). The bump is atomic, so the bulk action it
+  # returns counts every row this transaction has written so far.
+  defp report_progress(%{mode: :all_or_nothing} = bumped),
+    do: Progress.writing(bumped, bumped.rows_done)
+
+  defp report_progress(_bumped), do: :ok
 
   # The worker passes the settings and bulk action via the action's `context:`. Ash
   # exposes it on the callback context and on each changeset's context; read

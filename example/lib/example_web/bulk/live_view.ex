@@ -32,7 +32,10 @@ defmodule ExampleWeb.Bulk.LiveView do
   via `start_async/3`, and a node's `AshBulkDurable.Core.Poller` runs it with
   `AshBulkDurable.Core.Worker`. The LV then subscribes to the bulk action's PubSub
   topic and re-renders progress as the worker bumps `rows_done` and reaches
-  a terminal state. On mount, a logged-in user with an unresolved bulk action —
+  a terminal state. In between it shows the worker's `"progress"` hints
+  (`AshBulkDurable.Core.Progress`): references resolving in phase 1, and
+  rows processed inside an all-or-nothing run's one transaction. On mount,
+  a logged-in user with an unresolved bulk action —
   `:queued`, `:running`, or parked in `:completed_with_errors` — is
   reattached to it. A bulk action whose node died stays `:running` until a
   poller resumes it, so the page shows it running meanwhile. An errored
@@ -142,6 +145,7 @@ defmodule ExampleWeb.Bulk.LiveView do
       |> assign(
         bulk_action_status: :ready,
         bulk_action: nil,
+        bulk_action_progress: nil,
         errors_sheet: nil,
         failed_preview: []
       )
@@ -417,9 +421,26 @@ defmodule ExampleWeb.Bulk.LiveView do
     if (not is_nil(bulk_action_resource) and is_struct(data, bulk_action_resource) and current) &&
          current.id == data.id do
       {:noreply,
-       socket |> assign(:bulk_action, data) |> assign(:failed_preview, failed_preview(data))}
+       socket
+       |> assign(:bulk_action, data)
+       |> assign(:failed_preview, failed_preview(data))
+       |> assign(:bulk_action_progress, keep_progress(socket, current, data))}
     else
       {:noreply, socket}
+    end
+  end
+
+  # A progress hint (`AshBulkDurable.Core.Progress`) for the attached bulk
+  # action's current pass. One from another pass comes from a run a retry has
+  # replaced, so it's ignored.
+  def on_handle_info(%Phoenix.Socket.Broadcast{event: "progress", payload: payload}, socket) do
+    case socket.assigns[:bulk_action] do
+      %{id: id, pass: pass, status: :running}
+      when payload.bulk_action_id == id and payload.pass == pass ->
+        {:noreply, assign(socket, :bulk_action_progress, payload)}
+
+      _other ->
+        {:noreply, socket}
     end
   end
 
@@ -631,6 +652,15 @@ defmodule ExampleWeb.Bulk.LiveView do
     end
   end
 
+  # A hint holds only until the bulk action itself moves: a new status or
+  # pass, or committed rows. Every other update (the run's liveness stamps)
+  # leaves it.
+  defp keep_progress(socket, current, fresh) do
+    if Map.take(current, [:status, :pass, :rows_done]) ==
+         Map.take(fresh, [:status, :pass, :rows_done]),
+       do: socket.assigns[:bulk_action_progress]
+  end
+
   defp attach_bulk_action(socket, bulk_action) do
     subscribe_to_bulk_action(bulk_action)
     # A freshly-attached bulk action starts with the errors-sheet modal closed — any
@@ -638,6 +668,7 @@ defmodule ExampleWeb.Bulk.LiveView do
     # cleared too: a different bulk action shouldn't carry a previously-staged file.
     socket
     |> assign(:bulk_action, bulk_action)
+    |> assign(:bulk_action_progress, nil)
     |> assign(:errors_sheet, nil)
     |> assign(:failed_preview, failed_preview(bulk_action))
     |> assign(:retry_sheet, nil)

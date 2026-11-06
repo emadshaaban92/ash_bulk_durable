@@ -218,6 +218,81 @@ defmodule ExampleWeb.Bulk.DurableBulkActionTest do
     end
   end
 
+  describe "progress hints" do
+    defp hint(bulk_action, fields) do
+      Map.merge(%{bulk_action_id: bulk_action.id, pass: bulk_action.pass}, fields)
+    end
+
+    defp broadcast_hint(bulk_action, fields),
+      do:
+        ExampleWeb.Endpoint.broadcast(
+          "bulk_action:#{bulk_action.id}",
+          "progress",
+          hint(bulk_action, fields)
+        )
+
+    defp resolving(n, m),
+      do: %{phase: :resolving, committed: true, rows_resolved: n, rows_to_resolve: m}
+
+    test "shows phase 1's, ignores another pass's, and drops it once rows commit", %{
+      conn: conn,
+      super_user: user
+    } do
+      bulk_action = create_bulk_action!(user.id)
+      running = Ash.update!(bulk_action, %{}, action: :mark_running, authorize?: false)
+      {:ok, view, _html} = conn |> login_as(user) |> live(~p"/bulk")
+
+      broadcast_hint(running, resolving(2, 5))
+      assert render(view) =~ "Resolving references: 2 of 5"
+
+      # From a run a retry has replaced.
+      broadcast_hint(%{running | pass: running.pass + 1}, resolving(4, 5))
+      html = render(view)
+      assert html =~ "Resolving references: 2 of 5"
+      refute html =~ "4 of 5"
+
+      # An update that moves nothing (a liveness stamp) keeps it.
+      stamped = Ash.update!(running, %{}, action: :stamp_alive, authorize?: false)
+      assert render(view) =~ "Resolving references: 2 of 5"
+
+      Ash.update!(stamped, %{n: 1}, action: :bump_rows_done, authorize?: false)
+      html = render(view)
+      assert html =~ "1 of 5 rows done"
+      refute html =~ "Resolving references"
+    end
+
+    test "shows an all-or-nothing write's, and drops it on a status change", %{
+      conn: conn,
+      super_user: user
+    } do
+      bulk_action = create_bulk_action!(user.id, %{mode: :all_or_nothing, chunk_size: 5})
+      running = Ash.update!(bulk_action, %{}, action: :mark_running, authorize?: false)
+      {:ok, view, _html} = conn |> login_as(user) |> live(~p"/bulk")
+
+      broadcast_hint(running, %{
+        phase: :writing,
+        committed: false,
+        rows_processed: 3,
+        total_rows: 5
+      })
+
+      assert render(view) =~ "3 of 5 processed, not saved until the run finishes"
+
+      Ash.update!(running, %{result: :completed}, action: :mark_finished, authorize?: false)
+      html = render(view)
+      assert html =~ "Completed"
+      refute html =~ "not saved until the run finishes"
+    end
+
+    test "ignores a hint while the bulk action isn't running", %{conn: conn, super_user: user} do
+      bulk_action = create_bulk_action!(user.id)
+      {:ok, view, _html} = conn |> login_as(user) |> live(~p"/bulk")
+
+      broadcast_hint(bulk_action, resolving(2, 5))
+      refute render(view) =~ "Resolving references"
+    end
+  end
+
   describe "mount with a parked :completed_with_errors bulk action" do
     test "reattaches to the errored bulk action instead of showing the empty form", %{
       conn: conn,
