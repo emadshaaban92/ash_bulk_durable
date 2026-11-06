@@ -21,6 +21,11 @@ defmodule AshBulkDurable.Core.Changes.ReopenWithCorrections do
   otherwise, its `attempts` back to 0, so runs that died on it before the
   correction count no more; a correction its caller already refused (`error`) leaves it
   `:failed` and `refused` with that error.
+
+  Given a `pass`, the row takes it: the pass the bulk action moves on to in
+  the same transaction (`AshBulkDurable.Core.Retry`), so a run of an earlier
+  pass can't write the reopened row in phase 1 (see
+  `AshBulkDurable.Core.Changes.RequireStatus`).
   """
   use Ash.Resource.Change
 
@@ -66,6 +71,14 @@ defmodule AshBulkDurable.Core.Changes.ReopenWithCorrections do
       :status,
       Runner.initial_status(corrected, will_run_with)
     )
+    |> put_pass()
+  end
+
+  defp put_pass(changeset) do
+    case Ash.Changeset.get_argument(changeset, :pass) do
+      nil -> changeset
+      pass -> Ash.Changeset.force_change_attribute(changeset, :pass, pass)
+    end
   end
 
   defp shared_input(row),

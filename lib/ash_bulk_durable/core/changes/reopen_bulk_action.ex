@@ -8,7 +8,9 @@ defmodule AshBulkDurable.Core.Changes.ReopenBulkAction do
   `isolating_row_id`; see "Crashes" in `AshBulkDurable.Core.Worker`). Its
   `pass` goes up by one, so a run that started before the retry stops at its
   next lock instead of carrying on into this pass with the last one's
-  settings (see "Passes" in `AshBulkDurable.Core.Worker`).
+  settings (see "Passes" in `AshBulkDurable.Core.Worker`). Given a `pass`,
+  it takes that one: the one `AshBulkDurable.Core.Retry` wrote on the rows it
+  reopened in the same transaction.
 
   Only a bulk action parked in `:completed_with_errors` or `:failed` matches
   the update. One `:queued` or `:running`, or already `:completed` or
@@ -32,8 +34,17 @@ defmodule AshBulkDurable.Core.Changes.ReopenBulkAction do
     |> Ash.Changeset.force_change_attribute(:progress_at_start, nil)
     |> Ash.Changeset.force_change_attribute(:shutdown_stopped, false)
     |> Ash.Changeset.force_change_attribute(:isolating_row_id, nil)
-    |> Ash.Changeset.atomic_update(:pass, Ash.Expr.expr(pass + 1))
+    |> put_pass()
     |> put_input()
+  end
+
+  # `AshBulkDurable.Core.Retry` gives the pass it read under the lock plus
+  # one, the pass it wrote on the rows it reopened.
+  defp put_pass(changeset) do
+    case Ash.Changeset.get_argument(changeset, :pass) do
+      nil -> Ash.Changeset.atomic_update(changeset, :pass, Ash.Expr.expr(pass + 1))
+      pass -> Ash.Changeset.force_change_attribute(changeset, :pass, pass)
+    end
   end
 
   defp put_input(changeset) do

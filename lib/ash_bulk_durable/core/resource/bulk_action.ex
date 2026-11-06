@@ -23,6 +23,15 @@ defmodule AshBulkDurable.Core.Resource.BulkAction do
   `config :ash_bulk_durable, pubsub_module: MyAppWeb.Endpoint`), the
   extension fills in the `pub_sub` block automatically — every `:update`
   is broadcast on `"bulk_action:<id>"`.
+
+  ## Defining your own actions
+
+  The extension adds an action only where the host defines none of that
+  name. A host that defines its own `:enqueue_retry` must accept a `pass`
+  argument (an integer, which may be nil) and, when it is given, set the
+  bulk action's `pass` to it: `AshBulkDurable.Core.Retry` always passes the
+  pass it also writes onto the rows it reopens, and a retry through an
+  action without the argument fails.
   """
   use Spark.Dsl.Extension,
     transformers: [AshBulkDurable.Core.Resource.BulkAction.Transformer]

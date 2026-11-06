@@ -78,6 +78,37 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     def finish(_state), do: :ok
   end
 
+  defmodule HeldResolver do
+    @moduledoc """
+    Resolves a value to itself, and refuses one ending in "bad". In a run told
+    to hold (a test pid under `:hold` in its process), it first says so as it
+    readies, the run's rows already read, and waits for `:go`.
+    """
+    @behaviour AshBulkDurable.Core.Resolver
+
+    @impl true
+    def prepare(_args, _context) do
+      with pid when is_pid(pid) <- Process.get(:hold) do
+        send(pid, {:preparing, self()})
+        receive do: (:go -> :ok)
+      end
+
+      {:ok, nil}
+    end
+
+    @impl true
+    def resolve(value, nil, _context) do
+      if String.ends_with?(value, "bad"),
+        do:
+          {:error,
+           Ash.Error.Changes.InvalidAttribute.exception(field: :native_name, message: "bad")},
+        else: {:ok, value}
+    end
+
+    @impl true
+    def finish(nil), do: :ok
+  end
+
   alias AshBulkDurable.Core.Worker
   alias AshBulkDurable.Test.{Branch, BulkAction, Region, Repo, Row, Scope, User}
 
@@ -683,6 +714,128 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     end
   end
 
+  # Phase 1's row writes take no lock: each carries the run's pass, and
+  # matches its row only while the bulk action is still on it.
+  describe "a run in phase 1 that outlives a retry" do
+    test "has its :resolve of the reopened row refused, and stops; the retry's pass resolves it with its input",
+         ctx do
+      taken!(ctx, 1)
+      bulk_action = shared_resolving!(ctx, "old")
+
+      a = start_held_run(bulk_action)
+      assert_receive {:preparing, ^a}, 5_000
+
+      # Run B, while A waits with the row read: row 1's code is taken, so B
+      # ends `:completed_with_errors`. Its owner frees the code and retries
+      # with a new shared input, which reopens the row to `:pending`.
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :completed_with_errors, pass: 0} = reload(bulk_action)
+      free!(ctx, 1)
+      assert {:ok, %{status: :running, pass: 1}} = retry_with!(ctx, bulk_action, "new")
+      assert [%{status: :pending, pass: 1, resolved_data: reopened}] = rows(bulk_action)
+
+      send(a, :go)
+      assert_receive {:done, ^a, {:stopped, :row_moved_on}}, 5_000
+
+      # A wrote nothing of its old input, and no verdict.
+      assert [%{status: :pending, pass: 1, resolved_data: ^reopened}] = rows(bulk_action)
+      assert %{status: :running, result: nil, finished_at: nil} = reload(bulk_action)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :completed, rows_done: 1} = reload(bulk_action)
+      assert native_names(ctx) == ["#{ctx.tag} new"]
+    end
+
+    test "has its :mark_failed of the reopened row refused, and stops; the retry's pass resolves it",
+         ctx do
+      bulk_action = shared_resolving!(ctx, "old bad")
+
+      a = start_held_run(bulk_action)
+      assert_receive {:preparing, ^a}, 5_000
+
+      # Run B fails the row in phase 1, and its owner retries with an input
+      # that resolves.
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :completed_with_errors, pass: 0} = reload(bulk_action)
+      assert {:ok, %{status: :running, pass: 1}} = retry_with!(ctx, bulk_action, "new")
+      assert [%{status: :pending, error: nil}] = rows(bulk_action)
+
+      send(a, :go)
+      assert_receive {:done, ^a, {:stopped, :row_moved_on}}, 5_000
+
+      # A's failure of the old input is not on the row.
+      assert [%{status: :pending, error: nil}] = rows(bulk_action)
+      assert %{status: :running, result: nil, finished_at: nil} = reload(bulk_action)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :completed, rows_done: 1} = reload(bulk_action)
+      assert native_names(ctx) == ["#{ctx.tag} new"]
+    end
+
+    # The retry's transaction holds the row it reopened when A's `:resolve`
+    # starts, so A's UPDATE waits on it, and rechecks only the row's new
+    # version once the retry commits.
+    test "has its :resolve that waited on the row while the retry held it refused, and stops",
+         ctx do
+      bulk_action = shared_resolving!(ctx, "old")
+
+      a = start_held_run(bulk_action)
+      assert_receive {:preparing, ^a}, 5_000
+
+      # As another run failed it outright, its row left `:pending`.
+      Repo.query!(
+        "UPDATE bulk_actions SET status = 'failed', finished_at = now() WHERE id = $1",
+        [Ecto.UUID.dump!(bulk_action.id)]
+      )
+
+      retry = start_held_retry(ctx, bulk_action, "new")
+      assert_receive {:reopened, ^retry}, 5_000
+
+      send(a, :go)
+      assert eventually(&resolve_waiting_on_row?/0)
+
+      send(retry, :go)
+      assert_receive {:retried, ^retry, {:ok, %{pass: 1}}}, 5_000
+      assert_receive {:done, ^a, {:stopped, :row_moved_on}}, 5_000
+
+      # The row keeps the retry's input and pass, nothing resolved of A's.
+      assert [%{status: :pending, pass: 1, resolved_data: resolved}] = rows(bulk_action)
+      refute Map.has_key?(resolved, "native_name")
+      assert %{status: :running, result: nil, pass: 1} = reload(bulk_action)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :completed, rows_done: 1} = reload(bulk_action)
+      assert native_names(ctx) == ["#{ctx.tag} new"]
+    end
+
+    test "has its :mark_failed of a row whose staged files it lost refused, and stops", ctx do
+      bulk_action = resolving!(ctx, EchoResolver, staged_files: %{"a.zip" => "bulk-staging/gone"})
+      hold_after_download(bulk_action)
+
+      a = start_held_run(bulk_action)
+      assert_receive {:downloaded, ^a}, 5_000
+
+      # Run B fails both rows for their staged files, and its owner retries.
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :completed_with_errors, pass: 0} = reload(bulk_action)
+
+      assert {:ok, %{status: :running, pass: 1}} =
+               AshBulkDurable.retry(bulk_action, scope: ctx.scope)
+
+      assert [%{status: :pending, error: nil}, %{status: :pending, error: nil}] =
+               rows(bulk_action)
+
+      send(a, :go)
+      assert_receive {:done, ^a, {:stopped, :row_moved_on}}, 5_000
+
+      # A's failure of its pass is not on the reopened rows, and it wrote no verdict.
+      assert [%{status: :pending, error: nil}, %{status: :pending, error: nil}] =
+               rows(bulk_action)
+
+      assert %{status: :running, result: nil, finished_at: nil, pass: 1} = reload(bulk_action)
+    end
+  end
+
   describe "the verdict" do
     test "waits for a row another run put back to :pending between chunks", ctx do
       bulk_action = submit!(ctx, 3)
@@ -825,6 +978,106 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       Process.put(:hold, test_pid)
       send(test_pid, {:done, self(), Worker.run_now(bulk_action.id)})
     end)
+  end
+
+  # A retry in a process of its own, with a new shared input, that says so
+  # once it has reopened the rows and moved the bulk action on, and waits for
+  # `:go` before its transaction commits.
+  defp start_held_retry(ctx, bulk_action, value) do
+    test_pid = self()
+    handler = "held-retry-#{bulk_action.id}"
+
+    pid =
+      spawn_link(fn ->
+        :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
+        receive do: (:start -> :ok)
+        send(test_pid, {:retried, self(), retry_with!(ctx, bulk_action, value)})
+      end)
+
+    :telemetry.attach(
+      handler,
+      [:ash_bulk_durable, :test, :repo, :query],
+      fn _event, _measurements, %{source: source, query: query}, _config ->
+        if self() == pid and source == "bulk_actions" and String.starts_with?(query, "UPDATE") do
+          :telemetry.detach(handler)
+          send(test_pid, {:reopened, pid})
+          receive do: (:go -> :ok)
+        end
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    send(pid, :start)
+    pid
+  end
+
+  # A `:resolve` of a row waits on another transaction's lock.
+  defp resolve_waiting_on_row? do
+    %{rows: [[count]]} =
+      Repo.query!(
+        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' " <>
+          "AND query LIKE 'UPDATE \"bulk_action_rows\"%'"
+      )
+
+    count > 0
+  end
+
+  # A run told to hold (see `start_held_run/1`) says so once its staged-file
+  # download has failed, and waits for `:go` before failing the rows that
+  # needed the files.
+  defp hold_after_download(bulk_action) do
+    handler = "held-download-#{bulk_action.id}"
+
+    :telemetry.attach(
+      handler,
+      [:ash_bulk_durable, :staged_files_download, :stop],
+      fn _event, _measurements, %{bulk_action_id: id}, _config ->
+        with true <- id == bulk_action.id, pid when is_pid(pid) <- Process.get(:hold) do
+          send(pid, {:downloaded, self()})
+          receive do: (:go -> :ok)
+        end
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+  end
+
+  # One row running with the shared input, whose native name resolves,
+  # through `HeldResolver`, to the tag and `value`.
+  defp shared_resolving!(ctx, value) do
+    {:ok, bulk_action} =
+      AshBulkDurable.Core.create(Region, :create, [%{}],
+        scope: ctx.scope,
+        chunk_size: 1,
+        input: shared_input(ctx, value)
+      )
+
+    bulk_action
+  end
+
+  defp retry_with!(ctx, bulk_action, value),
+    do: AshBulkDurable.retry(bulk_action, scope: ctx.scope, input: shared_input(ctx, value))
+
+  defp shared_input(ctx, value) do
+    %{
+      code: "#{ctx.tag}-1",
+      name: "#{ctx.tag} N1",
+      native_name: {:resolve, HeldResolver, "#{ctx.tag} #{value}"}
+    }
+  end
+
+  defp free!(ctx, i), do: Repo.query!("DELETE FROM regions WHERE code = $1", ["#{ctx.tag}-#{i}"])
+
+  defp native_names(ctx) do
+    %{rows: rows} =
+      Repo.query!(
+        "SELECT native_name FROM regions WHERE code LIKE $1 || '-%' AND name NOT LIKE '%X%'",
+        [ctx.tag]
+      )
+
+    List.flatten(rows)
   end
 
   defp submit_unpreparable!(ctx) do

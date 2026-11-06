@@ -151,10 +151,14 @@ defmodule AshBulkDurable.Core.Retry do
   end
 
   # Each row compares the shared input it ran with to the one it will, so the
-  # rows reopen before `:enqueue_retry` moves that input on.
+  # rows reopen before `:enqueue_retry` moves that input on. The rows and the
+  # bulk action take one pass, read under the lock: a run of an earlier pass
+  # finds every reopened row on another pass, its phase-1 writes included.
   defp write(resources, rows, corrections, shared, locked, opts) do
-    with :ok <- reopen_rows(rows, corrections, shared, locked),
-         {:ok, retried} <- enqueue(locked, shared, opts) do
+    pass = locked.pass + 1
+
+    with :ok <- reopen_rows(rows, corrections, shared, locked, pass),
+         {:ok, retried} <- enqueue(locked, Map.put(shared, :pass, pass), opts) do
       {:ok, retried}
     else
       {:error, error} -> Ash.DataLayer.rollback(resources, error)
@@ -190,29 +194,30 @@ defmodule AshBulkDurable.Core.Retry do
     end
   end
 
-  defp reopen_rows(rows, corrections, shared, bulk_action) do
+  defp reopen_rows(rows, corrections, shared, bulk_action, pass) do
     resource = Introspection.resource(bulk_action)
 
     Enum.reduce_while(rows, :ok, fn row, :ok ->
       correction = Map.get(corrections, row.id, %{})
 
-      case reopen_row(%{row | bulk_action: bulk_action}, correction, shared, resource) do
+      case reopen_row(%{row | bulk_action: bulk_action}, correction, shared, resource, pass) do
         {:ok, _row} -> {:cont, :ok}
         {:error, error} -> {:halt, {:error, error}}
       end
     end)
   end
 
-  defp reopen_row(%{refused: true} = row, correction, _shared, _resource)
+  defp reopen_row(%{refused: true} = row, correction, _shared, _resource, _pass)
        when map_size(correction) == 0,
        do: {:ok, row}
 
-  defp reopen_row(row, correction, shared, resource) do
+  defp reopen_row(row, correction, shared, resource, pass) do
     arguments =
       correction
       |> Map.take([:input, :metadata, :error])
       |> put_target(row, correction, resource)
       |> put_shared_input(shared)
+      |> Map.put(:pass, pass)
 
     Ash.update(row, arguments, action: :reopen_with_corrections, authorize?: false)
   end

@@ -35,6 +35,7 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
      |> add_attribute(:refused, :boolean, allow_nil?: false, public?: true, default: false)
      |> add_attribute(:record_id, :string, allow_nil?: true, public?: true)
      |> add_attribute(:attempts, :integer, allow_nil?: false, public?: true, default: 0)
+     |> add_attribute(:pass, :integer, allow_nil?: false, public?: true, default: 0)
      |> add_create_timestamp(:inserted_at)
      |> add_bulk_action_relationship()
      |> add_default_accept()
@@ -472,7 +473,8 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
             input: :term,
             shared_input: :term,
             metadata: :map,
-            error: AshBulkDurable.Core.StoredErrors
+            error: AshBulkDurable.Core.StoredErrors,
+            pass: :integer
           ],
           fn {name, type} ->
             Transformer.build_entity!(Dsl, [:actions, :update], :argument,

@@ -192,9 +192,44 @@ defmodule AshBulkDurable.Core.Resource.RowTest do
     end
   end
 
+  # A run's phase-1 write gives its pass, and matches the row only while the
+  # row is still on it; a write that gives none checks no pass.
+  describe "a flip given a run's pass" do
+    setup ctx do
+      [row] = [resolved(0)] |> create_bulk_action!() |> list_rows()
+      %{row: Ash.Seed.update!(row, %{status: :pending, pass: 1}), ctx: ctx}
+    end
+
+    for action <- [:resolve, :mark_failed] do
+      test "#{action} is allowed on the row's pass", %{row: row, ctx: ctx} do
+        assert {:ok, _flipped} = flip_in_pass(row, unquote(action), ctx, 1)
+      end
+
+      test "#{action} is refused once a retry moved the row on, leaving the row as it is",
+           %{row: row, ctx: ctx} do
+        assert {:error, %Ash.Error.Invalid{errors: errors}} =
+                 flip_in_pass(row, unquote(action), ctx, 0)
+
+        assert [%Ash.Error.Changes.StaleRecord{resource: Row}] = errors
+        assert stored(Ash.get!(Row, row.id, authorize?: false)) == stored(row)
+      end
+
+      test "#{action} without a pass checks none", %{row: row, ctx: ctx} do
+        assert {:ok, _flipped} = flip_in_pass(row, unquote(action), ctx, nil)
+      end
+    end
+  end
+
   defp stored(row), do: Map.take(row, [:status, :resolved_data, :error, :record_id])
 
-  defp flip(row, :resolve, ctx) do
+  defp flip_in_pass(row, action, ctx, pass) do
+    context = if pass, do: %{pass: pass}, else: %{}
+    flip(row, action, ctx, context)
+  end
+
+  defp flip(row, action, ctx), do: flip(row, action, ctx, %{})
+
+  defp flip(row, :resolve, ctx, context) do
     settings = %AshBulkDurable.Core.Runner.Settings{
       resource: AshBulkDurable.Test.Region,
       action_name: :create,
@@ -206,18 +241,33 @@ defmodule AshBulkDurable.Core.Resource.RowTest do
     Ash.update(row, %{},
       action: :resolve,
       authorize?: false,
-      context: %{ash_bulk_durable: %{settings: settings, resolvers: %{}}}
+      context: %{ash_bulk_durable: Map.merge(%{settings: settings, resolvers: %{}}, context)}
     )
   end
 
-  defp flip(row, :mark_succeeded, _ctx),
-    do: Ash.update(row, %{record_id: "late"}, action: :mark_succeeded, authorize?: false)
+  defp flip(row, :mark_succeeded, _ctx, context),
+    do:
+      Ash.update(row, %{record_id: "late"},
+        action: :mark_succeeded,
+        authorize?: false,
+        context: %{ash_bulk_durable: context}
+      )
 
-  defp flip(row, :mark_failed, _ctx),
-    do: Ash.update(row, %{error: "late"}, action: :mark_failed, authorize?: false)
+  defp flip(row, :mark_failed, _ctx, context),
+    do:
+      Ash.update(row, %{error: "late"},
+        action: :mark_failed,
+        authorize?: false,
+        context: %{ash_bulk_durable: context}
+      )
 
-  defp flip(row, :forget_resolutions, _ctx),
-    do: Ash.update(row, %{names: ["photo"]}, action: :forget_resolutions, authorize?: false)
+  defp flip(row, :forget_resolutions, _ctx, context),
+    do:
+      Ash.update(row, %{names: ["photo"]},
+        action: :forget_resolutions,
+        authorize?: false,
+        context: %{ash_bulk_durable: context}
+      )
 
   # What the resolve phase resolved survives a correction only where the
   # reference behind it is unchanged.
