@@ -492,7 +492,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
   # ── :completed_with_errors → Abandon ───────────────────────
 
   describe "abandon failed rows" do
-    test "shows the three controls, then cancels and enqueues the eager staging purge", %{
+    test "shows the three controls, then cancels without enqueueing a staging purge", %{
       conn: conn,
       super_user: user
     } do
@@ -518,7 +518,8 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
 
       assert_patch(view, "/bulk")
       assert reload(bulk_action).status == :cancelled
-      assert_enqueued(worker: PurgeStaleStaging, args: %{bulk_action_id: bulk_action.id})
+      # The cancel deletes its staged files itself; no Oban job does it.
+      refute_enqueued(worker: PurgeStaleStaging)
     end
   end
 

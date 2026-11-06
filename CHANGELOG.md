@@ -35,3 +35,10 @@
   starts in a short locked transaction of its own before phase 1, which marks
   the bulk action `:running`; a run that finds it locked there stops before
   resolving anything. Every target must live in the bulk action's repo.
+- Staged files: a `:failed` bulk action keeps its staged files for a day
+  from when it failed (`finished_at`), not from when they were uploaded, so
+  its owner can still retry it after a run that stayed queued or running for a
+  day. Abandoning a bulk action deletes its staged files itself once the
+  cancel commits, instead of through a one-shot `PurgeStaleStaging` job; inside
+  a caller's own transaction, or when storage fails, it leaves them to the
+  daily sweep. `PurgeStaleStaging.sweep/0` and `delete_staging/1` are public.

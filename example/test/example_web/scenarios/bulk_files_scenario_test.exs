@@ -196,7 +196,7 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
     assert drain_finished(bulk_action).status == :failed
     [[held_key], [swept_key]] = kept_files(bulk_action)
 
-    # A day on, the staging sweep takes a failed bulk action's ZIP.
+    # A day after it failed, the staging sweep takes a failed bulk action's ZIP.
     sweep_staging(bulk_action)
 
     # A row whose file went too has nothing left to extract it from.
@@ -378,6 +378,12 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
 
   defp sweep_staging(bulk_action) do
     long_ago = DateTime.add(DateTime.utc_now(), -25, :hour)
+
+    # The sweep keeps a :failed bulk action's files for a day after it failed.
+    Example.Repo.query!("UPDATE bulk_actions SET finished_at = $1 WHERE id = $2", [
+      long_ago,
+      Ecto.UUID.dump!(bulk_action.id)
+    ])
 
     Enum.each(bulk_action.staged_files, fn {_name, key} ->
       TestStorage.put(key, zip(), long_ago)

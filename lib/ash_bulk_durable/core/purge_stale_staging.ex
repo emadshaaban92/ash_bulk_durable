@@ -4,37 +4,44 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
   staging keys itself when it finishes `:completed` or `:cancelled`, and
   leaves them for a retry when it finishes `:completed_with_errors` or
   `:failed`; it can't reach states where it never ran or already exited.
-  This cron reclaims those.
+  `sweep/0` reclaims those.
 
-  ## Daily sweep (`perform/1` with no `bulk_action_id`)
+  ## Daily sweep (`sweep/0`)
 
   Lists every object under the `bulk-staging/` prefix, keeps only those
   older than 24h, and decides per key against the set of keys that still
   need preservation:
 
     * **Key referenced by a `:queued` / `:running` /
-      `:completed_with_errors` bulk action** → KEEP. An active worker may still
-      need them, or the retry-in-place re-resolves the `:failed`
-      rows against them.
+      `:completed_with_errors` bulk action** → KEEP. An active worker may
+      still need them, or a retry re-resolves the failed rows against them.
+    * **Key referenced by a `:failed` bulk action that finished less than
+      24h ago** → KEEP. Its owner can still retry it, and the retry
+      downloads the same files. The day counts from `finished_at`, not
+      from the upload, so a run that stayed queued or running for a day
+      doesn't lose its files the moment it fails.
     * **Everything else** → delete. That covers true orphans (the
       browser completed a presigned PUT but the submit transaction
       never committed) AND keys belonging to a worker-exited terminal
-      bulk action (`:completed` / `:failed` / `:cancelled`): a `:failed`
-      one can be retried for a day, its files gone after that.
+      bulk action (`:completed` / `:cancelled`, or `:failed` more than a
+      day ago).
 
-  The preserve-set comes from reading bulk actions whose status is in the
-  one-unresolved set (same status set as the partial unique index on
-  `BulkAction`). The identity bounds that read to at most one row per
-  user, so memory is O(unresolved users), not O(bulk action history).
+  The sweep is idempotent and takes no lock. The preserve-set comes from
+  reading the unresolved bulk actions (same status set as the partial
+  unique index on `BulkAction`, so at most one per user) plus those that
+  failed within the day.
 
-  ## Eager one-shot (`perform/1` with a `bulk_action_id`, or `delete_bulk_action_staging/1`)
+  In this version the module is still an Oban worker whose `perform/1`
+  runs `sweep/0`, so a host's crontab can schedule it.
 
-  The Abandon path flips a `:completed_with_errors` bulk action to
-  `:cancelled` long after the worker exited, so nothing on the bulk action's own
-  code path can purge its staging. The Abandon action enqueues a one-shot
-  `new(%{bulk_action_id: id})` job that calls `delete_bulk_action_staging/1` to drop the
-  keys immediately; if that job is lost, the daily sweep catches the
-  `:cancelled` bulk action on its next pass.
+  ## Abandoning (`delete_staging/1`)
+
+  Abandoning flips a `:completed_with_errors` bulk action to `:cancelled`
+  long after the worker exited, so nothing on the worker's code path can
+  drop its staged files. `AshBulkDurable.Core.Changes.ApplyMarkFinished`
+  calls `delete_staging/1` itself once the cancel commits; when it can't
+  (the cancel ran inside a caller's transaction, or storage failed), the
+  next sweep reclaims the `:cancelled` bulk action's files.
   """
   use Oban.Worker, queue: :default, max_attempts: 1
 
@@ -46,43 +53,48 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
   @stale_after_seconds 24 * 60 * 60
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"bulk_action_id" => bulk_action_id}})
-      when is_binary(bulk_action_id) do
-    delete_bulk_action_staging(bulk_action_id)
-    :ok
-  end
-
   def perform(%Oban.Job{}) do
     sweep()
     :ok
   end
 
   @doc """
-  Synchronously deletes every staging key recorded on the given bulk action.
-  Safe to call for a missing bulk action (no-op) — the bulk action row may have been
-  destroyed before the eager job ran.
+  Reads the bulk action with this id and deletes its staging keys (see
+  `delete_staging/1`). A missing bulk action is a no-op.
   """
   def delete_bulk_action_staging(bulk_action_id) do
     case Ash.get(bulk_action_resource(), bulk_action_id, authorize?: false) do
       {:ok, bulk_action} ->
-        bulk_action.staged_files
-        |> Map.values()
-        |> Enum.each(&Storage.delete_object/1)
-
-        :ok
+        delete_staging(bulk_action)
 
       {:error, _} ->
         :ok
     end
   end
 
+  @doc """
+  Deletes every staging key in `bulk_action`'s `staged_files`, as the
+  record holds them, without reading the bulk action again.
+  """
+  def delete_staging(bulk_action) do
+    bulk_action.staged_files
+    |> Map.values()
+    |> Enum.each(&Storage.delete_object/1)
+
+    :ok
+  end
+
   # ── Daily sweep ────────────────────────────────────────────────────────
 
-  defp sweep do
+  @doc """
+  Deletes every staged file older than a day that no unresolved or
+  recently failed bulk action holds.
+  """
+  def sweep do
     case Storage.list_objects(@staging_prefix) do
       {:ok, objects} ->
-        keep = keys_to_preserve()
         cutoff = DateTime.add(DateTime.utc_now(), -@stale_after_seconds, :second)
+        keep = keys_to_preserve(cutoff)
         Enum.each(objects, &maybe_purge(&1, keep, cutoff))
 
       {:error, _term} ->
@@ -103,14 +115,17 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
   defp stale?(_object, _cutoff), do: false
 
   # Every staging key claimed by a bulk action whose status still warrants
-  # preservation — i.e. one of the one-unresolved statuses. The partial
-  # unique index caps this at one bulk action per user, so the set is bounded by
-  # the active-user count, not the bulk action history. Any staging key NOT
-  # in this set (orphan or worker-exited terminal) is fair game to
-  # delete once it's past the staleness cutoff.
-  defp keys_to_preserve do
+  # preservation: one of the one-unresolved statuses (capped by the partial
+  # unique index at one bulk action per user), or `:failed` within the last
+  # day, while its owner can still retry it. Any staging key NOT in this set
+  # (orphan or worker-exited terminal) is fair game to delete once it's past
+  # the staleness cutoff.
+  defp keys_to_preserve(cutoff) do
     bulk_action_resource()
-    |> Ash.Query.filter(status in [:queued, :running, :completed_with_errors])
+    |> Ash.Query.filter(
+      status in [:queued, :running, :completed_with_errors] or
+        (status == :failed and finished_at > ^cutoff)
+    )
     |> Ash.read!(authorize?: false)
     |> Enum.flat_map(&Map.values(&1.staged_files))
     |> MapSet.new()

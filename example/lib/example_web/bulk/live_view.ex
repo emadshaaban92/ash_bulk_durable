@@ -249,8 +249,8 @@ defmodule ExampleWeb.Bulk.LiveView do
   end
 
   # Abandon the still-`:failed` rows of a `:completed_with_errors` bulk action.
-  # Marks the bulk action `:cancelled` (whose after_action eagerly purges
-  # staging) then patches home.
+  # Marks the bulk action `:cancelled` (which deletes its staged files once
+  # the cancel commits) then patches home.
   def on_handle_event("abandon_failed_rows", _params, socket) do
     socket =
       case socket.assigns.bulk_action do
