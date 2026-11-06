@@ -572,6 +572,114 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     end
   end
 
+  # A failed chunk of 64 rows, its rows halved: rows numbered from 1, the bad
+  # ones those whose code another region already took. Each scenario also
+  # runs row by row (`halving_min_rows: 0`), on codes of its own, to compare.
+  describe "halving a failed chunk" do
+    setup do
+      on_exit(fn -> Application.delete_env(:ash_bulk_durable, :halving_min_rows) end)
+    end
+
+    test "one bad row: the same rows and errors as row by row, in far fewer transactions",
+         ctx do
+      halved = recovered!(ctx, "h", [37])
+      by_row = recovered!(ctx, "r", [37], halving_min_rows: 0)
+
+      assert halved.outcome == by_row.outcome
+      assert halved.counts == %{succeeded: 63, failed: 1}
+      assert %{recovery: :halving, transactions: 16} = halved.stop
+      assert %{recovery: :row_by_row, transactions: 66} = by_row.stop
+
+      # Halved down to single rows: about 2·log2(64).
+      tiny = recovered!(ctx, "t", [37], halving_min_rows: 1)
+      assert tiny.outcome == by_row.outcome
+      assert %{recovery: :halving, transactions: 14} = tiny.stop
+    end
+
+    test "several bad rows spread out: the same results, fewer transactions than rows", ctx do
+      bad = [8, 24, 40, 56]
+      halved = recovered!(ctx, "h", bad)
+      by_row = recovered!(ctx, "r", bad, halving_min_rows: 0)
+
+      assert halved.outcome == by_row.outcome
+      assert halved.counts == %{succeeded: 60, failed: 4}
+      assert %{recovery: :halving, transactions: 51} = halved.stop
+      assert %{transactions: 69} = by_row.stop
+    end
+
+    # Without the fallback, halving all the way costs 127.
+    test "most rows bad: halving falls back, costing close to row by row, not double", ctx do
+      bad = Enum.reject(1..64, &(rem(&1, 4) == 0))
+      halved = recovered!(ctx, "h", bad)
+      by_row = recovered!(ctx, "r", bad, halving_min_rows: 0)
+
+      assert halved.outcome == by_row.outcome
+      assert halved.counts == %{succeeded: 16, failed: 48}
+      assert %{recovery: :row_by_row, transactions: 119} = halved.stop
+      assert %{transactions: 113} = by_row.stop
+    end
+
+    test "halving_min_rows: 0 runs every row alone, as before", ctx do
+      Application.put_env(:ash_bulk_durable, :halving_min_rows, 0)
+      bulk_action = submit_set!(ctx, "z", 64, [37])
+      locks = count_locks()
+
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      # The start's, the chunk's, a run alone for each row, row 37's mark, and
+      # the verdict's chunk.
+      assert locks.() == 1 + 1 + 64 + 1 + 1
+    end
+
+    test "stops at a lock another transaction holds mid-recovery, writing nothing more", ctx do
+      bulk_action = submit_set!(ctx, "l", 64, [37])
+
+      # The `:run` batches end in order: the chunk's, then rows 1-32's, which
+      # commit. Rows 33-64 then find the lock held.
+      locker = lock_after_batch(bulk_action, 2)
+      locks = count_locks()
+
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      # The start's, the chunk's, rows 1-32's, and rows 33-64's refused one.
+      assert locks.() == 4
+      release(locker)
+
+      assert statuses(bulk_action) ==
+               List.duplicate(:succeeded, 32) ++ List.duplicate(:resolved, 32)
+
+      assert length(created_with(ctx, "l")) == 32
+
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert length(created_with(ctx, "l")) == 63
+      assert %{status: :completed_with_errors, rows_done: 63} = reload(bulk_action)
+    end
+
+    # Without the read under the lock, rows 33-64 would run row 40 again: its
+    # flip is refused, and the run stops with `{:stopped, :row_moved_on}`.
+    test "drops a row another run applied mid-recovery from its set, and runs it no more",
+         ctx do
+      bulk_action = submit_set!(ctx, "a", 64, [37])
+      row40 = Enum.at(rows(bulk_action), 39)
+
+      # After rows 1-32 commit, and before rows 33-64 run, another run applies
+      # row 40.
+      after_batch(2, fn -> apply_elsewhere(row40) end)
+      stops = chunk_stops(bulk_action)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      # Rows 33-64 run as 31 rows. Run with row 40 in them, each set holding
+      # it would fail on its refused flip, and halve on down to it alone.
+      assert [{%{transactions: 15, rows_succeeded: 62, rows_failed: 1}, _}] = stops.()
+
+      assert %{status: :succeeded, record_id: "other"} = Enum.at(rows(bulk_action), 39)
+      refute "#{ctx.tag}-a40" in created_with(ctx, "a")
+      assert length(created_with(ctx, "a")) == 62
+      assert %{status: :completed_with_errors, rows_done: 62} = reload(bulk_action)
+    end
+  end
+
   describe "all or nothing, rolled back" do
     test "writes its verdict under the lock: not while another transaction holds it", ctx do
       taken!(ctx, 2)
@@ -1137,6 +1245,110 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
   end
 
   # A run of the bulk action in a process of its own, as another node's would be.
+  # ── Halving ────────────────────────────────────────────────────────────
+
+  # A per-row bulk action of `count` rows in one chunk, coded
+  # "<tag>-<prefix><i>", whose `bad` rows find their code already taken.
+  defp submit_set!(ctx, prefix, count, bad) do
+    # An owner of its own, since one may have one unresolved bulk action.
+    scope = Scope.new(actor: create_user!(prefix <> ctx.tag))
+
+    Enum.each(bad, fn i ->
+      Ash.create!(
+        Region,
+        %{
+          code: "#{ctx.tag}-#{prefix}#{i}",
+          name: "#{ctx.tag} #{prefix}X#{i}",
+          native_name: "#{prefix}X#{i}"
+        },
+        authorize?: false
+      )
+    end)
+
+    inputs =
+      Enum.map(1..count, fn i ->
+        %{
+          code: "#{ctx.tag}-#{prefix}#{i}",
+          name: "#{ctx.tag} #{prefix}N#{i}",
+          native_name: "#{prefix}A#{i}"
+        }
+      end)
+
+    {:ok, bulk_action} =
+      AshBulkDurable.bulk_create(inputs, Region, :create, scope: scope, chunk_size: count)
+
+    bulk_action
+  end
+
+  # Runs a 64-row chunk with `bad` rows, with `config` for the run, and gives
+  # its rows' statuses and errors (codes made alike), the counts, and the
+  # chunk's `:stop` measurements and metadata.
+  defp recovered!(ctx, prefix, bad, config \\ []) do
+    Application.delete_env(:ash_bulk_durable, :halving_min_rows)
+    Enum.each(config, fn {key, value} -> Application.put_env(:ash_bulk_durable, key, value) end)
+    bulk_action = submit_set!(ctx, prefix, 64, bad)
+    stops = chunk_stops(bulk_action)
+
+    assert :ok = Worker.run_now(bulk_action.id)
+    Application.delete_env(:ash_bulk_durable, :halving_min_rows)
+
+    assert [{measurements, metadata}] = stops.()
+    assert %{status: :completed_with_errors} = reload(bulk_action)
+
+    rows = rows(bulk_action)
+    assert Enum.all?(rows, &(&1.status != :failed or &1.error not in [nil, []]))
+    alike = &String.replace(&1, "#{ctx.tag}-#{prefix}", "CODE-")
+
+    %{
+      outcome: Enum.map(rows, &{&1.row_index, &1.status, alike.(inspect(&1.error))}),
+      counts: %{
+        succeeded: Enum.count(rows, &(&1.status == :succeeded)),
+        failed: Enum.count(rows, &(&1.status == :failed))
+      },
+      stop: Map.merge(measurements, Map.take(metadata, [:recovery, :outcome]))
+    }
+  end
+
+  # The bulk action's chunk `:stop` events so far, oldest first.
+  defp chunk_stops(bulk_action) do
+    test_pid = self()
+    handler = "chunk-stops-#{bulk_action.id}"
+
+    :telemetry.attach(
+      handler,
+      [:ash_bulk_durable, :chunk, :stop],
+      fn _event, measurements, %{bulk_action_id: id} = metadata, _config ->
+        if id == bulk_action.id, do: send(test_pid, {:chunk_stop, id, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    fn ->
+      :telemetry.detach(handler)
+      collect_stops(bulk_action.id, [])
+    end
+  end
+
+  defp collect_stops(id, acc) do
+    receive do
+      {:chunk_stop, ^id, measurements, metadata} ->
+        collect_stops(id, [{measurements, metadata} | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp created_with(ctx, prefix) do
+    %{rows: rows} =
+      Repo.query!("SELECT code FROM regions WHERE code LIKE $1 AND name NOT LIKE '%X%'", [
+        "#{ctx.tag}-#{prefix}%"
+      ])
+
+    List.flatten(rows)
+  end
+
   defp start_run(bulk_action) do
     test_pid = self()
 

@@ -146,6 +146,7 @@ repo's pool for `:max_running` times `:phase1_concurrency + 2`.
 | `:max_row_attempts` | `2` | runs that may die on a row run alone before it fails as crashed |
 | `:warn_without_poller` | `true` | warn when a bulk action is queued on a node with no poller |
 | `:default_chunk_size` | `50` | rows a per-row bulk action commits per batch |
+| `:halving_min_rows` | `8` | a failed chunk's rows are halved down to sets this small, then run row by row; `0` runs every row alone |
 | `:atomic_mode_max_rows` | `10_000` | the cap on an all-or-nothing bulk action |
 | `:phase1_concurrency` | `4` | rows resolved at once |
 | `:field_handlers` | `[]` | handlers tried before the built-in ones |

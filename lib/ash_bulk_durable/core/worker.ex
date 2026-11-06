@@ -45,8 +45,9 @@ defmodule AshBulkDurable.Core.Worker do
   run that can't take the lock there stops before phase 1. Every
   verdict, phase 1's included, is written under the lock, from the record
   read under it. A chunk that fails rolls back with the lock; per row, its
-  rows then run one at a time, each in a locked transaction of its own, and
-  one that still fails is marked in a further one.
+  rows are then recovered (see "Recovering a failed chunk" below), each try
+  in a locked transaction of its own, and a row that still fails alone is
+  marked in a further one.
 
   Postgres releases the lock at commit, at rollback and when a connection
   dies, so a run that lost it has nothing left that can commit. A lock
@@ -79,9 +80,9 @@ defmodule AshBulkDurable.Core.Worker do
     `:mark_finished({:failed, %{reason: :atomic_phase1_failed, ...}})`.
   - All-or-nothing chunk rollback → `:mark_finished({:failed, %{reason:
     :atomic_chunk_rolled_back, ...}})`.
-  - Per-row chunk rollback → row-by-row recovery (rows succeed or
-    fail individually); the bulk action lands in `:completed_with_errors` if
-    any row landed `:failed`.
+  - Per-row chunk rollback → recovery, halving the chunk's rows (rows
+    succeed or fail individually); the bulk action lands in
+    `:completed_with_errors` if any row landed `:failed`.
   - A row status flip refused because another run of the bulk action already
     moved the row on (`RowMovedOnError`, see below) → the run stops, writing
     no verdict.
@@ -90,6 +91,42 @@ defmodule AshBulkDurable.Core.Worker do
   one that returns an error, in either phase and either mode. Only a raise from the worker's own reads and writes propagates
   out of the run; the bulk action stays `:running`, and is started again once
   its liveness hint goes stale.
+
+  ## Recovering a failed chunk
+
+  A per-row chunk whose rows return errors (a validation error, a constraint
+  violation; a row that raises counts too) rolls back as a whole, so its
+  rows are tried again in smaller sets, each set in a locked transaction of
+  its own (`SKIP LOCKED`). Each try reads again, under the lock and on its
+  connection, which of its rows are still `:resolved`, and drops the rest:
+  another run applied them, or a retry reopened them. A lock it can't take
+  stops the whole recovery, since the run holding it reads these same rows
+  and recovers them itself.
+
+  - **Halving.** The failed rows split in two, and each half is tried in
+    turn. A half that succeeds commits; one that fails splits again. A
+    single row that fails is marked failed, with its own error, in a further
+    locked transaction and only while it is still `:resolved`. With k bad
+    rows among n, that is about 2·k·log2(n/k) transactions instead of n.
+  - **Row by row.** A set at or below `:halving_min_rows` runs one row at a
+    time, as does the second half of a split whose first half failed too,
+    once halving that first half cost at least what row by row would have (a
+    run alone for each row and a mark for each that failed): many bad rows
+    then cost little more than row by row, a few spread across both halves
+    are still halved.
+
+  The first half is recovered before the second is tried, so rows commit in
+  the order the chunk read them, and each failing row is marked with the
+  error it gave running alone: the rows that succeed, those that fail and
+  their errors are the ones running every row alone gives. Crashes are
+  another matter, and rows suspected of them run alone (see "Crashes"
+  below).
+
+  In the `ash_bulk_durable` config:
+
+    * `:halving_min_rows` - sets of at most this many rows run row by row,
+      8 by default. 0 turns halving off: every row of a failed chunk runs
+      alone.
 
   ## Crashes
 
@@ -145,6 +182,18 @@ defmodule AshBulkDurable.Core.Worker do
       runs in isolation, 3 by default.
     * `:max_row_attempts` - runs alone that may die on a row before it fails
       as crashed, 2 by default.
+
+  ## Telemetry
+
+  A chunk emits `[:ash_bulk_durable, :chunk, :start | :stop | :exception]`.
+  `:stop` comes once the chunk committed, or after its recovery, with
+  measurements `duration`, `rows_in_chunk`, `rows_succeeded`, `rows_failed`
+  and `transactions`, the locked transactions the chunk took, its own
+  included (1 for a chunk that committed; 2 for an all-or-nothing one rolled
+  back, with its verdict's), and metadata `bulk_action_id`, `chunk_index`,
+  `outcome` (`:ok` or `:rolled_back`) and `recovery`: `:none`, `:halving`,
+  or `:row_by_row` when halving is off, the chunk was at or below
+  `:halving_min_rows`, or a half fell back to row by row.
 
   ## Tenants
 
@@ -1077,14 +1126,16 @@ defmodule AshBulkDurable.Core.Worker do
 
       {:ok, {:written, span, notifications, terminal}} ->
         Ash.Notifier.notify(notifications)
-        chunk_stop(span, chunk_measurements(span.rows, span.rows, 0), :ok, :none)
+        chunk_stop(span, chunk_measurements(span.rows, span.rows, 0, 1), :ok, :none)
         if terminal, do: {:done, terminal}, else: :continue
 
       {:rolled_back, {span, rows}, error} ->
         chunk_failed(bulk_action, settings, span, rows, error)
 
       {:ok, {:alone, row}} ->
-        if recover_row(row, settings, bulk_action) == :busy, do: :busy, else: :continue
+        if elem(recover_row(row, settings, bulk_action), 0) == :busy,
+          do: :busy,
+          else: :continue
 
       {:ok, {:crashed, row}} ->
         report_crashed(row)
@@ -1174,56 +1225,186 @@ defmodule AshBulkDurable.Core.Worker do
         [:running]
       )
 
-    chunk_stop(span, chunk_measurements(span.rows, 0, span.rows), :rolled_back, :none)
+    chunk_stop(span, chunk_measurements(span.rows, 0, span.rows, 2), :rolled_back, :none)
     if terminal, do: {:done, terminal}, else: :busy
   end
 
-  # Per row: the chunk rolled back (every row back to :resolved), so re-run
-  # its rows one at a time: good rows commit individually and only the bad
-  # ones land :failed.
+  # Per row: the chunk rolled back (every row back to :resolved), so recover
+  # its rows: good rows commit and only the bad ones land :failed.
   defp chunk_failed(bulk_action, settings, span, rows, _error) do
-    {status, succeeded, failed} = recover_row_by_row(rows, settings, bulk_action)
+    recovering = %{
+      bulk_action: bulk_action,
+      settings: settings,
+      min: AshBulkDurable.Core.config(:halving_min_rows, 8)
+    }
+
+    {status, tally} = recover(rows, recovering)
 
     chunk_stop(
       span,
-      chunk_measurements(span.rows, succeeded, failed),
+      chunk_measurements(span.rows, tally.succeeded, tally.failed, 1 + tally.transactions),
       :rolled_back,
-      :row_by_row
+      tally.recovery
     )
 
     status
   end
 
+  # ── Recovering a failed chunk ──────────────────────────────────────────
+
+  # A chunk above `:halving_min_rows` is halved; one at or below it, or with
+  # halving off (0), runs row by row. Either way rows commit in the order the
+  # chunk read them, and each failing row is marked with the error it gave
+  # running alone, so the rows that succeed, those that fail and their errors
+  # are the ones row by row gives: only the number of transactions differs.
+  # Returns `{:continue | :busy, tally}`; `:busy` stops the recovery, since
+  # the run holding the lock reads these same rows and recovers them itself.
+  defp recover(rows, recovering) do
+    if recovering.min > 0 and length(rows) > recovering.min,
+      do: halve(rows, nil, recovering, tally(:halving)),
+      else: row_by_row(rows, recovering, tally(:row_by_row))
+  end
+
+  defp tally(recovery), do: %{succeeded: 0, failed: 0, transactions: 0, recovery: recovery}
+
+  # `rows` just failed together, `error` being what they failed with. A single
+  # row failed alone, with its own error, and is marked. A set at or below
+  # `:halving_min_rows` runs row by row. A larger one splits in two, and each
+  # half is tried in turn, the first recovered before the second is tried.
+  defp halve([row], error, recovering, tally), do: mark_failed(row, error, recovering, tally)
+
+  defp halve(rows, _error, %{min: min} = recovering, tally) when length(rows) <= min,
+    do: row_by_row(rows, recovering, tally)
+
+  defp halve(rows, _error, recovering, tally) do
+    {first, second} = Enum.split(rows, div(length(rows), 2))
+
+    case try_rows(first, recovering, tally) do
+      {:ok, tally} ->
+        second_half(second, :ok, recovering, tally)
+
+      {:failed, fresh, error, before} ->
+        with {:continue, tally} <- halve(fresh, error, recovering, before) do
+          second_half(second, paid_off(fresh, before, tally), recovering, tally)
+        end
+
+      {:busy, tally} ->
+        {:busy, tally}
+    end
+  end
+
+  # Both halves failing hints at many bad rows, where halving costs more than
+  # row by row: once halving the first half cost at least what row by row
+  # would have (a run alone for each row, and a mark for each that failed),
+  # the second goes row by row. So many bad rows cost little more than row by
+  # row, while a few spread across both halves are still halved.
+  defp second_half(rows, first, recovering, tally) do
+    case try_rows(rows, recovering, tally) do
+      {:failed, [_, _ | _] = fresh, _error, tally} when first == :not_paid_off ->
+        row_by_row(fresh, recovering, %{tally | recovery: :row_by_row})
+
+      {:failed, fresh, error, tally} ->
+        halve(fresh, error, recovering, tally)
+
+      {:ok, tally} ->
+        {:continue, tally}
+
+      {:busy, tally} ->
+        {:busy, tally}
+    end
+  end
+
+  defp paid_off(rows, before, tally) do
+    spent = tally.transactions - before.transactions
+    row_by_row = length(rows) + tally.failed - before.failed
+    if spent < row_by_row, do: :paid_off, else: :not_paid_off
+  end
+
+  # One locked transaction runs `rows` together: those still `:resolved`
+  # under the lock, the rest dropped (another run applied them, or a retry
+  # reopened them). `{:ok, tally}` once they committed, or none was left;
+  # `{:failed, fresh, error, tally}` when they rolled back, `fresh` being the
+  # rows it ran.
+  defp try_rows(rows, recovering, tally) do
+    tally = %{tally | transactions: tally.transactions + 1}
+
+    case in_pass(recovering.bulk_action, &write_together(&1, rows, recovering.settings)) do
+      {:ok, :skipped} ->
+        {:ok, tally}
+
+      {:ok, {written, notifications}} ->
+        Ash.Notifier.notify(notifications)
+        {:ok, %{tally | succeeded: tally.succeeded + written}}
+
+      {:rolled_back, fresh, error} ->
+        {:failed, fresh, error, tally}
+
+      :busy ->
+        {:busy, tally}
+    end
+  end
+
+  defp write_together(locked, rows, settings) do
+    locked = Enum.reduce(rows, locked, &stop_isolating(&2, &1))
+
+    case still_resolved_rows(rows) do
+      [] -> :skipped
+      fresh -> {length(fresh), write_rows(fresh, settings, locked, fresh, stop_on_error?: false)}
+    end
+  end
+
+  defp still_resolved_rows(rows) do
+    ids = Enum.map(rows, & &1.id)
+
+    row_resource()
+    |> Ash.Query.filter(id in ^ids and status == :resolved)
+    |> Ash.Query.sort(row_index: :asc)
+    |> BulkActionLock.pin()
+    |> Ash.read!(authorize?: false)
+  end
+
+  defp mark_failed(row, error, recovering, tally) do
+    tally = %{tally | transactions: tally.transactions + 1}
+
+    case mark_failed_locked(row, error, recovering.bulk_action) do
+      :failed -> {:continue, %{tally | failed: tally.failed + 1}}
+      :skipped -> {:continue, tally}
+      :busy -> {:busy, tally}
+    end
+  end
+
   # Each row runs alone in a locked transaction of its own, and a row that
   # still fails is marked in a further one. A row no longer `:resolved` when
-  # read under the lock was run by another run meanwhile, and is skipped; a
-  # lock another transaction holds stops the recovery, since that run reads
-  # these same rows and recovers them itself.
-  defp recover_row_by_row(rows, settings, bulk_action) do
-    Enum.reduce_while(rows, {:continue, 0, 0}, fn row, {:continue, succeeded, failed} ->
-      case recover_row(row, settings, bulk_action) do
-        :succeeded -> {:cont, {:continue, succeeded + 1, failed}}
-        :failed -> {:cont, {:continue, succeeded, failed + 1}}
-        :skipped -> {:cont, {:continue, succeeded, failed}}
-        :busy -> {:halt, {:busy, succeeded, failed}}
+  # read under the lock was run by another run meanwhile, and is skipped.
+  defp row_by_row(rows, recovering, tally) do
+    Enum.reduce_while(rows, {:continue, tally}, fn row, {:continue, tally} ->
+      {outcome, transactions} = recover_row(row, recovering.settings, recovering.bulk_action)
+      tally = %{tally | transactions: tally.transactions + transactions}
+
+      case outcome do
+        :succeeded -> {:cont, {:continue, %{tally | succeeded: tally.succeeded + 1}}}
+        :failed -> {:cont, {:continue, %{tally | failed: tally.failed + 1}}}
+        :skipped -> {:cont, {:continue, tally}}
+        :busy -> {:halt, {:busy, tally}}
       end
     end)
   end
 
+  # How the row went, and the locked transactions it took.
   defp recover_row(row, settings, bulk_action) do
     case in_pass(bulk_action, &write_row_alone(&1, row, settings)) do
       {:ok, :skipped} ->
-        :skipped
+        {:skipped, 1}
 
       {:ok, notifications} ->
         Ash.Notifier.notify(notifications)
-        :succeeded
+        {:succeeded, 1}
 
       {:rolled_back, row, error} ->
-        mark_failed_locked(row, error, bulk_action)
+        {mark_failed_locked(row, error, bulk_action), 2}
 
       :busy ->
-        :busy
+        {:busy, 1}
     end
   end
 
@@ -1396,8 +1577,13 @@ defmodule AshBulkDurable.Core.Worker do
 
   defp error_row_index(_error), do: nil
 
-  defp chunk_measurements(rows_in_chunk, succeeded, failed) do
-    %{rows_in_chunk: rows_in_chunk, rows_succeeded: succeeded, rows_failed: failed}
+  defp chunk_measurements(rows_in_chunk, succeeded, failed, transactions) do
+    %{
+      rows_in_chunk: rows_in_chunk,
+      rows_succeeded: succeeded,
+      rows_failed: failed,
+      transactions: transactions
+    }
   end
 
   # ── Rows run alone ─────────────────────────────────────────────────────
