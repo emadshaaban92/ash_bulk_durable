@@ -84,3 +84,12 @@
   pass, such as a host's own, checks its status alone. A host that defines
   its own `:reopen_with_corrections` or `:enqueue_retry` must accept the new
   `pass` argument and set `pass` from it, or every retry fails.
+- A per-row chunk that fails with returned errors is recovered by halving
+  its rows instead of running each alone: a half that succeeds commits, one
+  that fails splits again, and a single row that fails is marked as before.
+  One bad row among 64 takes 16 transactions instead of 66. Sets at or
+  below `:halving_min_rows` (8; 0 turns halving off) run row by row, and so
+  does a second half once halving its failed first half didn't pay, so many
+  bad rows cost little more than before. The rows that succeed, those that
+  fail and their errors are the same. The chunk `:stop` event's `recovery`
+  is now `:halving` or `:row_by_row`, and it measures `transactions`.
