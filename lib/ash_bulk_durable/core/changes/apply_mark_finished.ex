@@ -32,16 +32,28 @@ defmodule AshBulkDurable.Core.Changes.ApplyMarkFinished do
 
   The Abandon path flips a `:completed_with_errors` bulk action to
   `:cancelled` long after the worker exited, so nothing on the bulk action's own
-  code path can drop its staged files. This change enqueues a
-  one-shot `AshBulkDurable.Core.PurgeStaleStaging` job for that case. The enqueue
-  is best-effort — a failed insert never blocks the cancel, because the
-  daily sweep catches the `:cancelled` bulk action on its next pass. Other
-  terminal flips (`:completed`, `:failed`, `:completed_with_errors`) are
-  handled by the worker's own `maybe_delete_staging/1`, so only
-  `:cancelled` enqueues here.
+  code path can drop its staged files. For that case this change adds an
+  `after_transaction` hook that calls
+  `AshBulkDurable.Core.PurgeStaleStaging.delete_staging/1` once the cancel
+  has committed. The delete is best-effort and never changes the cancel's
+  result:
+
+    * it is skipped when the cancel failed;
+    * it is skipped when the bulk action's repo is still in a transaction
+      (the cancel ran inside a caller's own transaction, which could still
+      roll back);
+    * an exception from storage is rescued and logged as a warning.
+
+  In each of those cases the daily sweep reclaims the `:cancelled` bulk
+  action's files on its next pass. Other terminal flips (`:completed`,
+  `:failed`, `:completed_with_errors`) are handled by the worker's own
+  `maybe_delete_staging/1`, so only `:cancelled` deletes here.
   """
   use Ash.Resource.Change
   require Ash.Expr
+  require Logger
+
+  alias AshBulkDurable.Core.PurgeStaleStaging
 
   @impl true
   def change(changeset, _opts, _context) do
@@ -54,22 +66,32 @@ defmodule AshBulkDurable.Core.Changes.ApplyMarkFinished do
     |> Ash.Changeset.force_change_attribute(:result, result_blob)
     |> Ash.Changeset.force_change_attribute(:error, error)
     |> Ash.Changeset.force_change_attribute(:finished_at, DateTime.utc_now())
-    |> maybe_enqueue_staging_purge(status)
+    |> maybe_delete_staging(status)
   end
 
-  defp maybe_enqueue_staging_purge(changeset, :cancelled) do
-    Ash.Changeset.after_action(changeset, fn _changeset, bulk_action ->
-      _ =
-        Oban.insert(
-          AshBulkDurable.Core.oban(),
-          AshBulkDurable.Core.PurgeStaleStaging.new(%{bulk_action_id: bulk_action.id})
-        )
+  defp maybe_delete_staging(changeset, :cancelled) do
+    Ash.Changeset.after_transaction(changeset, fn
+      changeset, {:ok, bulk_action} = result ->
+        repo = AshPostgres.DataLayer.Info.repo(changeset.resource, :mutate)
+        unless repo.in_transaction?(), do: delete_staging(bulk_action)
+        result
 
-      {:ok, bulk_action}
+      _changeset, result ->
+        result
     end)
   end
 
-  defp maybe_enqueue_staging_purge(changeset, _status), do: changeset
+  defp maybe_delete_staging(changeset, _status), do: changeset
+
+  defp delete_staging(bulk_action) do
+    PurgeStaleStaging.delete_staging(bulk_action)
+  rescue
+    error ->
+      Logger.warning(
+        "could not delete the staged files of abandoned bulk action #{bulk_action.id}, " <>
+          "the daily sweep will: " <> Exception.message(error)
+      )
+  end
 
   defp interpret(:completed), do: {:completed, %{outcome: "completed"}, nil}
 
