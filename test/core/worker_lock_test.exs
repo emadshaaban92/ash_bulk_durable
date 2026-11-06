@@ -12,6 +12,20 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
 
   require Ash.Query
 
+  defmodule EchoResolver do
+    @moduledoc "Resolves a value to itself."
+    @behaviour AshBulkDurable.Core.Resolver
+
+    @impl true
+    def prepare(_args, _context), do: {:ok, nil}
+
+    @impl true
+    def resolve(value, nil, _context), do: {:ok, value}
+
+    @impl true
+    def finish(nil), do: :ok
+  end
+
   alias AshBulkDurable.Core.Worker
   alias AshBulkDurable.Test.{BulkAction, Region, Repo, Row, Scope, User}
 
@@ -79,6 +93,14 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
              reload(bulk_action)
   end
 
+  # As the run's start left it: running, no verdict, nothing done.
+  defp assert_no_verdict(bulk_action) do
+    assert %{status: :running, result: nil, finished_at: nil, rows_done: 0} =
+             running = reload(bulk_action)
+
+    assert running.started_at
+  end
+
   defp job(bulk_action), do: Repo.get!(Oban.Job, bulk_action.oban_job_id)
 
   defp perform_as_current(bulk_action) do
@@ -97,6 +119,48 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
 
       release(locker)
       assert statuses(bulk_action) == [:resolved, :resolved]
+      assert created(ctx) == []
+      assert_untouched(bulk_action)
+    end
+
+    test "a run stops before phase 1, resolving no row", ctx do
+      rows =
+        Enum.map(1..2, fn i ->
+          %{
+            input: %{
+              code: "#{ctx.tag}-#{i}",
+              name: "#{ctx.tag} N#{i}",
+              native_name: {:resolve, EchoResolver, "#{ctx.tag} A#{i}"}
+            }
+          }
+        end)
+
+      bulk_action =
+        Ash.create!(
+          BulkAction,
+          %{
+            user_id: ctx.user.id,
+            resource_name: inspect(Region),
+            action_name: :create,
+            action_type: :create,
+            total_rows: 2,
+            mode: :per_row,
+            chunk_size: 1,
+            rows: rows
+          },
+          action: :create,
+          authorize?: false
+        )
+
+      assert statuses(bulk_action) == [:pending, :pending]
+      phase1 = count_events(bulk_action, [:ash_bulk_durable, :phase1, :start])
+      locker = lock_elsewhere(bulk_action.id)
+
+      assert :ok = perform_as_current(bulk_action)
+
+      release(locker)
+      assert phase1.() == 0
+      assert statuses(bulk_action) == [:pending, :pending]
       assert created(ctx) == []
       assert_untouched(bulk_action)
     end
@@ -264,7 +328,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
 
       assert created(ctx) == []
       assert statuses(bulk_action) == [:resolved, :resolved]
-      assert_untouched(bulk_action)
+      assert_no_verdict(bulk_action)
 
       # Its lock went with its connection.
       assert eventually(fn -> lockable?(bulk_action.id) end)
@@ -289,8 +353,9 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
 
       assert :ok = perform_as_current(bulk_action)
 
-      # The chunk's, row 1's, and row 2's refused one: row 3 is not tried.
-      assert locks.() == 3
+      # The start's, the chunk's, row 1's, and row 2's refused one: row 3 is
+      # not tried.
+      assert locks.() == 4
       release(locker)
       assert statuses(bulk_action) == [:succeeded, :resolved, :resolved]
       assert created(ctx) == codes(ctx, [1])
@@ -358,7 +423,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       release(locker)
       assert statuses(bulk_action) == [:resolved, :resolved]
       assert created(ctx) == []
-      assert_untouched(bulk_action)
+      assert_no_verdict(bulk_action)
 
       assert :ok = perform_as_current(bulk_action)
       assert created(ctx) == []
@@ -390,7 +455,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       # Row 1's target write and flip shared the refused flip's transaction.
       assert created(ctx) == []
       assert [%{status: :resolved}, %{status: :succeeded, record_id: "other"}] = rows(bulk_action)
-      assert_untouched(bulk_action)
+      assert_no_verdict(bulk_action)
     end
 
     test "phase 2, all or nothing: the transaction rolls back, no rollback verdict, and the current job snoozes",
@@ -406,7 +471,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       assert spans.() == %{start: 1, stop: 0, exception: 1}
       assert created(ctx) == []
       assert [%{status: :resolved}, %{status: :succeeded, record_id: "other"}] = rows(bulk_action)
-      assert_untouched(bulk_action)
+      assert_no_verdict(bulk_action)
     end
 
     test "phase 2, per row: a row another run applied before recovery marks it failed is left as it is",
@@ -437,6 +502,24 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
   end
 
   # ── Helpers ─────────────────────────────────────────────────────────────
+
+  # How many times `event` fired for the bulk action.
+  defp count_events(bulk_action, event) do
+    counter = :counters.new(1, [])
+    handler = "count-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      event,
+      fn _event, _measurements, %{bulk_action_id: id}, _config ->
+        if id == bulk_action.id, do: :counters.add(counter, 1, 1)
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    fn -> :counters.get(counter, 1) end
+  end
 
   # A run of `job` in a process of its own, as another node's would be.
   defp start_run(job) do

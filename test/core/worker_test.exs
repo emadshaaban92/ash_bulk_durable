@@ -1015,10 +1015,10 @@ defmodule AshBulkDurable.Core.WorkerTest do
       MovingResolver.hook(fun)
     end
 
-    # The bulk action as the run found it, still queued: no verdict.
+    # The bulk action as this run's start left it: no verdict.
     defp assert_no_verdict(bulk_action) do
       fresh = reload(bulk_action)
-      assert fresh.status == :queued
+      assert fresh.status == :running
       assert fresh.result == nil
       assert fresh.finished_at == nil
       assert fresh.rows_done == 0

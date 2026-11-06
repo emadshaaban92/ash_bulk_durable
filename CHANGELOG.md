@@ -31,8 +31,7 @@
   transaction once no row is left. Every verdict is written under the lock,
   and per-row recovery runs each row in a locked transaction of its own. A
   run that finds the bulk action locked stops at once, writing nothing, so two
-  runs of one bulk action take turns rather than both writing it. The worker
-  no longer marks the bulk action `:running` before phase 1: the first locked
-  transaction does, so it stays `:queued` while its references resolve, and
-  `started_at` is when its first chunk started, leaving phase 1 out of the
-  run's duration. Every target must live in the bulk action's repo.
+  runs of one bulk action take turns rather than both writing it. A run
+  starts in a short locked transaction of its own before phase 1, which marks
+  the bulk action `:running`; a run that finds it locked there stops before
+  resolving anything. Every target must live in the bulk action's repo.

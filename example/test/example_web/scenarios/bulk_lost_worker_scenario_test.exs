@@ -147,13 +147,13 @@ defmodule ExampleWeb.Scenarios.BulkLostWorkerScenarioTest do
 
     job = job_running(bulk_action)
     # Slow outside a transaction, which would hold the test's own shared
-    # connection, and so before the first chunk makes it `:running`.
+    # connection.
     attach([:ash_bulk_durable, :phase1, :start], %{id: bulk_action.id}, {Process, :sleep, [900]})
     {worker, monitor} = spawn_monitor(fn -> Worker.perform(job) end)
 
     Process.sleep(600)
     assert :ok = perform_job(RescueStuckBulkActions, %{})
-    assert reload(bulk_action).status == :queued
+    assert reload(bulk_action).status == :running
     assert Process.alive?(worker)
 
     assert_receive {:DOWN, ^monitor, :process, ^worker, :normal}, 5000
