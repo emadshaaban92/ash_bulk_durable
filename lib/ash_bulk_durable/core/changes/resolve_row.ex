@@ -37,12 +37,22 @@ defmodule AshBulkDurable.Core.Changes.ResolveRow do
           |> Ash.Changeset.force_change_attribute(:resolved_data, merged)
           |> keep_tenant(settings)
           |> Ash.Changeset.force_change_attribute(:status, :resolved)
+          |> give_back_attempt()
 
         {:error, error} ->
           Ash.Changeset.add_error(cs, resolve_error(error))
       end
     end)
   end
+
+  # A row resolved alone was bumped for this run, and phase 2 bumps it again
+  # for its own: this run's bump goes back, so one run counts once. Bumps
+  # earlier runs died with stay, so a row whose resolution is lost between
+  # runs still reaches the cap. Chunks only hold rows with no attempts.
+  defp give_back_attempt(%{data: %{attempts: attempts}} = changeset) when attempts > 0,
+    do: Ash.Changeset.force_change_attribute(changeset, :attempts, attempts - 1)
+
+  defp give_back_attempt(changeset), do: changeset
 
   # Only a tenant the row's target named by reference needs keeping; any
   # other is read from the target or the bulk action again.

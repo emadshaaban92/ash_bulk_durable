@@ -137,6 +137,8 @@ plus a brief one each `:alive_interval` for its stamp: size the repo's pool for
 | Key | Default | |
 |---|---|---|
 | `:alive_interval` | 30 seconds | how often a run stamps its liveness hint |
+| `:max_stalled_starts` | `3` | starts in a row without progress before a bulk action's rows run alone |
+| `:max_row_attempts` | `2` | runs that may die on a row run alone before it fails as crashed |
 | `:warn_without_poller` | `true` | warn when a bulk action is queued on a node with no poller |
 | `:default_chunk_size` | `50` | rows a per-row bulk action commits per batch |
 | `:atomic_mode_max_rows` | `10_000` | the cap on an all-or-nothing bulk action |
@@ -148,7 +150,8 @@ plus a brief one each `:alive_interval` for its stamp: size the repo's pool for
 ## Telemetry
 
 `[:ash_bulk_durable, :bulk_action | :staged_files_download | :phase1 | :chunk]`
-spans, and `[:ash_bulk_durable, :worker_attempt, :start]`.
+spans, and `[:ash_bulk_durable, :worker_attempt, :start]`,
+`[:ash_bulk_durable, :isolation, :start]` and `[:ash_bulk_durable, :row, :crashed]`.
 
 ## Contributing
 

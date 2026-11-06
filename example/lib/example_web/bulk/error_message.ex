@@ -13,6 +13,7 @@ defmodule ExampleWeb.Bulk.ErrorMessage do
   use Gettext, backend: ExampleWeb.Gettext
 
   alias AshBulkDurable.Core.{
+    CrashedRowError,
     NoMatchError,
     RowTimeoutError,
     StagedFileError,
@@ -42,6 +43,13 @@ defmodule ExampleWeb.Bulk.ErrorMessage do
     do: [
       gettext(
         "A file uploaded with this bulk action couldn't be read, so nothing was saved for this row."
+      )
+    ]
+
+  defp word(%StoredError{error: %CrashedRowError{}}),
+    do: [
+      gettext(
+        "This row stopped the bulk action each time it ran, so it was not run again and nothing was saved for it."
       )
     ]
 

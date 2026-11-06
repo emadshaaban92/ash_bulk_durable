@@ -223,6 +223,13 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanelTest do
       assert html =~ "under Retry with corrections"
       assert html =~ "alert-error"
     end
+
+    test ":failed as crashed says it kept stopping" do
+      html = render_panel(bulk_action(%{status: :failed, result: %{"reason" => "crashed"}}))
+
+      assert html =~ "kept stopping before it could finish"
+      assert html =~ "alert-error"
+    end
   end
 
   # A real %Phoenix.LiveView.UploadConfig{} only exists inside a live view,

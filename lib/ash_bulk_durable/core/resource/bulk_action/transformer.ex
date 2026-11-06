@@ -49,6 +49,14 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
      |> add_attribute(:started_at, :utc_datetime_usec, allow_nil?: true, public?: true)
      |> add_attribute(:finished_at, :utc_datetime_usec, allow_nil?: true, public?: true)
      |> add_attribute(:alive_at, :utc_datetime_usec, allow_nil?: true, public?: true)
+     |> add_attribute(:stalled_starts, :integer, allow_nil?: false, public?: true, default: 0)
+     |> add_attribute(:progress_at_start, :integer, allow_nil?: true, public?: true)
+     |> add_attribute(:shutdown_stopped, :boolean,
+       allow_nil?: false,
+       public?: true,
+       default: false
+     )
+     |> add_attribute(:isolating_row_id, :uuid, allow_nil?: true, public?: true)
      |> add_create_timestamp(:inserted_at)
      |> add_update_timestamp(:updated_at)
      |> add_one_unresolved_identity()
@@ -58,6 +66,7 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
      |> add_create_action()
      |> add_mark_running_action()
      |> add_stamp_alive_action()
+     |> add_count_crashes_action()
      |> add_bump_rows_done_action()
      |> add_mark_finished_action()
      |> add_enqueue_retry_action()
@@ -317,6 +326,23 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
           name: :stamp_alive,
           accept: [],
           changes: [stamp]
+        )
+
+      Transformer.add_entity(dsl_state, [:actions], action, type: :append)
+    end
+  end
+
+  # What a run keeps to tell a run that keeps dying from one that makes
+  # progress (see "Crashes" in `AshBulkDurable.Core.Worker`), written under
+  # the lock. Nothing a page shows.
+  defp add_count_crashes_action(dsl_state) do
+    if Info.action(dsl_state, :count_crashes) do
+      dsl_state
+    else
+      {:ok, action} =
+        Transformer.build_entity(Dsl, [:actions], :update,
+          name: :count_crashes,
+          accept: [:stalled_starts, :progress_at_start, :shutdown_stopped, :isolating_row_id]
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)
