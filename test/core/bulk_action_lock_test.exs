@@ -11,7 +11,7 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
   require Ash.Expr
   require Ash.Query
 
-  alias AshBulkDurable.Core.{BulkActionLock, Worker}
+  alias AshBulkDurable.Core.BulkActionLock
   alias AshBulkDurable.Test.{BulkAction, Region, Repo, Row, Scope, User}
 
   setup do
@@ -40,16 +40,6 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
     |> Ash.Query.filter(bulk_action_id == ^bulk_action.id)
     |> Ash.Query.sort(row_index: :asc)
     |> Ash.read!(authorize?: false)
-  end
-
-  defp jobs(bulk_action) do
-    %{rows: [[count]]} =
-      Repo.query!(
-        "SELECT count(*) FROM oban_jobs WHERE worker = $1 AND args->>'bulk_action_id' = $2",
-        [inspect(Worker), bulk_action.id]
-      )
-
-    count
   end
 
   defp in_transaction(fun) do
@@ -113,7 +103,6 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
     test "retry/2 and retry_row/2 are refused at once, nothing written", ctx do
       bulk_action = finished_with_errors!(ctx)
       [row | _rows] = rows(bulk_action)
-      jobs_before = jobs(bulk_action)
       locker = lock_elsewhere(bulk_action.id)
 
       for retry <- [
@@ -130,14 +119,12 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
 
       assert Enum.map(rows(bulk_action), & &1.status) == [:failed, :failed]
       assert Ash.get!(BulkAction, bulk_action.id, authorize?: false) == bulk_action
-      assert jobs(bulk_action) == jobs_before
     end
   end
 
   test "a caller who doesn't own it is refused before reading a row", ctx do
     bulk_action = finished_with_errors!(ctx)
     [row | _rows] = rows(bulk_action)
-    jobs_before = jobs(bulk_action)
     stranger = Scope.new(actor: create_user!("stranger-#{ctx.tag}"))
     test_pid = self()
     handler = "lock-rows-read-#{ctx.tag}"
@@ -169,7 +156,6 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
     assert Enum.map(rows(bulk_action), & &1.status) == [:failed, :failed]
     assert Enum.all?(rows(bulk_action), &unlocked?/1)
     assert Ash.get!(BulkAction, bulk_action.id, authorize?: false) == bulk_action
-    assert jobs(bulk_action) == jobs_before
   end
 
   # Whether another connection can lock `row` without waiting.
@@ -235,12 +221,6 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
     users = "SELECT id FROM users WHERE email LIKE '%' || $1"
     email = "#{tag}@example.test"
-
-    Repo.query!(
-      "DELETE FROM oban_jobs WHERE args->>'bulk_action_id' IN " <>
-        "(SELECT id::text FROM bulk_actions WHERE user_id IN (#{users}))",
-      [email]
-    )
 
     Repo.query!("DELETE FROM bulk_actions WHERE user_id IN (#{users})", [email])
     Repo.query!("DELETE FROM users WHERE id IN (#{users})", [email])

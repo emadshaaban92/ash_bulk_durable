@@ -45,7 +45,6 @@ defmodule Example.MixProject do
       {:ash, "~> 3.37"},
       {:ash_phoenix, "~> 2.3"},
       {:ash_postgres, "~> 2.15"},
-      {:oban, "~> 2.24"},
       {:simple_sat, "~> 0.1"},
       {:sourceror, "~> 1.7", only: [:dev, :test]},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

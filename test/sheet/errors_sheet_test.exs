@@ -6,7 +6,6 @@ defmodule AshBulkDurable.Sheet.ErrorsSheetTest do
   bulk action started from.
   """
   use AshBulkDurable.DataCase, async: true
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
 
   require Ash.Query
 
@@ -305,8 +304,6 @@ defmodule AshBulkDurable.Sheet.ErrorsSheetTest do
       assert {:ok, %{status: :running}} =
                AshBulkDurable.retry(bulk_action, sheet, scope: ctx.scope)
 
-      assert_enqueued(worker: Worker, args: %{bulk_action_id: bulk_action.id})
-
       bulk_action = run!(bulk_action)
       [first, second] = rows(bulk_action)
 
@@ -587,12 +584,6 @@ defmodule AshBulkDurable.Sheet.ErrorsSheetTest do
       bogus = Ecto.UUID.generate()
       name = "Branch #{tag()}"
 
-      jobs = fn ->
-        length(all_enqueued(worker: Worker, args: %{bulk_action_id: bulk_action.id}))
-      end
-
-      jobs_before = jobs.()
-
       sheet = %Sheet{
         rows: [%{"row_id" => second.id, "name" => name}, %{"row_id" => bogus, "name" => "x"}]
       }
@@ -604,7 +595,6 @@ defmodule AshBulkDurable.Sheet.ErrorsSheetTest do
                :completed_with_errors
 
       assert reload_row(second).status == :failed
-      assert jobs.() == jobs_before
     end
   end
 

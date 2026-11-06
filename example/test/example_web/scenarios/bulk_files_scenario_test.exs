@@ -10,7 +10,6 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
   `Example.Test.TestStorage`.
   """
   use ExampleWeb.ConnCase, async: false
-  use Oban.Testing, repo: Example.Repo
 
   import Example.Test.StorageHelpers
   import ExUnit.CaptureLog
@@ -389,7 +388,7 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
       TestStorage.put(key, zip(), long_ago)
     end)
 
-    assert :ok = perform_job(PurgeStaleStaging, %{})
+    assert :ok = PurgeStaleStaging.sweep()
     refute Enum.any?(TestStorage.keys(), &String.starts_with?(&1, "bulk-staging/"))
   end
 

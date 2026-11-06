@@ -23,10 +23,8 @@ defmodule AshBulkDurable.Core.Changes.ApplyMarkFinished do
   :completed_with_errors]` — the same set that holds the user's
   one-unresolved slot. A call on an already-terminal bulk action (`:completed`,
   `:failed`, `:cancelled`) is rejected as `StaleRecord` rather than
-  silently overwriting the verdict. This closes the worker-vs-rescue
-  race: if the rescue cron flips a stuck `:running` bulk action to
-  `:failed`/`worker_lost` and a delayed worker then tries to finalize
-  `:completed`, the worker's UPDATE no-ops.
+  silently overwriting the verdict: if one run finishes a bulk action and
+  an overlapping run then tries to finalize it, the second UPDATE no-ops.
 
   ## Eager staging purge on `:cancelled`
 

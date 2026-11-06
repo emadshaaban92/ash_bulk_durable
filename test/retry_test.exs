@@ -6,7 +6,6 @@ defmodule AshBulkDurable.RetryTest do
   corrected sheet (the example's `/bulk` page tests).
   """
   use AshBulkDurable.DataCase, async: true
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
 
   require Ash.Query
 
@@ -79,17 +78,6 @@ defmodule AshBulkDurable.RetryTest do
 
   defp region_id(branch, user), do: Ash.reload!(branch, actor: user).region_id
 
-  # An old attempt Oban still has, as one that raised after the bulk action
-  # finished leaves it. The bulk action ran in the test, so Oban never
-  # attempted the job: this one says it did.
-  defp old_job(%{oban_job_id: job_id}) do
-    job = AshBulkDurable.Test.Repo.get!(Oban.Job, job_id)
-    %{job | attempt: 2, attempted_at: DateTime.utc_now()}
-  end
-
-  defp jobs(bulk_action),
-    do: length(all_enqueued(worker: Worker, args: %{bulk_action_id: bulk_action.id}))
-
   defp codes_written(codes) do
     Region
     |> Ash.Query.filter(code in ^codes)
@@ -143,22 +131,6 @@ defmodule AshBulkDurable.RetryTest do
       found: found,
       kept_input: %{name: "Branch #{tag()}", region_id: lookup(code)}
     }
-  end
-
-  test "a late attempt of the job a retry replaced drives nothing; the retry's own job does",
-       ctx do
-    failed = two_failed!(ctx)
-    superseded = old_job(failed.bulk_action)
-
-    {:ok, retried} = AshBulkDurable.retry(failed.bulk_action, scope: ctx.scope)
-    assert retried.oban_job_id != superseded.id
-
-    assert :ok = perform_job(superseded, repo: AshBulkDurable.Test.Repo)
-
-    assert reload(retried).status == :running
-
-    assert 1 = Worker.drain()
-    assert reload(retried).status == :completed_with_errors
   end
 
   describe "retry/2, per row" do
@@ -372,7 +344,6 @@ defmodule AshBulkDurable.RetryTest do
     test "a row that is not one left to run refuses the whole retry", ctx do
       %{bulk_action: bulk_action, first: first} = two_failed!(ctx)
       [_first, succeeded, _second] = rows(bulk_action)
-      jobs_before = jobs(bulk_action)
 
       for unmatched <- [Ecto.UUID.generate(), succeeded.id] do
         assert {:error, %{unmatched: [^unmatched]}} =
@@ -384,7 +355,6 @@ defmodule AshBulkDurable.RetryTest do
 
       assert reload(bulk_action).status == :completed_with_errors
       assert Ash.get!(Row, first.id, authorize?: false).status == :failed
-      assert jobs(bulk_action) == jobs_before
     end
   end
 
@@ -584,12 +554,9 @@ defmodule AshBulkDurable.RetryTest do
       assert Enum.map([refused, unprepared, untouched], & &1.status) ==
                [:failed, :pending, :resolved]
 
-      jobs_before = jobs(bulk_action)
-
       assert {:error, %{unprocessed: 2}} =
                AshBulkDurable.retry_row(refused, input: first, scope: ctx.scope)
 
-      assert jobs(bulk_action) == jobs_before
       assert reload(bulk_action).status == :failed
       assert codes_written(Enum.map(inputs, & &1.code)) == []
 
@@ -753,14 +720,12 @@ defmodule AshBulkDurable.RetryTest do
         ])
 
         gone = reload(bulk_action)
-        jobs_before = jobs(bulk_action)
         sheet = %AshBulkDurable.Sheet{headers: ["row_id"], rows: [%{"row_id" => first.id}]}
 
         assert {:error, :gone} = AshBulkDurable.retry(gone, scope: ctx.scope)
         assert {:error, :gone} = AshBulkDurable.retry(gone, sheet, scope: ctx.scope)
         assert {:error, :gone} = AshBulkDurable.retry_row(first, scope: ctx.scope)
 
-        assert jobs(bulk_action) == jobs_before
         assert reload(bulk_action).status == :completed_with_errors
         assert Ash.get!(Row, second.id, authorize?: false).status == :failed
 
@@ -773,7 +738,6 @@ defmodule AshBulkDurable.RetryTest do
 
       {:ok, running} = AshBulkDurable.retry_row(first, scope: ctx.scope)
       assert running.status == :running
-      jobs_before = jobs(bulk_action)
 
       # `running` reads :running, `bulk_action` the state it was retried from.
       for held <- [running, bulk_action] do
@@ -782,7 +746,9 @@ defmodule AshBulkDurable.RetryTest do
 
       assert {:error, %Ash.Error.Invalid{}} = AshBulkDurable.retry_row(second, scope: ctx.scope)
 
-      assert jobs(bulk_action) == jobs_before
+      assert Map.take(reload(bulk_action), [:status, :updated_at]) ==
+               Map.take(running, [:status, :updated_at])
+
       assert Ash.get!(Row, second.id, authorize?: false).status == :failed
     end
 

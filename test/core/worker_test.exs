@@ -2,16 +2,13 @@ defmodule AshBulkDurable.Core.WorkerTest do
   @moduledoc """
   Tests for `AshBulkDurable.Core.Worker` driving the two-phase
   pipeline. Each scenario runs the bulk action with `Worker.run_now/1`,
-  synchronously inside the test sandbox. The tests under "a row moved on
-  under another run" go through `perform/1` on purpose, for its cancel and
-  snooze.
+  synchronously inside the test sandbox.
 
   `async: false` because tests swap `:ash_bulk_durable` config (storage
   adapter, `:test_poison`) globally and drive the
   `AshBulkDurable.TestStorage` named Agent (a VM-wide singleton).
   """
   use AshBulkDurable.DataCase, async: false
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
 
   import AshBulkDurable.StorageHelpers
 
@@ -640,9 +637,9 @@ defmodule AshBulkDurable.Core.WorkerTest do
           mode: :all_or_nothing
         )
 
-      # Simulate the first attempt having reached mark_finished but the
-      # BEAM dying before Oban acked. The next attempt picks up a bulk action in
-      # `:completed` state.
+      # Simulate an overlapping run having reached mark_finished before this
+      # one read the bulk action: it picks up a bulk action in `:completed`
+      # state.
       Ash.update!(bulk_action, %{result: :completed}, action: :mark_finished, authorize?: false)
 
       finished = reload(bulk_action)
@@ -746,7 +743,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
   end
 
   describe "staged-file download error" do
-    test "all or nothing: storage adapter returns :error → bulk action :failed, no Oban raise", %{
+    test "all or nothing: storage adapter returns :error → bulk action :failed, no raise", %{
       super_user: user
     } do
       put_storage(ErrorStorage)
@@ -867,7 +864,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
 
   # The cleanup keys off the bulk action record `mark_finished/2` just returned
   # — re-reading the row here would open a window where a racing writer
-  # could flip the purge decision (see the RescueStuckBulkActions TOCTOU). Both
+  # could flip the purge decision. Both
   # purge branches must therefore reflect the terminal status the worker
   # itself wrote.
   describe "staged-file cleanup gates on the worker's terminal status" do
@@ -1025,14 +1022,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
       assert fresh.rows_done == 0
     end
 
-    defp perform_as_current(bulk_action) do
-      Worker
-      |> build_job(%{"bulk_action_id" => bulk_action.id})
-      |> Map.put(:id, bulk_action.oban_job_id)
-      |> perform_job()
-    end
-
-    test "phase 1, per row: the current job's resolve is refused and it snoozes",
+    test "phase 1, per row: the run's resolve is refused and it stops",
          %{super_user: user} do
       suffix = System.unique_integer([:positive])
 
@@ -1048,10 +1038,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
         Ash.Seed.update!(row, %{status: :resolved, resolved_data: %{"native_name" => "other"}})
       end)
 
-      log =
-        capture_log(fn -> assert {:snooze, 30} = perform_as_current(bulk_action) end)
-
-      assert log =~ "a stale run wrote a row first"
+      assert {:stopped, :row_moved_on} = Worker.run_now(bulk_action.id)
 
       assert [%{status: :resolved, resolved_data: %{"native_name" => "other"}}] =
                list_rows(bulk_action.id)
@@ -1060,7 +1047,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
       assert regions_from(suffix, user) == []
     end
 
-    test "phase 1, all or nothing: a superseded job's resolve is refused and it cancels",
+    test "phase 1, all or nothing: the run's resolve is refused and it stops",
          %{super_user: user} do
       suffix = System.unique_integer([:positive])
 
@@ -1077,13 +1064,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
         Ash.Seed.update!(row, %{status: :failed, error: "other run"})
       end)
 
-      log =
-        capture_log(fn ->
-          assert {:cancel, :superseded} =
-                   perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
-        end)
-
-      assert log =~ "is superseded"
+      assert {:stopped, :row_moved_on} = Worker.run_now(bulk_action.id)
 
       [r1, r2] = list_rows(bulk_action.id)
       assert r1.status == :failed

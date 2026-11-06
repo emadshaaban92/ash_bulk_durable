@@ -1,9 +1,9 @@
 # AshBulkDurable
 
 Run any Ash action over many rows durably. A bulk action and its rows are
-written in one transaction, then an Oban worker runs them. Rows that fail stay
-behind with their errors, to correct and retry, and a bulk action survives a
-restart or a lost node.
+written in one transaction, then a poller on one of the app's nodes runs them.
+Rows that fail stay behind with their errors, to correct and retry, and a bulk
+action survives a restart or a lost node: another node resumes it.
 
 The verbs are Ash's, with its argument orders. Each takes a list of inputs or a
 sheet, and returns `{:ok, bulk_action}` once the work is queued:
@@ -24,8 +24,9 @@ AshBulkDurable.bulk_destroy(ids, :destroy, resource: Post, scope: scope)
 
 See `AshBulkDurable` for every verb and option.
 
-The library stands on Ash, Oban and Postgres. It has no screens and needs no
-web framework.
+The library stands on Ash and Postgres. It has no screens and needs no web
+framework, and no job queue: the `bulk_actions` table is the only record of
+what needs running.
 
 [`example/`](example/README.md) is a Phoenix app using it, with a `/bulk` page
 to copy into yours.
@@ -92,29 +93,51 @@ config :ash_bulk_durable,
 - `AshBulkDurable.Core.Storage` reads, lists and deletes staged files. The
   library ships no adapter.
 
-Give Oban the queue and the two backstops:
+Add the poller last to each node's supervision tree, after the repo, anything
+that migrates it, and the PubSub and endpoint a run broadcasts through. It then
+stops first, so the runs it lets finish on shutdown can still broadcast:
 
 ```elixir
-config :my_app, Oban,
-  queues: [bulk_actions: 4],
-  plugins: [
-    {Oban.Plugins.Cron,
-     crontab: [
-       {"0 3 * * *", AshBulkDurable.Core.PurgeStaleStaging},
-       {"*/5 * * * *", AshBulkDurable.Core.RescueStuckBulkActions}
-     ]}
-  ]
+children = [
+  MyApp.Repo,
+  {Phoenix.PubSub, name: MyApp.PubSub},
+  MyAppWeb.Endpoint,
+  AshBulkDurable.Core.Poller
+]
 ```
 
-Oban's Lifeline plugin should run too: a job orphaned by a dead node stays
-`:executing` without it.
+It starts each queued bulk action as soon as it is submitted or retried on its
+node, and every few seconds starts any other node's: one queued, or one whose
+run died with its node. It also runs the daily sweep of staged files. Without
+a poller, bulk actions stay queued and a warning is logged once; set
+`warn_without_poller: false` on nodes that leave the work to others, and in
+tests, which run bulk actions with `AshBulkDurable.Core.Worker.run_now/1` or
+`drain/0`.
+
+Its options, each also an `:ash_bulk_durable` config key:
+
+| Option | Default | |
+|---|---|---|
+| `:poll_interval` | 5 seconds | how often it looks for bulk actions to start |
+| `:max_running` | `2` | bulk actions this node runs at once |
+| `:stale_after` | 2 minutes | how long a running bulk action's liveness hint may go unstamped before another run starts it |
+| `:staging_sweep_interval` | a day | between staged-file sweeps; `nil` for none |
+| `:shutdown_grace` | 20 seconds | how long a run still going at shutdown has to finish before it is killed |
+
+A run stamps its bulk action's liveness hint (`alive_at`) as it goes, and at
+least every `:alive_interval` (30 seconds by default). Two runs of one bulk
+action are harmless, since each chunk runs under the bulk action's row lock,
+so the hint only decides when to start one. Each running bulk action takes one
+connection, and up to `:phase1_concurrency` more while it resolves references,
+plus a brief one each `:alive_interval` for its stamp: size the repo's pool for
+`:max_running` times that.
 
 ## Other config
 
 | Key | Default | |
 |---|---|---|
-| `:oban` | `Oban` | the Oban instance's name, for a host that names its own; it must be running |
-| `:queue` | `:bulk_actions` | the Oban queue |
+| `:alive_interval` | 30 seconds | how often a run stamps its liveness hint |
+| `:warn_without_poller` | `true` | warn when a bulk action is queued on a node with no poller |
 | `:default_chunk_size` | `50` | rows a per-row bulk action commits per batch |
 | `:atomic_mode_max_rows` | `10_000` | the cap on an all-or-nothing bulk action |
 | `:phase1_concurrency` | `4` | rows resolved at once |

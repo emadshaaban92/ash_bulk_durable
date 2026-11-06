@@ -6,9 +6,6 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
   test runs outside the sandbox and deletes what it wrote.
   """
   use ExUnit.Case, async: false
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
-
-  import ExUnit.CaptureLog
 
   require Ash.Query
 
@@ -101,21 +98,12 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     assert running.started_at
   end
 
-  defp perform_as_current(bulk_action) do
-    Worker
-    |> build_job(%{"bulk_action_id" => bulk_action.id})
-    |> Map.put(:id, bulk_action.oban_job_id)
-    |> perform_job()
-  end
-
   describe "exclusion" do
     test "a run while another transaction holds the bulk action writes nothing", ctx do
       bulk_action = submit!(ctx, 2)
       locker = lock_elsewhere(bulk_action.id)
 
       assert :busy = Worker.run_now(bulk_action.id)
-      # The Oban job ends `:ok`.
-      assert :ok = perform_as_current(bulk_action)
 
       release(locker)
       assert statuses(bulk_action) == [:resolved, :resolved]
@@ -433,20 +421,14 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
   # Part 1's compare-and-set still catches a write that slips past the lock,
   # here one from a connection that never takes it.
   describe "a row moved on under another run" do
-    test "phase 2, per row: the chunk rolls back with no recovery, and a superseded job cancels",
+    test "phase 2, per row: the chunk rolls back with no recovery, and the run stops",
          ctx do
       bulk_action = submit!(ctx, 2, chunk_size: 2)
       [_r1, r2] = rows(bulk_action)
       at_first_chunk(bulk_action, fn -> apply_elsewhere(r2) end)
       spans = count_chunk_events(bulk_action)
 
-      log =
-        capture_log(fn ->
-          assert {:cancel, :superseded} =
-                   perform_job(Worker, %{"bulk_action_id" => bulk_action.id})
-        end)
-
-      assert log =~ "is superseded"
+      assert {:stopped, :row_moved_on} = Worker.run_now(bulk_action.id)
       assert spans.() == %{start: 1, stop: 0, exception: 1}
 
       # Row 1's target write and flip shared the refused flip's transaction.
@@ -455,16 +437,14 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       assert_no_verdict(bulk_action)
     end
 
-    test "phase 2, all or nothing: the transaction rolls back, no rollback verdict, and the current job snoozes",
+    test "phase 2, all or nothing: the transaction rolls back, no rollback verdict, and the run stops",
          ctx do
       bulk_action = submit!(ctx, 2, mode: :all_or_nothing)
       [_r1, r2] = rows(bulk_action)
       at_first_chunk(bulk_action, fn -> apply_elsewhere(r2) end)
       spans = count_chunk_events(bulk_action)
 
-      log = capture_log(fn -> assert {:snooze, 30} = perform_as_current(bulk_action) end)
-
-      assert log =~ "a stale run wrote a row first"
+      assert {:stopped, :row_moved_on} = Worker.run_now(bulk_action.id)
       assert spans.() == %{start: 1, stop: 0, exception: 1}
       assert created(ctx) == []
       assert [%{status: :resolved}, %{status: :succeeded, record_id: "other"}] = rows(bulk_action)
@@ -518,7 +498,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     fn -> :counters.get(counter, 1) end
   end
 
-  # A run of `job` in a process of its own, as another node's would be.
+  # A run of the bulk action in a process of its own, as another node's would be.
   defp start_run(bulk_action) do
     test_pid = self()
 
@@ -726,12 +706,6 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
     users = "SELECT id FROM users WHERE email LIKE '%' || $1"
     email = "#{tag}@example.test"
-
-    Repo.query!(
-      "DELETE FROM oban_jobs WHERE args->>'bulk_action_id' IN " <>
-        "(SELECT id::text FROM bulk_actions WHERE user_id IN (#{users}))",
-      [email]
-    )
 
     Repo.query!("DELETE FROM bulk_actions WHERE user_id IN (#{users})", [email])
     Repo.query!("DELETE FROM regions WHERE code LIKE $1 || '-%'", [tag])

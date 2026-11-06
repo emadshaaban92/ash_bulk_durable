@@ -64,8 +64,8 @@ Rename the `ExampleWeb` modules, then:
    ```
 
 3. Do the [library's setup](../README.md#setup): the `BulkAction` and `Row`
-   resources, `Owner`, config and Oban. `lib/example/bulk_actions/` has all of
-   them working.
+   resources, `Owner`, config and the poller. `lib/example/bulk_actions/` has
+   all of them working, and `Example.Application` starts the poller.
 
 4. Give `:storage` an adapter that also implements `ExampleWeb.Bulk.Storage`,
    for presigned uploads and the errors sheet. `LocalStorage` here writes to

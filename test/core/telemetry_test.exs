@@ -3,11 +3,9 @@ defmodule AshBulkDurable.Core.TelemetryTest do
   Verifies the telemetry events fire at the documented sites with the
   documented measurement / metadata shapes. A handler attached in the test
   process forwards every event to the mailbox (the worker runs inline under
-  `Worker.run_now/1`, so the emits land here). One test goes through the Oban
-  wrapper on purpose, for the attempt it reports.
+  `Worker.run_now/1`, so the emits land here).
   """
   use AshBulkDurable.DataCase, async: true
-  use Oban.Testing, repo: AshBulkDurable.Test.Repo
 
   alias AshBulkDurable.Core.Worker
   alias AshBulkDurable.Test.BulkAction
@@ -127,15 +125,15 @@ defmodule AshBulkDurable.Core.TelemetryTest do
     end
   end
 
-  describe "through the Oban wrapper" do
-    test "the attempt start reports the job's attempt", %{super_user: user} do
+  describe "an attempt given to the run" do
+    test "the attempt start reports it", %{super_user: user} do
       suffix = System.unique_integer([:positive])
       bulk_action = create_bulk_action!(region_rows(1, suffix), 50, user.id)
       bulk_action_id = bulk_action.id
-      assert :ok = perform_job(Worker, %{"bulk_action_id" => bulk_action_id})
+      assert :ok = Worker.run(bulk_action_id, attempt: 3)
 
       assert_receive {:telemetry, [:ash_bulk_durable, :worker_attempt, :start], _,
-                      %{bulk_action_id: ^bulk_action_id, attempt: 1, pending_rows_at_start: 1}}
+                      %{bulk_action_id: ^bulk_action_id, attempt: 3, pending_rows_at_start: 1}}
     end
   end
 

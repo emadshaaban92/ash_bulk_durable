@@ -31,8 +31,8 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
   unique index on `BulkAction`, so at most one per user) plus those that
   failed within the day.
 
-  In this version the module is still an Oban worker whose `perform/1`
-  runs `sweep/0`, so a host's crontab can schedule it.
+  `AshBulkDurable.Core.Poller` runs `sweep/0` on each node, every
+  `:staging_sweep_interval`.
 
   ## Abandoning (`delete_staging/1`)
 
@@ -43,20 +43,12 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
   (the cancel ran inside a caller's transaction, or storage failed), the
   next sweep reclaims the `:cancelled` bulk action's files.
   """
-  use Oban.Worker, queue: :default, max_attempts: 1
-
   require Ash.Query
 
   alias AshBulkDurable.Core.Storage
 
   @staging_prefix "bulk-staging/"
   @stale_after_seconds 24 * 60 * 60
-
-  @impl Oban.Worker
-  def perform(%Oban.Job{}) do
-    sweep()
-    :ok
-  end
 
   @doc """
   Reads the bulk action with this id and deletes its staging keys (see

@@ -28,7 +28,6 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
      |> add_attribute(:input, AshBulkDurable.Core.StoredTerm, allow_nil?: true, public?: true)
      |> add_attribute(:staged_files, :map, allow_nil?: false, public?: true, default: %{})
      |> add_attribute(:metadata, :map, allow_nil?: false, public?: true, default: %{})
-     |> add_attribute(:oban_job_id, :integer, allow_nil?: true, public?: true)
      |> add_attribute(:status, :atom,
        allow_nil?: false,
        public?: true,
@@ -49,14 +48,16 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
      |> add_attribute(:result, :map, allow_nil?: true, public?: true)
      |> add_attribute(:started_at, :utc_datetime_usec, allow_nil?: true, public?: true)
      |> add_attribute(:finished_at, :utc_datetime_usec, allow_nil?: true, public?: true)
+     |> add_attribute(:alive_at, :utc_datetime_usec, allow_nil?: true, public?: true)
      |> add_create_timestamp(:inserted_at)
      |> add_update_timestamp(:updated_at)
      |> add_one_unresolved_identity()
+     |> add_startable_index()
      |> add_default_accept()
      |> add_defaults()
      |> add_create_action()
-     |> add_set_oban_job_id_action()
      |> add_mark_running_action()
+     |> add_stamp_alive_action()
      |> add_bump_rows_done_action()
      |> add_mark_finished_action()
      |> add_enqueue_retry_action()
@@ -151,6 +152,29 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
     end
   end
 
+  # What the poller reads every few seconds on every node: the few bulk
+  # actions still queued or running, oldest first, out of the whole history.
+  defp add_startable_index(dsl_state) do
+    where = "status IN ('queued', 'running')"
+
+    existing =
+      dsl_state
+      |> Transformer.get_entities([:postgres, :custom_indexes])
+      |> Enum.any?(&(&1.where == where))
+
+    if existing do
+      dsl_state
+    else
+      {:ok, index} =
+        Transformer.build_entity(AshPostgres.DataLayer, [:postgres, :custom_indexes], :index,
+          fields: [:inserted_at, :id],
+          where: where
+        )
+
+      Transformer.add_entity(dsl_state, [:postgres, :custom_indexes], index, type: :append)
+    end
+  end
+
   # ── Actions ──────────────────────────────────────────────────────────────
 
   defp add_default_accept(dsl_state) do
@@ -225,11 +249,6 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
           change: AshBulkDurable.Core.Changes.PersistRows
         )
 
-      enqueue_worker =
-        Transformer.build_entity!(Dsl, [:actions, :create], :change,
-          change: AshBulkDurable.Core.Changes.EnqueueWorker
-        )
-
       {:ok, action} =
         Transformer.build_entity(Dsl, [:actions], :create,
           name: :create,
@@ -238,24 +257,8 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
           arguments: [rows_argument],
           changes: [
             validate_atomic_mode,
-            persist_rows,
-            enqueue_worker
+            persist_rows
           ]
-        )
-
-      Transformer.add_entity(dsl_state, [:actions], action, type: :append)
-    end
-  end
-
-  defp add_set_oban_job_id_action(dsl_state) do
-    if Info.action(dsl_state, :set_oban_job_id) do
-      dsl_state
-    else
-      {:ok, action} =
-        Transformer.build_entity(Dsl, [:actions], :update,
-          name: :set_oban_job_id,
-          accept: [:oban_job_id],
-          require_atomic?: false
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)
@@ -284,6 +287,36 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
           accept: [],
           require_atomic?: false,
           changes: [set_status, set_started_at]
+        )
+
+      Transformer.add_entity(dsl_state, [:actions], action, type: :append)
+    end
+  end
+
+  # The liveness hint (`AshBulkDurable.Core.Liveness`), on the database's
+  # clock, so nodes whose clocks differ agree on how old it is.
+  defp add_stamp_alive_action(dsl_state) do
+    if Info.action(dsl_state, :stamp_alive) do
+      dsl_state
+    else
+      import Ash.Expr
+
+      stamp =
+        Transformer.build_entity!(Dsl, [:actions, :update], :change,
+          change:
+            {Ash.Resource.Change.Atomic,
+             [
+               attribute: :alive_at,
+               expr: expr(fragment("(now() AT TIME ZONE 'utc')")),
+               cast_atomic?: true
+             ]}
+        )
+
+      {:ok, action} =
+        Transformer.build_entity(Dsl, [:actions], :update,
+          name: :stamp_alive,
+          accept: [],
+          changes: [stamp]
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)
@@ -373,18 +406,13 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
           change: {Ash.Resource.Change.SetAttribute, [attribute: :status, value: :running]}
         )
 
-      enqueue_worker =
-        Transformer.build_entity!(Dsl, [:actions, :update], :change,
-          change: AshBulkDurable.Core.Changes.EnqueueWorker
-        )
-
       {:ok, action} =
         Transformer.build_entity(Dsl, [:actions], :update,
           name: :enqueue_retry,
           accept: [],
           require_atomic?: false,
           arguments: [input_argument],
-          changes: [reopen, set_status, enqueue_worker]
+          changes: [reopen, set_status]
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)

@@ -10,23 +10,22 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
     * a reconnecting user re-renders the bulk action from persisted DB state;
     * a crashed worker resumes from the next pending row with no
       no row committed twice;
-    * the one-unresolved rule blocks a second submit (and a second job);
-    * abandoning a `:completed_with_errors` bulk action enqueues the eager
-      staging purge.
+    * the one-unresolved rule blocks a second submit;
+    * abandoning a `:completed_with_errors` bulk action cancels it, deleting
+      its staged files itself.
 
   Nothing here is global, so it runs `async: true`: the `start_async` submit
   and the phase-1 `Task.async_stream` children reach the test's sandbox
-  connection through `$callers`, the drain bulk actions in the test process, and each
-  test's `oban_jobs` rows are confined to its own sandbox transaction.
+  connection through `$callers`, and the drain runs bulk actions in the test
+  process.
   """
   use ExampleWeb.ConnCase, async: true
-  use Oban.Testing, repo: Example.Repo
 
   import Phoenix.LiveViewTest
 
   require Ash.Query
 
-  alias AshBulkDurable.Core.{Worker, PurgeStaleStaging}
+  alias AshBulkDurable.Core.Worker
   alias Example.BulkActions.{BulkAction, Row}
   alias Example.Test.Region
   alias NimbleCSV.RFC4180, as: CSV
@@ -144,7 +143,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
   # ── Submit happy path (drives the real worker) ────────────────────────────
 
   describe "submit happy path" do
-    test "enqueues a job, drains it to completion, renders :completed", %{
+    test "queues the bulk action, drains it to completion, renders :completed", %{
       conn: conn,
       super_user: user
     } do
@@ -152,9 +151,8 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
       codes = Enum.map(rows, & &1.code)
       {view, bulk_action} = submit_bulk_action(conn, user, rows)
       assert bulk_action.status == :queued
-      assert_enqueued(worker: Worker, args: %{bulk_action_id: bulk_action.id})
 
-      # One Oban job (the bulk action worker) drains successfully.
+      # The one bulk action drains successfully.
       assert 1 = drain()
 
       fresh = reload(bulk_action)
@@ -441,7 +439,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
 
       Ash.update!(bulk_action, %{}, action: :mark_running, authorize?: false)
 
-      # The retry (the job the :create enqueued) drains and resumes at row 3.
+      # The next run drains and resumes at row 3.
       drain()
 
       fresh = reload(bulk_action)
@@ -471,28 +469,29 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
   # ── One-in-flight enforcement ──────────────────────────────────────
 
   describe "second submit while a bulk action is in flight" do
-    test "surfaces the flash and enqueues no second job", %{conn: conn, super_user: user} do
+    test "surfaces the flash and queues no second bulk action", %{conn: conn, super_user: user} do
       {:ok, view, _html} = conn |> login_as(user) |> live(~p"/bulk")
       view |> ready_to_submit()
 
       # A competing bulk action appears after this LV mounted (so mount didn't attach
       # it); the submit's create then hits the partial unique index.
       create_bulk_action!(user.id)
-      jobs_before = Example.Repo.aggregate(Oban.Job, :count, :id)
 
       view |> form("#main_form") |> render_submit()
       render_async(view, 2000)
 
       assert render(view) =~ "You have an unfinished bulk action."
       refute render(view) =~ "bulk-action-panel"
-      assert Example.Repo.aggregate(Oban.Job, :count, :id) == jobs_before
+
+      assert [_one] =
+               Ash.read!(BulkAction, authorize?: false) |> Enum.filter(&(&1.user_id == user.id))
     end
   end
 
   # ── :completed_with_errors → Abandon ───────────────────────
 
   describe "abandon failed rows" do
-    test "shows the three controls, then cancels without enqueueing a staging purge", %{
+    test "shows the three controls, then cancels", %{
       conn: conn,
       super_user: user
     } do
@@ -518,8 +517,6 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
 
       assert_patch(view, "/bulk")
       assert reload(bulk_action).status == :cancelled
-      # The cancel deletes its staged files itself; no Oban job does it.
-      refute_enqueued(worker: PurgeStaleStaging)
     end
   end
 

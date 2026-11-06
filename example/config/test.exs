@@ -40,9 +40,10 @@ config :phoenix_live_view,
 config :phoenix,
   sort_verified_routes_query_params: true
 
-config :example, Oban, testing: :manual
+# Tests run bulk actions with `Worker.run_now/1` and `Worker.drain/0`.
+config :example, poller?: false
 
-config :ash_bulk_durable, phase1_concurrency: 1
+config :ash_bulk_durable, phase1_concurrency: 1, warn_without_poller: false
 
 config :ash, warn_on_transaction_hooks?: false
 

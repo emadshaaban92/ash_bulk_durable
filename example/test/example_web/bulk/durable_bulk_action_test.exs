@@ -8,8 +8,8 @@ defmodule ExampleWeb.Bulk.DurableBulkActionTest do
     * A second submit while the user already has an in-flight bulk action surfaces
       the one-in-flight flash.
     * Mount reattaches a logged-in user to their in-flight bulk action.
-    * Mount flips a bulk action whose Oban job is in a terminal state to `:failed`
-      (the stuck bulk action rescue), freeing the one-in-flight slot.
+    * Mount leaves a `:queued` or `:running` bulk action as it is: a poller
+      runs it, or resumes it once its node died.
     * `dismiss_bulk_action` and `abandon_failed_rows` behave as designed.
 
   Nothing here is global, so it runs `async: true`: the LiveView carries the
@@ -18,7 +18,6 @@ defmodule ExampleWeb.Bulk.DurableBulkActionTest do
   """
   use ExampleWeb.ConnCase, async: true
 
-  import Ecto.Query
   import Phoenix.LiveViewTest
 
   alias Example.BulkActions.BulkAction
@@ -80,16 +79,6 @@ defmodule ExampleWeb.Bulk.DurableBulkActionTest do
     Ash.create!(BulkAction, attrs, action: :create, authorize?: false)
   end
 
-  defp set_oban_job_state(job_id, state) do
-    {1, _} =
-      Example.Repo.update_all(
-        from(j in Oban.Job, where: j.id == ^job_id),
-        set: [state: state]
-      )
-
-    :ok
-  end
-
   # Drive the LV's form to a submittable state: pick Region/create and upload
   # the CSV so `uploaded_file` is populated and the fields auto-map.
   defp ready_to_submit(view) do
@@ -131,7 +120,6 @@ defmodule ExampleWeb.Bulk.DurableBulkActionTest do
       assert bulk_action.total_rows == 3
       assert bulk_action.mode == :per_row
       assert bulk_action.chunk_size == 50
-      assert is_integer(bulk_action.oban_job_id)
 
       assert_patch(view, "/bulk?bulk_action=#{bulk_action.id}")
       assert render(view) =~ "bulk-action-panel"
@@ -236,9 +224,8 @@ defmodule ExampleWeb.Bulk.DurableBulkActionTest do
       super_user: user
     } do
       bulk_action = create_bulk_action!(user.id)
-      # The worker finished legitimately — its Oban job is :completed — and
-      # left failed rows behind. Closing the tab must not strand the bulk action.
-      set_oban_job_state(bulk_action.oban_job_id, "completed")
+      # The worker finished legitimately and left failed rows behind.
+      # Closing the tab must not strand the bulk action.
 
       Ash.update!(bulk_action, %{result: :completed_with_errors},
         action: :mark_finished,
@@ -252,45 +239,28 @@ defmodule ExampleWeb.Bulk.DurableBulkActionTest do
       assert html =~ "Completed with errors"
       assert html =~ "Abandon failed rows"
 
-      # The mount-time stuck bulk action rescue must NOT treat the parked bulk action as
-      # worker-lost just because its job is terminal — the worker finished.
       assert reload(bulk_action).status == :completed_with_errors
     end
   end
 
-  # ── Stuck bulk action rescue ─────────────────────────────────────────────
+  # ── A bulk action whose node died ──────────────────────────────────────
 
-  describe "mount with a provably-dead worker" do
-    test "flips a discarded-job bulk action to :failed and frees the slot", %{
+  describe "mount with a bulk action whose node died" do
+    test "leaves it running for a poller to resume, and shows it", %{
       conn: conn,
       super_user: user
     } do
       bulk_action = create_bulk_action!(user.id)
-      set_oban_job_state(bulk_action.oban_job_id, "discarded")
+      Ash.update!(bulk_action, %{}, action: :mark_running, authorize?: false)
 
       {:ok, view, _html} = conn |> login_as(user) |> live(~p"/bulk")
 
-      assert reload(bulk_action).status == :failed
-      html = render(view)
-      assert html =~ "Failed"
-      assert html =~ "Dismiss"
-
-      # Dismissing a terminal bulk action returns the user to the empty form.
-      view |> element("#bulk-action-panel button", "Dismiss") |> render_click()
-      assert_patch(view, "/bulk")
-      refute render(view) =~ "bulk-action-panel"
-
-      # Slot is free: fetch_for_user_unresolved no longer finds a bulk action.
-      assert is_nil(unresolved_bulk_action(user.id))
+      assert reload(bulk_action).status == :running
+      assert render(view) =~ "bulk-action-panel"
     end
 
-    test "leaves a bulk action with a live (available) job untouched", %{
-      conn: conn,
-      super_user: user
-    } do
+    test "leaves a queued bulk action untouched", %{conn: conn, super_user: user} do
       bulk_action = create_bulk_action!(user.id)
-      # Freshly enqueued jobs are :available in Oban's manual testing mode —
-      # the rescue must not touch them.
       {:ok, _view, _html} = conn |> login_as(user) |> live(~p"/bulk")
 
       assert reload(bulk_action).status == :queued
