@@ -23,6 +23,10 @@ defmodule AshBulkDurable.Sheet.FieldHandlers.Scalar do
 
     * `{:array, _}` types: pipe-delimited CSV cells are split on `|`,
       trimmed, with empty entries dropped, before being handed to Ash.
+    * `:boolean` types (and arrays of them): `true` and `false` in any case
+      are lowercased, as Ash casts only the lowercase words. Excel's CSV export
+      writes `TRUE` and `FALSE`, and an XLSX read through `in2csv` gives `True`
+      and `False`.
     * Anything else: the raw value is forwarded as-is — Ash casts it.
 
   No companion upload, no per-submit lifecycle.
@@ -67,7 +71,7 @@ defmodule AshBulkDurable.Sheet.FieldHandlers.Scalar do
 
   @impl AshBulkDurable.Sheet.FieldHandler
   def input_value(%AshBulkDurable.Sheet.Field{field: field}, raw_value, _ctx),
-    do: {:ok, maybe_split_array(field.type, raw_value)}
+    do: {:ok, field.type |> maybe_split_array(raw_value) |> normalize_booleans(field.type)}
 
   defp maybe_split_array({:array, _inner}, value) when is_binary(value) do
     value
@@ -77,6 +81,21 @@ defmodule AshBulkDurable.Sheet.FieldHandlers.Scalar do
   end
 
   defp maybe_split_array(_type, value), do: value
+
+  defp normalize_booleans(values, {:array, inner}) when is_list(values),
+    do: Enum.map(values, &normalize_boolean(&1, inner))
+
+  defp normalize_booleans(value, type), do: normalize_boolean(value, type)
+
+  defp normalize_boolean(value, type) when is_binary(value) do
+    bool = String.downcase(value)
+
+    if bool in ["true", "false"] and boolean?(type), do: bool, else: value
+  end
+
+  defp normalize_boolean(value, _type), do: value
+
+  defp boolean?(type), do: type |> unwrap_new_type() |> Ash.Type.get_type() == Ash.Type.Boolean
 
   defp scalar_type?(type) do
     case type |> unwrap_new_type() |> Ash.Type.get_type() do
