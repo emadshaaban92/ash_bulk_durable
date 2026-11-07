@@ -586,6 +586,41 @@ defmodule AshBulkDurable.Core.PollerTest do
       assert %{status: :completed, alive_at: committed} = reload(bulk_action)
       assert DateTime.diff(committed, started, :millisecond) >= 600
     end
+
+    # Two rows in one chunk, the second taken, so the chunk rolls back and is
+    # recovered: row 1 commits on its own, then row 2 fails and is marked.
+    # Row by row runs row 1 alone (`write_row_alone`); halving at one row
+    # tries it as a half (`write_together`). Either way row 2 is then marked
+    # (`mark_if_resolved`).
+    for {recovery, min} <- [row_by_row: 8, halving: 1] do
+      test "stays fresh while a failed chunk is recovered, #{recovery}", ctx do
+        put_config(:halving_min_rows, unquote(min))
+        bulk_action = submit!(ctx, 2, chunk_size: 2)
+        taken!(ctx, 2)
+        test_pid = self()
+
+        on_row_write(ctx, fn i ->
+          send(
+            test_pid,
+            {:write, i, startable?(bulk_action.id, 250), committed_alive_at(bulk_action.id)}
+          )
+
+          Process.sleep(300)
+        end)
+
+        assert :ok = Worker.run_now(bulk_action.id)
+        assert %{status: :completed_with_errors, alive_at: last} = reload(bulk_action)
+
+        # The chunk, then the recovery: row 1, then row 2.
+        assert_received {:write, 1, _, _}
+        assert_received {:write, 2, _, _}
+        assert_received {:write, 1, _, _}
+        # Row 1's own commit stamped: the chunk that rolled back did not.
+        assert_received {:write, 2, false, recovered}
+        # And marking row 2 failed stamped again, after row 2 ran.
+        assert DateTime.diff(last, recovered, :millisecond) >= 300
+      end
+    end
   end
 
   describe "the run's own ticker" do
