@@ -19,7 +19,8 @@ defmodule AshBulkDurable.Sheet.ExcelReader.Calamine do
     max_cells = Keyword.fetch!(opts, :max_cells)
 
     with {:ok, name} <- sheet_name(path, sheet, max_cells),
-         {:ok, rows} <- xlsx(Spreadsheet.parse(path, sheet: name, max_cells: max_cells)) do
+         {:ok, rows} <-
+           xlsx(Spreadsheet.parse(path, sheet: name, max_cells: max_cells), max_cells) do
       {:ok,
        rows
        |> Enum.reject(fn row -> Enum.all?(row, &is_nil/1) end)
@@ -27,14 +28,29 @@ defmodule AshBulkDurable.Sheet.ExcelReader.Calamine do
     end
   end
 
-  defp xlsx({:ok, _value} = ok), do: ok
-  defp xlsx({:error, reason}), do: {:error, {:xlsx, reason}}
+  # `spreadsheet` reports going over `:max_cells` only in its message, each
+  # kind ending "above the :max_cells limit of N" or "... cells left of the
+  # :max_cells limit of N ...".
+  defp xlsx(result, max_cells) do
+    case result do
+      {:ok, _value} = ok ->
+        ok
+
+      {:error, reason} ->
+        if reason =~ ":max_cells limit of",
+          do: {:error, {:too_many_cells, max_cells}},
+          else: {:error, {:xlsx, reason}}
+    end
+  end
 
   # An index counts only the visible sheets, so the default is never a
   # hidden lookup sheet; a name finds a hidden sheet too.
   defp sheet_name(path, sheet, max_cells) do
     with {:ok, names} <-
-           xlsx(Spreadsheet.sheet_names(path, hidden: is_binary(sheet), max_cells: max_cells)) do
+           xlsx(
+             Spreadsheet.sheet_names(path, hidden: is_binary(sheet), max_cells: max_cells),
+             max_cells
+           ) do
       cond do
         is_integer(sheet) and sheet >= 0 and sheet < length(names) ->
           {:ok, Enum.at(names, sheet)}

@@ -38,11 +38,15 @@ defmodule AshBulkDurable.Sheet.ExcelReader do
   @doc """
   Reads the sheet `opts` names from the XLSX at `path`, an existing file.
   Returns its rows, the header row first, each a list of cells as above.
-  Returns `{:error, {:unknown_sheet, sheet}}` for a sheet the file does not
-  have, and `{:error, {:xlsx, reason}}` for a file it cannot read or a sheet
-  over `:max_cells`. It must not raise on a malformed file.
+  Returns `{:error, {:too_many_cells, max_cells}}` for a sheet over
+  `:max_cells`, `{:error, {:unknown_sheet, sheet}}` for a sheet the file
+  does not have, and `{:error, {:xlsx, reason}}` for a file it cannot read.
+  It must not raise on a malformed file.
   """
   @callback read(path :: Path.t(), opts()) ::
               {:ok, [[String.t()]]}
-              | {:error, {:unknown_sheet, String.t() | non_neg_integer()} | {:xlsx, term()}}
+              | {:error,
+                 {:too_many_cells, pos_integer()}
+                 | {:unknown_sheet, String.t() | non_neg_integer()}
+                 | {:xlsx, term()}}
 end

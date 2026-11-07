@@ -71,9 +71,10 @@ defmodule AshBulkDurable.Sheet do
   cell as the string a CSV of the same sheet would hold. `:sheet` names the
   sheet to read, by name (hidden or not) or 0-based index among the visible
   sheets; the first visible sheet by default. `:max_cells` caps the cells
-  the reader builds, #{@max_cells} by default. A file the reader cannot
-  read, or a sheet over the cap, returns `{:error, {:xlsx, reason}}`, and a
-  sheet the file lacks `{:error, {:unknown_sheet, sheet}}`.
+  the reader builds, #{@max_cells} by default. A sheet over the cap returns
+  `{:error, {:too_many_cells, max_cells}}`, a sheet the file lacks
+  `{:error, {:unknown_sheet, sheet}}`, and a file the reader cannot read
+  `{:error, {:xlsx, reason}}`.
   """
   def read(path, opts \\ []) do
     case Keyword.get_lazy(opts, :type, fn -> type(path) end) do
@@ -100,18 +101,22 @@ defmodule AshBulkDurable.Sheet do
   end
 
   defp read_xlsx(path, opts) do
-    if not File.regular?(path),
-      do: raise(File.Error, reason: :enoent, action: "read file", path: path)
-
     reader = Core.config(:excel_reader, ExcelReader.Calamine)
 
-    with {:ok, rows} <-
+    with :ok <- regular(path),
+         {:ok, rows} <-
            reader.read(path,
              sheet: Keyword.get(opts, :sheet, 0),
              max_cells: Keyword.get(opts, :max_cells, @max_cells)
            ) do
       {:ok, build(rows)}
     end
+  end
+
+  defp regular(path) do
+    if File.regular?(path),
+      do: :ok,
+      else: {:error, %File.Error{reason: :enoent, action: "read file", path: path}}
   end
 
   defp build([]), do: %__MODULE__{}

@@ -123,8 +123,8 @@
   list no longer gets a Python warning in its header row. `read_sheet/2`
   takes `:sheet`, a name or 0-based index among the visible sheets, and
   `:max_cells`, the rows × columns it reads at most (5,000,000 by default),
-  and returns `{:error, {:xlsx, reason}}` or `{:error, {:unknown_sheet,
-  sheet}}`. The reader is an `AshBulkDurable.Sheet.ExcelReader` behaviour,
+  and returns `{:error, {:too_many_cells, max_cells}}`, `{:error,
+  {:unknown_sheet, sheet}}` or `{:error, {:xlsx, reason}}`. The reader is an `AshBulkDurable.Sheet.ExcelReader` behaviour,
   chosen with `config :ash_bulk_durable, excel_reader: ...`;
   `AshBulkDurable.Sheet.ExcelReader.Calamine` is the default and, for now,
   the only one.

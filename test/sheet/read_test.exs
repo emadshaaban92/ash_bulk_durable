@@ -158,8 +158,7 @@ defmodule AshBulkDurable.Sheet.ReadTest do
   # calamine builds the whole rectangle from A1, so one far cell costs its
   # row × column count, whatever the file's size.
   test ":max_cells caps the rows × columns read", %{path: path} do
-    assert {:error, {:xlsx, reason}} = Sheet.read(path, max_cells: 50)
-    assert reason =~ "max_cells"
+    assert {:error, {:too_many_cells, 50}} = Sheet.read(path, max_cells: 50)
     assert {:ok, %Sheet{}} = Sheet.read(path, max_cells: 100)
   end
 
