@@ -63,12 +63,25 @@ defmodule AshBulkDurable.Sheet do
   `:type` (`:csv` or `:xlsx`) names it, as an upload's temporary path has
   none. A UTF-8 byte-order mark is stripped, so a file Excel saved reads
   cleanly. Returns `{:ok, %AshBulkDurable.Sheet{}}`, or `{:error, reason}`.
+
+  An XLSX's cells are read as the strings a CSV of the same sheet would
+  hold: a number as the digits the file stores (no float rounding or
+  exponent), a percentage as the number shown (`15` for 15%), a boolean as
+  `true`/`false`, a date, date-time or time as ISO 8601, a formula as its
+  cached value. `:sheet` names the sheet to read, by
+  name or 0-based index; the first sheet by default.
   """
   def read(path, opts \\ []) do
     case Keyword.get_lazy(opts, :type, fn -> type(path) end) do
-      :csv -> {:ok, path |> File.read!() |> parse()}
-      :xlsx -> read_xlsx(path)
-      other -> {:error, {:unknown_type, other}}
+      :csv ->
+        {:ok,
+         path |> File.read!() |> strip_bom() |> CSV.parse_string(skip_headers: false) |> build()}
+
+      :xlsx ->
+        read_xlsx(path, Keyword.get(opts, :sheet, 0))
+
+      other ->
+        {:error, {:unknown_type, other}}
     end
   rescue
     error in [File.Error, NimbleCSV.ParseError] -> {:error, error}
@@ -82,33 +95,75 @@ defmodule AshBulkDurable.Sheet do
     end
   end
 
-  # `in2csv` (csvkit) converts the first sheet; the CSV it prints parses as
-  # any other.
-  defp read_xlsx(path) do
-    case System.cmd("in2csv", ["-I", "-u", "1", "-f", "xlsx", path], stderr_to_stdout: true) do
-      {csv, 0} -> {:ok, parse(csv)}
-      {output, status} -> {:error, {:in2csv, status, output}}
+  defp read_xlsx(path, sheet) do
+    with {:ok, package} <- open_xlsx(path),
+         {:ok, name} <- sheet_name(package, sheet),
+         {:ok, rows} <- XlsxReader.sheet(package, name, number_type: Decimal) do
+      base_date = package.workbook.base_date
+      {:ok, rows |> Enum.map(fn row -> Enum.map(row, &cell(&1, base_date)) end) |> build()}
+    else
+      {:error, {:unknown_sheet, _sheet}} = error -> error
+      {:error, reason} -> {:error, {:xlsx, reason}}
     end
   end
 
-  defp parse(content) do
-    case content |> strip_bom() |> CSV.parse_string(skip_headers: false) do
-      [] ->
-        %__MODULE__{}
+  # xlsx_reader raises on some malformed archives instead of returning an
+  # error (a `FunctionClauseError` on the error shape OTP 29's `:zip` gives
+  # for a file that is not a zip), so a raise here is an unreadable file too.
+  defp open_xlsx(path) do
+    if File.regular?(path),
+      do: XlsxReader.open(path),
+      else: raise(File.Error, reason: :enoent, action: "read file", path: path)
+  rescue
+    error in [File.Error] -> reraise error, __STACKTRACE__
+    error -> {:error, error}
+  end
 
-      [headers | rows] ->
-        %__MODULE__{
-          headers: headers,
-          rows:
-            rows
-            |> Enum.map(
-              &(headers
-                |> Enum.zip(&1)
-                |> Map.new(fn {k, v} -> {k, String.trim(v)} end))
-            )
-            |> Enum.reject(fn row -> Enum.all?(row, fn {_header, cell} -> cell == "" end) end)
-        }
+  defp sheet_name(package, sheet) do
+    names = XlsxReader.sheet_names(package)
+
+    cond do
+      is_integer(sheet) and sheet >= 0 and sheet < length(names) -> {:ok, Enum.at(names, sheet)}
+      is_binary(sheet) and sheet in names -> {:ok, sheet}
+      true -> {:error, {:unknown_sheet, sheet}}
     end
+  end
+
+  # A cell as a CSV of the sheet would hold it. Numbers come as `Decimal`
+  # (`number_type: Decimal`), parsed from the text the file stores, so they
+  # print without float rounding or an exponent. A percentage comes
+  # multiplied by 100, as `15.00` for 15%, which normalising prints as `15`.
+  # A time is a date-time on the workbook's base date.
+  defp cell(value, _base_date) when is_binary(value), do: value
+  defp cell(true, _base_date), do: "true"
+  defp cell(false, _base_date), do: "false"
+  defp cell(nil, _base_date), do: ""
+
+  defp cell(%Decimal{} = number, _base_date),
+    do: number |> Decimal.normalize() |> Decimal.to_string(:normal)
+
+  defp cell(%Date{} = date, _base_date), do: Date.to_iso8601(date)
+
+  defp cell(%NaiveDateTime{} = datetime, base_date) do
+    if NaiveDateTime.to_date(datetime) == base_date,
+      do: datetime |> NaiveDateTime.to_time() |> Time.to_iso8601(),
+      else: NaiveDateTime.to_iso8601(datetime)
+  end
+
+  defp build([]), do: %__MODULE__{}
+
+  defp build([headers | rows]) do
+    %__MODULE__{
+      headers: headers,
+      rows:
+        rows
+        |> Enum.map(fn row ->
+          headers
+          |> Enum.zip(Stream.concat(row, Stream.repeatedly(fn -> "" end)))
+          |> Map.new(fn {k, v} -> {k, String.trim(v)} end)
+        end)
+        |> Enum.reject(fn row -> Enum.all?(row, fn {_header, cell} -> cell == "" end) end)
+    }
   end
 
   defp strip_bom(<<0xEF, 0xBB, 0xBF, rest::binary>>), do: rest
