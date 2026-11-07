@@ -279,10 +279,25 @@ defmodule AshBulkDurable.Core.PollerTest do
       assert_receive {:chunk_started, run}, 2_000
       assert %{stalled_starts: 0} = reload(bulk_action)
 
-      # Queued behind the run's chunk, another connection takes the lock the
-      # moment the killed run lets go, and keeps it past the poller's wait.
-      locker = lock_elsewhere(bulk_action.id, wait?: true)
-      assert eventually(&waiting_for_lock?/0)
+      # Once the poller has killed the run, and before it asks for the lock to
+      # mark it, another connection takes the lock, waiting for the killed
+      # run's connection to let go, and keeps it past the poller's wait.
+      # Queued behind the run instead, it could lose the lock to the mark:
+      # once the run's transaction aborts, a waiter that hasn't yet woken
+      # holds nothing, and the mark's fresh lock query can take the row first.
+      locker = lock_elsewhere(bulk_action.id, on_request?: true)
+
+      attach([:ash_bulk_durable, :test, :repo, :query], fn metadata ->
+        if String.starts_with?(metadata.query, "SET LOCAL lock_timeout") do
+          send(locker, {:lock, self()})
+
+          receive do
+            :locked -> :ok
+          after
+            2_000 -> :ok
+          end
+        end
+      end)
 
       monitor = Process.monitor(run)
       log = capture_log(fn -> stop_supervised!(Poller) end)
@@ -744,18 +759,28 @@ defmodule AshBulkDurable.Core.PollerTest do
   end
 
   # Holds the bulk action's row lock from a connection of its own until told.
-  # With `wait?: true` it waits for the lock rather than for having it.
+  # With `on_request?: true` it asks for the lock only once sent
+  # `{:lock, from}`, waits for it, and tells `from` too once it has it.
   defp lock_elsewhere(id, opts \\ []) do
     test_pid = self()
 
     pid =
       spawn(fn ->
+        notify =
+          if opts[:on_request?] do
+            receive do
+              {:lock, from} -> [test_pid, from]
+            end
+          else
+            [test_pid]
+          end
+
         Repo.transaction(fn ->
           Repo.query!("SELECT 1 FROM bulk_actions WHERE id = $1 FOR NO KEY UPDATE", [
             Ecto.UUID.dump!(id)
           ])
 
-          send(test_pid, :locked)
+          Enum.each(notify, &send(&1, :locked))
 
           receive do
             :release -> :ok
@@ -767,7 +792,7 @@ defmodule AshBulkDurable.Core.PollerTest do
         send(test_pid, :released)
       end)
 
-    unless opts[:wait?], do: assert_receive(:locked, 2_000)
+    unless opts[:on_request?], do: assert_receive(:locked, 2_000)
     pid
   end
 

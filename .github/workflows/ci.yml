@@ -184,6 +184,11 @@ jobs:
         if: ${{ !cancelled() }}
         run: mix hex.audit
 
+      # The test resources' snapshots and migrations, in priv/test_repo.
+      - name: Migrations are up to date
+        if: ${{ !cancelled() }}
+        run: mix check.migrations
+
   # The screens, on a real router and endpoint, using the library as an app does.
   example-test:
     name: Test (example app)
