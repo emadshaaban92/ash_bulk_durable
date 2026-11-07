@@ -114,6 +114,29 @@ defmodule AshBulkDurable.Sheet.FieldHandlers.ScalarTest do
 
       assert Scalar.input_value(wrap(arg), "a|b", empty_ctx()) == {:ok, "a|b"}
     end
+
+    # Excel's CSV export writes TRUE and FALSE, in2csv gives True and False;
+    # Ash casts only the lowercase words.
+    test "lowercases true and false for :boolean types, arrays of them too" do
+      arg = %Ash.Resource.Actions.Argument{name: :open, type: :boolean}
+
+      for {cell, value} <- [{"True", "true"}, {"FALSE", "false"}, {"true", "true"}] do
+        assert Scalar.input_value(wrap(arg), cell, empty_ctx()) == {:ok, value}
+      end
+
+      assert Scalar.input_value(wrap(arg), "yes", empty_ctx()) == {:ok, "yes"}
+
+      flags = %Ash.Resource.Actions.Argument{name: :flags, type: {:array, Ash.Type.Boolean}}
+
+      assert Scalar.input_value(wrap(flags), "TRUE|False", empty_ctx()) ==
+               {:ok, ["true", "false"]}
+    end
+
+    test "leaves a true or false cell of any other type as it is" do
+      arg = %Ash.Resource.Actions.Argument{name: :foo, type: :string}
+
+      assert Scalar.input_value(wrap(arg), "True", empty_ctx()) == {:ok, "True"}
+    end
   end
 
   describe "default lifecycle (via use AshBulkDurable.Sheet.FieldHandler)" do

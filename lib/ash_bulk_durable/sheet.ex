@@ -83,11 +83,20 @@ defmodule AshBulkDurable.Sheet do
   end
 
   # `in2csv` (csvkit) converts the first sheet; the CSV it prints parses as
-  # any other.
+  # any other. Its stderr goes to a file of its own, never into the CSV: a
+  # workbook can make openpyxl warn (on a dropdown, say) and still convert,
+  # and the warning would read as the header row. It is the error on a
+  # failure, as is the shell's when `in2csv` is not installed.
   defp read_xlsx(path) do
-    case System.cmd("in2csv", ["-I", "-u", "1", "-f", "xlsx", path], stderr_to_stdout: true) do
-      {csv, 0} -> {:ok, parse(csv)}
-      {output, status} -> {:error, {:in2csv, status, output}}
+    stderr = Path.join(System.tmp_dir!(), "in2csv-#{System.unique_integer([:positive])}.err")
+
+    try do
+      case System.cmd("sh", ["-c", ~s(in2csv -I -u 1 -f xlsx "$1" 2>"$2"), "sh", path, stderr]) do
+        {csv, 0} -> {:ok, parse(csv)}
+        {_csv, status} -> {:error, {:in2csv, status, File.read!(stderr)}}
+      end
+    after
+      File.rm(stderr)
     end
   end
 
