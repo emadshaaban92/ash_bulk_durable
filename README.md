@@ -144,6 +144,7 @@ repo's pool for `:max_running` times `:phase1_concurrency + 2`.
 | `:alive_interval` | 30 seconds | how often a run stamps its liveness hint |
 | `:max_stalled_starts` | `3` | starts in a row without progress before a bulk action's rows run alone |
 | `:max_row_attempts` | `2` | runs that may die on a row run alone before it fails as crashed |
+| `:max_setup_failures` | `3` | starts that raise before reaching a row, with no progress between, before a bulk action fails |
 | `:warn_without_poller` | `true` | warn when a bulk action is queued on a node with no poller |
 | `:default_chunk_size` | `50` | rows a per-row bulk action commits per batch |
 | `:halving_min_rows` | `8` | a failed chunk's rows are halved down to sets this small, then run row by row; `0` runs every row alone |

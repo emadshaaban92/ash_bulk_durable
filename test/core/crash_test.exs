@@ -68,6 +68,28 @@ defmodule AshBulkDurable.Core.CrashTest do
     def finish(nil), do: :ok
   end
 
+  defmodule RaisingOwner do
+    @moduledoc "The test owner, but its scopes can't be rebuilt: the user is gone."
+    @behaviour AshBulkDurable.Core.Owner
+
+    @impl true
+    def worker_key(scope), do: AshBulkDurable.Test.Owner.worker_key(scope)
+
+    @impl true
+    def scope_from_worker_key(_key, _tenant), do: raise("the user is gone")
+  end
+
+  defmodule KillingOwner do
+    @moduledoc "The test owner, but rebuilding a scope kills the run."
+    @behaviour AshBulkDurable.Core.Owner
+
+    @impl true
+    def worker_key(scope), do: AshBulkDurable.Test.Owner.worker_key(scope)
+
+    @impl true
+    def scope_from_worker_key(_key, _tenant), do: Process.exit(self(), :kill)
+  end
+
   alias AshBulkDurable.Core.{CrashedRowError, Retry, Worker}
   alias AshBulkDurable.Test.{BulkAction, Region, Repo, Row, Scope, User}
 
@@ -304,6 +326,116 @@ defmodule AshBulkDurable.Core.CrashTest do
     end
   end
 
+  describe "a run that raises before its first row" do
+    # The owner's user deleted, a storage that raises: every start raises
+    # again, moving no row, so stalled starts alone would never end it.
+    for mode <- [:per_row, :all_or_nothing] do
+      test "#{mode}: counted, and failed on the third, the owner free again", ctx do
+        bulk_action = submit!(ctx, 2, mode: unquote(mode))
+        owner(RaisingOwner)
+
+        capture_log(fn ->
+          for failures <- 1..2 do
+            assert {%RuntimeError{message: "the user is gone"}, _} = attempt(bulk_action)
+
+            assert %{status: :running, setup_failures: ^failures, result: nil} =
+                     reload(bulk_action)
+          end
+
+          assert {%RuntimeError{}, _} = attempt(bulk_action)
+        end)
+
+        assert %{
+                 status: :failed,
+                 setup_failures: 3,
+                 result: %{"reason" => "setup_error", "message" => "the user is gone"}
+               } = failed = reload(bulk_action)
+
+        assert statuses(bulk_action) == [:resolved, :resolved]
+        assert created(ctx) == []
+
+        # A failed start is over: it isn't started again.
+        assert :ok = Worker.run_now(bulk_action.id)
+
+        owner(AshBulkDurable.Test.Owner)
+
+        # The verdict frees the owner to submit again...
+        other = submit!(ctx, 1)
+        assert %{status: :queued} = other
+        Repo.query!("DELETE FROM bulk_actions WHERE id = $1", [Ecto.UUID.dump!(other.id)])
+
+        # ...and a retry, once the cause is fixed, starts the count again.
+        assert {:ok, _retried} = AshBulkDurable.retry(failed, scope: ctx.scope)
+        assert %{setup_failures: 0} = reload(bulk_action)
+        assert :ok = Worker.run_now(bulk_action.id)
+        assert %{status: :completed} = reload(bulk_action)
+      end
+    end
+
+    test "a start whose score rose sets the count back to 0", ctx do
+      bulk_action = submit!(ctx, 2)
+      # Two failed setups, the last start scoring no row moved on; since then
+      # both rows resolved.
+      set!(bulk_action, "status = 'running', progress_at_start = 0, setup_failures = 2")
+      owner(RaisingOwner)
+
+      capture_log(fn -> assert {%RuntimeError{}, _} = attempt(bulk_action) end)
+
+      assert %{status: :running, progress_at_start: 2, setup_failures: 1} = reload(bulk_action)
+    end
+
+    test "a kill is never counted, however many", ctx do
+      bulk_action = submit!(ctx, 2)
+      owner(KillingOwner)
+
+      for _start <- 1..5, do: assert(:killed = attempt(bulk_action))
+
+      assert %{status: :running, setup_failures: 0} = reload(bulk_action)
+      assert statuses(bulk_action) == [:resolved, :resolved]
+    end
+
+    test "one that finds the lock held at its count counts nothing, and still raises", ctx do
+      bulk_action = submit!(ctx, 2)
+      owner(RaisingOwner)
+
+      # Once the run's start has committed, another transaction takes the lock.
+      test_pid = self()
+
+      attach([:ash_bulk_durable, :bulk_action, :start], fn _measurements, metadata ->
+        if metadata.bulk_action_id == bulk_action.id do
+          send(test_pid, {:started, self()})
+          assert_receive :locked, 5_000
+        end
+      end)
+
+      capture_log(fn ->
+        run = Task.async(fn -> attempt(bulk_action) end)
+        assert_receive {:started, started}, 5_000
+        locker = lock_elsewhere(bulk_action.id)
+        send(started, :locked)
+        assert {%RuntimeError{}, _} = Task.await(run, 15_000)
+        release(locker)
+      end)
+
+      assert %{status: :running, setup_failures: 0} = reload(bulk_action)
+    end
+
+    test "one whose pass a retry moved on counts nothing, and still raises", ctx do
+      bulk_action = submit!(ctx, 2)
+      owner(RaisingOwner)
+
+      # Once the run's start has committed, a retry moves the pass on, as
+      # one that reopened the bulk action while this run was still setting up.
+      attach([:ash_bulk_durable, :bulk_action, :start], fn _measurements, metadata ->
+        if metadata.bulk_action_id == bulk_action.id, do: set!(bulk_action, "pass = pass + 1")
+      end)
+
+      capture_log(fn -> assert {%RuntimeError{}, _} = attempt(bulk_action) end)
+
+      assert %{status: :running, pass: 1, setup_failures: 0} = reload(bulk_action)
+    end
+  end
+
   describe "a retry" do
     test "starts the count again", ctx do
       bulk_action = submit!(ctx, 2)
@@ -316,7 +448,7 @@ defmodule AshBulkDurable.Core.CrashTest do
       set!(
         bulk_action,
         "status = 'completed_with_errors', rows_done = 1, stalled_starts = 4, " <>
-          "progress_at_start = 3, shutdown_stopped = true, isolating_row_id = $2",
+          "setup_failures = 2, progress_at_start = 3, shutdown_stopped = true, isolating_row_id = $2",
         [Ecto.UUID.dump!(r2.id)]
       )
 
@@ -327,6 +459,7 @@ defmodule AshBulkDurable.Core.CrashTest do
       assert %{
                status: :running,
                stalled_starts: 0,
+               setup_failures: 0,
                progress_at_start: nil,
                shutdown_stopped: false,
                isolating_row_id: nil
@@ -514,6 +647,13 @@ defmodule AshBulkDurable.Core.CrashTest do
   end
 
   defp starts(_bulk_action), do: Process.get(:starts, 0)
+
+  # The owner every run rebuilds its scope with, until the test ends.
+  defp owner(module) do
+    previous = Application.fetch_env!(:ash_bulk_durable, :owner_module)
+    Application.put_env(:ash_bulk_durable, :owner_module, module)
+    on_exit(fn -> Application.put_env(:ash_bulk_durable, :owner_module, previous) end)
+  end
 
   # Starts the bulk action until it is finished, and returns how many starts
   # that took.
