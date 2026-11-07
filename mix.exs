@@ -28,14 +28,22 @@ defmodule AshBulkDurable.MixProject do
   end
 
   def cli do
-    [preferred_envs: ["ash.codegen": :test]]
+    [preferred_envs: ["ash.codegen": :test, "check.migrations": :test]]
   end
 
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_env), do: ["lib"]
 
   defp aliases do
-    [test: ["ash.setup --quiet", "test"]]
+    [
+      test: ["ash.setup --quiet", "test"],
+      # The resources live in test/support, their tables in priv/test_repo.
+      "check.migrations": [
+        "ash_postgres.generate_migrations --check " <>
+          "--snapshot-path priv/test_repo/resource_snapshots " <>
+          "--migration-path priv/test_repo/migrations"
+      ]
+    ]
   end
 
   defp deps do
