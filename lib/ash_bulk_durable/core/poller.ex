@@ -34,13 +34,16 @@ defmodule AshBulkDurable.Core.Poller do
   (see `AshBulkDurable.Core.Worker`). The poller's only job is that every
   bulk action still queued or running eventually has a run.
 
-  A run that returns or crashes frees its slot, and the poller fills it
-  straight away. A crash is logged; the bulk action stays `:running`, its
-  hint as the run's start stamped it, and is started again once that is
-  stale. A bulk action whose run keeps crashing is therefore started again
-  every `:stale_after`. A run that returns `:busy` frees its slot until the
-  next poll instead: another transaction took the bulk action's lock between
-  the poll and the run, and filling now would start it again at once.
+  A run that returns frees its slot, and the poller fills it straight away.
+  A crash is logged; the bulk action stays `:running`, its hint as the run's
+  start stamped it, and is started again once that is stale. A bulk action
+  whose run keeps crashing is therefore started again every `:stale_after`.
+  A crash, and a run that returns `:busy`, free the slot only until the next
+  poll. A crash before the run's start committed leaves the bulk action
+  startable, and filling now would start it again at once, as often as it
+  crashes, which it most likely does again (the database is down, say).
+  After `:busy`, another transaction took the bulk action's lock between the
+  poll and the run, and filling now would start it again at once too.
 
   The poll skips a bulk action another transaction holds right now, such as
   one inside a long all-or-nothing chunk on another node, which stamps
@@ -93,15 +96,17 @@ defmodule AshBulkDurable.Core.Poller do
 
   It stops starting runs, then gives the runs still going `:shutdown_grace`
   to finish, and kills those that haven't. A killed run's transaction rolls
-  back, and its rows resume on another node, or this one once restarted,
-  when its hint goes stale.
+  back.
 
   A killed run didn't crash, so the poller then sets `shutdown_stopped` on
   its bulk action, and the next start doesn't count it as stalled (see
-  "Crashes" in `AshBulkDurable.Core.Worker`). It takes the bulk action's
-  lock to do so, waiting at most 2 seconds for the killed run's transaction
-  to let go of it: the one wait on the lock anywhere. A node stopped without
-  this shutdown (out of memory, `kill -9`) counts as a crash.
+  "Crashes" in `AshBulkDurable.Core.Worker`). The same write clears its
+  liveness hint, so another node's next poll resumes it, rather than one
+  `:stale_after` later. It takes the bulk action's lock to do so, waiting at
+  most 2 seconds for the killed run's transaction to let go of it: the one
+  wait on the lock anywhere. A bulk action it couldn't mark resumes once its
+  hint goes stale, as does one on a node stopped without this shutdown (out
+  of memory, `kill -9`), which counts as a crash.
   """
   use GenServer
 
@@ -227,7 +232,7 @@ defmodule AshBulkDurable.Core.Poller do
   # A run returned: its slot is free now. One that found the bulk action
   # locked (`:busy`) leaves it for the next poll: the bulk action still reads
   # as startable, and filling now would start it again at once, as often as
-  # its lock holder's chunk takes.
+  # its lock holder's chunk takes. A crash leaves it for the next poll too.
   def handle_info({ref, result}, state) when is_map_key(state.running, ref) do
     Process.demonitor(ref, [:flush])
     state = %{state | running: Map.delete(state.running, ref)}
@@ -238,7 +243,7 @@ defmodule AshBulkDurable.Core.Poller do
       when is_map_key(state.running, ref) do
     {%{id: id}, running} = Map.pop(state.running, ref)
     Logger.error("ash_bulk_durable: bulk action #{id} crashed: #{Exception.format_exit(reason)}")
-    {:noreply, fill(%{state | running: running})}
+    {:noreply, %{state | running: running}}
   end
 
   def handle_info({:EXIT, pid, reason}, %{tasks: pid} = state), do: {:stop, reason, state}
@@ -258,7 +263,7 @@ defmodule AshBulkDurable.Core.Poller do
 
       Logger.warning(
         "ash_bulk_durable: bulk action #{run.id} was still running at shutdown; " <>
-          "it resumes once its liveness hint goes stale"
+          "it resumes at the next poll, or once its liveness hint goes stale if it can't be marked"
       )
     end)
 
@@ -295,16 +300,21 @@ defmodule AshBulkDurable.Core.Poller do
   # outlived a retry and is killed here marks the retry's pass, costing it one
   # stalled-start count. That needs a stale run and a shutdown at once, and
   # is accepted.
+  # Clearing the hint makes the bulk action startable at once. Should another
+  # run of it still be going elsewhere, between its locked transactions, a
+  # poll may start a duplicate before that run's ticker stamps again: the
+  # lock makes that harmless, as for any duplicate start.
   defp mark_shutdown_stopped(id) do
     Ash.transaction([Core.config(:bulk_action_resource)], fn ->
       case BulkActionLock.lock(id, [:queued, :running], wait: @shutdown_lock_wait) do
         {:ok, locked} ->
           {:ok, _marked, _notifications} =
-            Ash.update(locked, %{shutdown_stopped: true},
-              action: :count_crashes,
-              authorize?: false,
-              return_notifications?: true
+            locked
+            |> Ash.Changeset.for_update(:count_crashes, %{shutdown_stopped: true},
+              authorize?: false
             )
+            |> Ash.Changeset.force_change_attribute(:alive_at, nil)
+            |> Ash.update(return_notifications?: true)
 
         :none ->
           :ok

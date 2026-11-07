@@ -52,7 +52,7 @@ defmodule AshBulkDurable.Core.Worker do
   Postgres releases the lock at commit, at rollback and when a connection
   dies, so a run that lost it has nothing left that can commit. A lock
   another transaction holds stops the run at once, writing nothing; `run/2`
-  returns `:busy`.
+  returns `:busy` when that happens at the run's start, and `:ok` after it.
 
   The lock covers only what is written on the bulk action's own connection,
   so every target must live in the bulk action's repo.
@@ -306,14 +306,16 @@ defmodule AshBulkDurable.Core.Worker do
   Runs the bulk action `bulk_action_id` once, in the calling process: phase 1,
   then phase 2, up to its verdict.
 
-  Returns `:ok` when the run reached a verdict, or found nothing left to do
-  (the bulk action is terminal); `:busy` when the run's start couldn't take
-  the bulk action's lock, another transaction holding it, the bulk action no
-  longer queued or running, or, with `:if_stale_after`, its liveness hint
-  still fresh, and nothing was written; and
-  `{:stopped, :row_moved_on}` when another run had moved one of its rows on,
-  which stopped this one without a verdict. Raises what the run's own reads
-  and writes raise.
+  Returns `:busy` when the run's start couldn't take the bulk action's lock,
+  another transaction holding it, the bulk action no longer queued or
+  running, or, with `:if_stale_after`, its liveness hint still fresh, and
+  nothing was written; `{:stopped, :row_moved_on}` when another run had
+  moved one of its rows on, which stopped this one without a verdict; and
+  `:ok` otherwise: the run reached a verdict, found nothing left to do (the
+  bulk action is terminal), or stopped once started because another
+  transaction took the lock, leaving the bulk action to that one. `:ok` is
+  not a verdict: read the bulk action's status for that. Raises what the
+  run's own reads and writes raise.
 
   `opts`:
 
@@ -323,9 +325,6 @@ defmodule AshBulkDurable.Core.Worker do
       it. Checked under the lock, in the run's start transaction. Nil by
       default, which starts the bulk action whatever its hint; the poller
       passes its `:stale_after`.
-    * `:attempt` - reported as `attempt` in the
-      `[:ash_bulk_durable, :worker_attempt, :start]` event's metadata. Nil
-      by default.
   """
   @spec run(Ash.UUID.t(), keyword()) :: :ok | :busy | {:stopped, :row_moved_on}
   def run(bulk_action_id, opts \\ []) do
@@ -388,7 +387,7 @@ defmodule AshBulkDurable.Core.Worker do
   defp attempt(bulk_action, opts) do
     case unrunnable(bulk_action) do
       nil ->
-        emit_worker_attempt_start(bulk_action, Keyword.get(opts, :attempt))
+        emit_worker_attempt_start(bulk_action)
 
         bulk_action
         |> start_run(Keyword.get(opts, :if_stale_after))
@@ -1774,15 +1773,14 @@ defmodule AshBulkDurable.Core.Worker do
   # ── Telemetry ────────────────────────────────────────────────────
 
   # Emitted before any write, so the attempt is observable even if the
-  # bulk action never starts. `pending_rows_at_start == total_rows` on attempt 1 is
-  # a cold start; a smaller count on a later attempt is a crash resume.
-  defp emit_worker_attempt_start(bulk_action, attempt) do
+  # bulk action never starts. `pending_rows_at_start == total_rows` is a cold
+  # start; a smaller count is a resume.
+  defp emit_worker_attempt_start(bulk_action) do
     :telemetry.execute(
       [:ash_bulk_durable, :worker_attempt, :start],
       %{system_time: System.system_time()},
       %{
         bulk_action_id: bulk_action.id,
-        attempt: attempt,
         pending_rows_at_start: pending_row_count(bulk_action)
       }
     )

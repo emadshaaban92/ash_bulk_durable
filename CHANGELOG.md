@@ -17,7 +17,8 @@
   action whose node died resumes from its rows on another node, instead of
   failing. The poller also runs the staged-file sweep every
   `:staging_sweep_interval`, and on shutdown gives its runs `:shutdown_grace`
-  to finish before killing them.
+  to finish before killing them, clearing a killed run's hint so the next
+  poll on any node resumes it.
 - `example/`: a Phoenix app with a `/bulk` page to copy, using no other library
   for its screens: organizations and roles a worker acts under, and files in a
   sheet.
