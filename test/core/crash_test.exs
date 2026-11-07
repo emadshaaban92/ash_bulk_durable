@@ -269,6 +269,41 @@ defmodule AshBulkDurable.Core.CrashTest do
     end
   end
 
+  describe "a bulk action whose action is gone" do
+    # A deploy renamed or removed what it runs: every start would raise
+    # before reaching a row, so the first fails it, uncounted.
+    for {mode, column, name} <- [
+          {:per_row, "action_name", "renamed_away"},
+          {:all_or_nothing, "action_name", "renamed_away"},
+          {:per_row, "resource_name", "AshBulkDurable.Test.NoLongerHere"}
+        ] do
+      test "#{mode}, its #{column} gone: failed on the first start, nothing run", ctx do
+        bulk_action = submit!(ctx, 2, mode: unquote(mode))
+        set!(bulk_action, "#{unquote(column)} = $2", [unquote(name)])
+
+        assert :ok = Worker.run_now(bulk_action.id)
+
+        assert %{
+                 status: :failed,
+                 result: %{"reason" => "gone"},
+                 alive_at: nil,
+                 progress_at_start: nil,
+                 stalled_starts: 0
+               } = failed = reload(bulk_action)
+
+        assert statuses(bulk_action) == [:resolved, :resolved]
+        assert created(ctx) == []
+
+        # Nothing a retry can run either.
+        assert {:error, :gone} = AshBulkDurable.retry(failed, scope: ctx.scope)
+        assert reload(bulk_action).status == :failed
+
+        # The verdict frees the owner to submit again.
+        assert %{status: :queued} = submit!(ctx, 1)
+      end
+    end
+  end
+
   describe "a retry" do
     test "starts the count again", ctx do
       bulk_action = submit!(ctx, 2)
