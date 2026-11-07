@@ -17,9 +17,10 @@ defmodule AshBulkDurable.Core.Liveness do
   the run (`start_ticker/1`) also stamps it every `:alive_interval`
   (milliseconds, 30 seconds by default, in the `ash_bulk_durable` config).
   A transaction that rolls back loses its stamp, but while it runs it holds
-  the lock, so a duplicate start finds the bulk action busy. The ticker takes the lock with `SKIP LOCKED`
-  and skips the stamp when another transaction holds it, never waiting: a
-  chunk holding it is alive, and stamps when it commits.
+  the lock, so a duplicate start finds the bulk action busy. The ticker
+  takes the lock with `SKIP LOCKED` and skips the stamp when another
+  transaction holds it, never waiting: a chunk holding it is alive, and
+  stamps when it commits.
 
   The run's own locked transactions take the same lock with `SKIP LOCKED`,
   and one that found the ticker's stamp holding it would stop the run as if
