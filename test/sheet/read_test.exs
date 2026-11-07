@@ -10,15 +10,22 @@ defmodule AshBulkDurable.Sheet.ReadTest do
 
   # Cell styles, by index into `cellXfs`: 0 general, then the built-in
   # number formats for a date (14), a date-time (22), a time (21) and a
-  # percentage (9).
+  # percentage (9), then custom formats for a date, a date-time and a time
+  # that xlsx_reader does not know by itself.
   @styles """
   <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+    <numFmts count="3">
+      <numFmt numFmtId="164" formatCode="dd\-mmm\-yyyy"/>
+      <numFmt numFmtId="165" formatCode="[$-409]d-mmm-yy h:mm AM/PM;@"/>
+      <numFmt numFmtId="166" formatCode="h:mm AM/PM"/>
+    </numFmts>
     <fonts count="1"><font/></fonts>
     <fills count="1"><fill/></fills>
     <borders count="1"><border/></borders>
     <cellStyleXfs count="1"><xf numFmtId="0"/></cellStyleXfs>
-    <cellXfs count="5">
+    <cellXfs count="8">
       <xf numFmtId="0"/><xf numFmtId="14"/><xf numFmtId="22"/><xf numFmtId="21"/><xf numFmtId="9"/>
+      <xf numFmtId="164"/><xf numFmtId="165"/><xf numFmtId="166"/>
     </cellXfs>
   </styleSheet>
   """
@@ -30,19 +37,20 @@ defmodule AshBulkDurable.Sheet.ReadTest do
     xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main">
     <x14:dataValidations count="1" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main">
       <x14:dataValidation type="list"><x14:formula1><xm:f>Lists!$A$1:$A$2</xm:f></x14:formula1>
-      <xm:sqref>H2:H10</xm:sqref></x14:dataValidation>
+      <xm:sqref>N2:N10</xm:sqref></x14:dataValidation>
     </x14:dataValidations>
   </ext></extLst>
   """
 
   @data [
-    ~w(name qty big price share when midnight day clock flag zip total pick),
+    ~w(name qty big price share share_n when midnight day clock flag zip total pick cday cwhen cclock),
     [
       "Ann",
       {:n, "3"},
       {:n, "1.2345678901234568E+16"},
       {:n, "19.99"},
       {:n, "0.15", 4},
+      {:tn, "0.15", 4},
       {:n, "45306.5", 2},
       {:n, "45306", 2},
       {:n, "45352", 1},
@@ -50,10 +58,13 @@ defmodule AshBulkDurable.Sheet.ReadTest do
       {:b, "1"},
       "01234",
       {:f, "B2*2", "6"},
-      "red"
+      "red",
+      {:n, "45352", 5},
+      {:n, "45306.5", 6},
+      {:n, "0.375", 7}
     ],
     [],
-    ["Bob", {:n, "-0.5"}, {:n, "1E-7"}, nil, nil, nil, nil, nil, nil, {:b, "0"}, " 99 "]
+    ["Bob", {:n, "-0.5"}, {:n, "1E-7"}, nil, nil, nil, nil, nil, nil, nil, {:b, "0"}, " 99 "]
   ]
 
   @lists [["red"], ["blue"]]
@@ -67,14 +78,18 @@ defmodule AshBulkDurable.Sheet.ReadTest do
 
   test "reads every kind of cell as a CSV would hold it", %{path: path} do
     assert {:ok, %Sheet{headers: headers, rows: [ann, bob]}} = Sheet.read(path)
-    assert headers == ~w(name qty big price share when midnight day clock flag zip total pick)
+
+    assert headers ==
+             ~w(name qty big price share share_n when midnight day clock flag zip total pick cday cwhen cclock)
 
     assert ann == %{
              "name" => "Ann",
              "qty" => "3",
              "big" => "12345678901234568",
              "price" => "19.99",
-             "share" => "15",
+             # 15%, read as its stored value whether or not the cell says t="n"
+             "share" => "0.15",
+             "share_n" => "0.15",
              "when" => "2024-01-15T12:00:00",
              "midnight" => "2024-01-15T00:00:00",
              "day" => "2024-03-01",
@@ -82,7 +97,10 @@ defmodule AshBulkDurable.Sheet.ReadTest do
              "flag" => "true",
              "zip" => "01234",
              "total" => "6",
-             "pick" => "red"
+             "pick" => "red",
+             "cday" => "2024-03-01",
+             "cwhen" => "2024-01-15T12:00:00",
+             "cclock" => "09:00:00"
            }
 
     # A row shorter than the header reads blank for the rest; cells are
@@ -93,6 +111,7 @@ defmodule AshBulkDurable.Sheet.ReadTest do
              "big" => "0.0000001",
              "price" => "",
              "share" => "",
+             "share_n" => "",
              "when" => "",
              "midnight" => "",
              "day" => "",
@@ -100,7 +119,10 @@ defmodule AshBulkDurable.Sheet.ReadTest do
              "flag" => "false",
              "zip" => "99",
              "total" => "",
-             "pick" => ""
+             "pick" => "",
+             "cday" => "",
+             "cwhen" => "",
+             "cclock" => ""
            }
   end
 
@@ -223,6 +245,10 @@ defmodule AshBulkDurable.Sheet.ReadTest do
 
   defp cell_xml({:n, value}, ref), do: cell_xml({:n, value, 0}, ref)
   defp cell_xml({:n, value, style}, ref), do: ~s(<c r="#{ref}" s="#{style}"><v>#{value}</v></c>)
+
+  defp cell_xml({:tn, value, style}, ref),
+    do: ~s(<c r="#{ref}" s="#{style}" t="n"><v>#{value}</v></c>)
+
   defp cell_xml({:b, value}, ref), do: ~s(<c r="#{ref}" t="b"><v>#{value}</v></c>)
 
   defp cell_xml({:f, formula, cached}, ref),

@@ -118,7 +118,7 @@
 - An XLSX is read with `xlsx_reader` instead of shelling out to csvkit's
   `in2csv`, so no Python is needed. Booleans read as `true`/`false` (they read
   `True`, which Ash refused), large numbers keep their digits instead of an
-  exponent, a percentage reads as the number shown, and a workbook with a
+  exponent, a date in any custom format reads as a date, and a workbook with a
   dropdown list no longer gets a Python warning in its header row.
   `read_sheet/2` takes `:sheet`, a name or 0-based index, and returns
   `{:error, {:xlsx, reason}}` or `{:error, {:unknown_sheet, sheet}}`.

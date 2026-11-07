@@ -66,10 +66,12 @@ defmodule AshBulkDurable.Sheet do
 
   An XLSX's cells are read as the strings a CSV of the same sheet would
   hold: a number as the digits the file stores (no float rounding or
-  exponent), a percentage as the number shown (`15` for 15%), a boolean as
+  exponent), a percentage as its stored value (`0.15` for 15%), a boolean as
   `true`/`false`, a date, date-time or time as ISO 8601, a formula as its
-  cached value. `:sheet` names the sheet to read, by
-  name or 0-based index; the first sheet by default.
+  cached value. A cell xlsx_reader cannot convert (a date-time that rounds
+  to 24:00:00, an elapsed time over 24 hours) reads as `#ERROR`. `:sheet`
+  names the sheet to read, by name or 0-based index; the first sheet by
+  default.
   """
   def read(path, opts \\ []) do
     case Keyword.get_lazy(opts, :type, fn -> type(path) end) do
@@ -97,6 +99,7 @@ defmodule AshBulkDurable.Sheet do
 
   defp read_xlsx(path, sheet) do
     with {:ok, package} <- open_xlsx(path),
+         package = percentages_as_numbers(package),
          {:ok, name} <- sheet_name(package, sheet),
          {:ok, rows} <- XlsxReader.sheet(package, name, number_type: Decimal) do
       base_date = package.workbook.base_date
@@ -112,11 +115,45 @@ defmodule AshBulkDurable.Sheet do
   # for a file that is not a zip), so a raise here is an unreadable file too.
   defp open_xlsx(path) do
     if File.regular?(path),
-      do: XlsxReader.open(path),
+      do: XlsxReader.open(path, supported_custom_formats: custom_formats()),
       else: raise(File.Error, reason: :enoent, action: "read file", path: path)
   rescue
     error in [File.Error] -> reraise error, __STACKTRACE__
     error -> {:error, error}
+  end
+
+  # xlsx_reader knows the built-in date formats and a few custom ones; any
+  # other custom format reads as a serial number. A format is a date if it
+  # has a d or y outside quoted text, `[...]` sections, `\x` escapes and `_x`
+  # padding, a time if it has an h or s there, a date-time if both. (An m is
+  # a month or a minute, so it decides nothing.)
+  defp custom_formats do
+    token = ~S{\[[^\]]*\]|"[^"]*"|\\.|_.|}
+    without = &"(?:#{token}[^\"\[\\\\_#{&1}])*"
+
+    [
+      {Regex.compile!("\\A(?=#{without.("dDyY")}[dDyY])(?=#{without.("hHsS")}[hHsS])"),
+       :date_time},
+      {Regex.compile!("\\A#{without.("dDyYhHsS")}[dDyY]#{without.("hHsS")}\\z"), :date},
+      {Regex.compile!("\\A#{without.("dDyY")}[hHsS]#{without.("dDyY")}\\z"), :time}
+    ]
+  end
+
+  # xlsx_reader multiplies a percentage by 100, but only for a number cell
+  # with no explicit `t="n"` (as Excel writes it, not openpyxl or a custom
+  # `0.000%`). Reading every percentage as a plain number gives the stored
+  # value, 0.15 for 15%, whichever program wrote the file. This edits
+  # `style_types`, a typed field of `XlsxReader.Workbook`.
+  defp percentages_as_numbers(package) do
+    update_in(package.workbook.style_types, fn types ->
+      :array.map(
+        fn
+          _index, :percentage -> :number
+          _index, type -> type
+        end,
+        types
+      )
+    end)
   end
 
   defp sheet_name(package, sheet) do
@@ -131,8 +168,8 @@ defmodule AshBulkDurable.Sheet do
 
   # A cell as a CSV of the sheet would hold it. Numbers come as `Decimal`
   # (`number_type: Decimal`), parsed from the text the file stores, so they
-  # print without float rounding or an exponent. A percentage comes
-  # multiplied by 100, as `15.00` for 15%, which normalising prints as `15`.
+  # print without float rounding or an exponent; normalising drops trailing
+  # zeros.
   # A time is a date-time on the workbook's base date.
   defp cell(value, _base_date) when is_binary(value), do: value
   defp cell(true, _base_date), do: "true"
