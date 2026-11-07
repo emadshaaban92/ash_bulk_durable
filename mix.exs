@@ -52,6 +52,7 @@ defmodule AshBulkDurable.MixProject do
       {:ash_postgres, "~> 2.15"},
       {:spark, "~> 2.7"},
       {:nimble_csv, "~> 1.3"},
+      {:spreadsheet, "~> 0.7"},
       {:briefly, "~> 0.5"},
       {:telemetry, "~> 1.2"},
 

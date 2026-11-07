@@ -48,7 +48,7 @@ defmodule AshBulkDurable.Sheet do
 
   alias AshBulkDurable.Core
   alias AshBulkDurable.Core.{Owner, Runner}
-  alias AshBulkDurable.Sheet.{Companions, Field, Mapping, PrepareContext}
+  alias AshBulkDurable.Sheet.{Companions, ExcelReader, Field, Mapping, PrepareContext}
   alias NimbleCSV.RFC4180, as: CSV
 
   @doc """
@@ -58,17 +58,34 @@ defmodule AshBulkDurable.Sheet do
   """
   defstruct headers: [], rows: []
 
+  @max_cells 5_000_000
+
   @doc """
   Reads the CSV or XLSX at `path`. The type is `path`'s extension unless
   `:type` (`:csv` or `:xlsx`) names it, as an upload's temporary path has
   none. A UTF-8 byte-order mark is stripped, so a file Excel saved reads
   cleanly. Returns `{:ok, %AshBulkDurable.Sheet{}}`, or `{:error, reason}`.
+
+  An XLSX is read by the configured `AshBulkDurable.Sheet.ExcelReader`
+  (`AshBulkDurable.Sheet.ExcelReader.Calamine` by default), which reads each
+  cell as the string a CSV of the same sheet would hold. `:sheet` names the
+  sheet to read, by name (hidden or not) or 0-based index among the visible
+  sheets; the first visible sheet by default. `:max_cells` caps the cells
+  the reader builds, #{@max_cells} by default. A file the reader cannot
+  read, or a sheet over the cap, returns `{:error, {:xlsx, reason}}`, and a
+  sheet the file lacks `{:error, {:unknown_sheet, sheet}}`.
   """
   def read(path, opts \\ []) do
     case Keyword.get_lazy(opts, :type, fn -> type(path) end) do
-      :csv -> {:ok, path |> File.read!() |> parse()}
-      :xlsx -> read_xlsx(path)
-      other -> {:error, {:unknown_type, other}}
+      :csv ->
+        {:ok,
+         path |> File.read!() |> strip_bom() |> CSV.parse_string(skip_headers: false) |> build()}
+
+      :xlsx ->
+        read_xlsx(path, opts)
+
+      other ->
+        {:error, {:unknown_type, other}}
     end
   rescue
     error in [File.Error, NimbleCSV.ParseError] -> {:error, error}
@@ -82,33 +99,35 @@ defmodule AshBulkDurable.Sheet do
     end
   end
 
-  # `in2csv` (csvkit) converts the first sheet; the CSV it prints parses as
-  # any other.
-  defp read_xlsx(path) do
-    case System.cmd("in2csv", ["-I", "-u", "1", "-f", "xlsx", path], stderr_to_stdout: true) do
-      {csv, 0} -> {:ok, parse(csv)}
-      {output, status} -> {:error, {:in2csv, status, output}}
+  defp read_xlsx(path, opts) do
+    if not File.regular?(path),
+      do: raise(File.Error, reason: :enoent, action: "read file", path: path)
+
+    reader = Core.config(:excel_reader, ExcelReader.Calamine)
+
+    with {:ok, rows} <-
+           reader.read(path,
+             sheet: Keyword.get(opts, :sheet, 0),
+             max_cells: Keyword.get(opts, :max_cells, @max_cells)
+           ) do
+      {:ok, build(rows)}
     end
   end
 
-  defp parse(content) do
-    case content |> strip_bom() |> CSV.parse_string(skip_headers: false) do
-      [] ->
-        %__MODULE__{}
+  defp build([]), do: %__MODULE__{}
 
-      [headers | rows] ->
-        %__MODULE__{
-          headers: headers,
-          rows:
-            rows
-            |> Enum.map(
-              &(headers
-                |> Enum.zip(&1)
-                |> Map.new(fn {k, v} -> {k, String.trim(v)} end))
-            )
-            |> Enum.reject(fn row -> Enum.all?(row, fn {_header, cell} -> cell == "" end) end)
-        }
-    end
+  defp build([headers | rows]) do
+    %__MODULE__{
+      headers: headers,
+      rows:
+        rows
+        |> Enum.map(fn row ->
+          headers
+          |> Enum.zip(Stream.concat(row, Stream.repeatedly(fn -> "" end)))
+          |> Map.new(fn {k, v} -> {k, String.trim(v)} end)
+        end)
+        |> Enum.reject(fn row -> Enum.all?(row, fn {_header, cell} -> cell == "" end) end)
+    }
   end
 
   defp strip_bom(<<0xEF, 0xBB, 0xBF, rest::binary>>), do: rest
