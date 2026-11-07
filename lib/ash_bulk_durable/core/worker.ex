@@ -1375,6 +1375,7 @@ defmodule AshBulkDurable.Core.Worker do
       [] -> :skipped
       fresh -> {length(fresh), write_rows(fresh, settings, locked, fresh, stop_on_error?: false)}
     end
+    |> stamped(locked)
   end
 
   defp still_resolved_rows(rows) do
@@ -1441,6 +1442,7 @@ defmodule AshBulkDurable.Core.Worker do
       nil -> :skipped
       fresh -> write_rows([fresh], settings, locked, fresh, stop_on_error?: false)
     end
+    |> stamped(locked)
   end
 
   defp still_resolved(row) do
@@ -1467,12 +1469,23 @@ defmodule AshBulkDurable.Core.Worker do
   end
 
   defp mark_if_resolved(locked, row, error) do
-    stop_isolating(locked, row)
+    locked = stop_isolating(locked, row)
 
     case still_resolved(row) do
       nil -> :skipped
       fresh -> mark_row_failed(fresh, error)
     end
+    |> stamped(locked)
+  end
+
+  # Isolation and recovery go from one locked transaction to the next, so
+  # the ticker, held through each of them, misses nearly every tick: each of
+  # them stamps instead, last, so the stamp is as fresh as its commit (see
+  # `AshBulkDurable.Core.Liveness`). A transaction that rolls back never
+  # gets here, and the one that follows it stamps.
+  defp stamped(result, locked) do
+    Liveness.stamp!(locked)
+    result
   end
 
   # Drives the `:run` action over a batch of Rows, inside the locked
@@ -1640,7 +1653,9 @@ defmodule AshBulkDurable.Core.Worker do
         :none
 
       %{attempts: attempts} = row when attempts >= max_attempts ->
-        {:crashed, mark_row_failed(row, %CrashedRowError{attempts: attempts})}
+        crashed = mark_row_failed(row, %CrashedRowError{attempts: attempts})
+        Liveness.stamp!(locked)
+        {:crashed, crashed}
 
       row ->
         bumped =
@@ -1650,7 +1665,10 @@ defmodule AshBulkDurable.Core.Worker do
           |> Ash.update(authorize?: false)
           |> row_flipped!(locked.id)
 
-        count_crashes!(locked, %{isolating_row_id: row.id})
+        locked
+        |> count_crashes!(%{isolating_row_id: row.id})
+        |> Liveness.stamp!()
+
         {:alone, bumped}
     end
   end

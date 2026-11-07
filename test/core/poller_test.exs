@@ -38,6 +38,14 @@ defmodule AshBulkDurable.Core.PollerTest do
     def delete_object(_key), do: :ok
   end
 
+  defmodule ExitingResource do
+    @moduledoc """
+    Stands in for the bulk action resource, exiting as a connection pool's
+    checkout that timed out does.
+    """
+    def persisted(_key, _default), do: exit({:timeout, {DBConnection.Holder, :checkout, []}})
+  end
+
   alias AshBulkDurable.Core.{Liveness, Poller, Worker}
   alias AshBulkDurable.Test.{BulkAction, Region, Repo, Row, Scope, User}
   alias AshBulkDurable.TestStorage
@@ -490,6 +498,54 @@ defmodule AshBulkDurable.Core.PollerTest do
     end
   end
 
+  describe "the liveness hint through isolation" do
+    setup do
+      # No ticker stamps: each one here comes from a run's own transaction.
+      put_config(:alive_interval, :timer.hours(1))
+    end
+
+    test "stays fresh while every row runs alone, each in a locked transaction", ctx do
+      bulk_action = submit!(ctx, 3, chunk_size: 3)
+      # Two starts without progress already: this one stalls out, so every
+      # row runs alone.
+      Repo.query!(
+        "UPDATE bulk_actions SET status = 'running', progress_at_start = 3, stalled_starts = 2 " <>
+          "WHERE id = $1",
+        [Ecto.UUID.dump!(bulk_action.id)]
+      )
+
+      test_pid = self()
+
+      # Each row takes a while to write, with the lock held. What a poller
+      # would see, as committed, when each row starts writing: one whose hint
+      # is older than 250 ms would start a duplicate.
+      on_row_write(ctx, fn i ->
+        send(test_pid, {:startable?, i, startable?(bulk_action.id, 250)})
+        Process.sleep(300)
+      end)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :completed, stalled_starts: 3} = reload(bulk_action)
+
+      for i <- 1..3, do: assert_received({:startable?, ^i, false})
+    end
+
+    test "a chunk that runs long stamps as it commits, not as it began", ctx do
+      bulk_action = submit!(ctx, 2, chunk_size: 2)
+      test_pid = self()
+
+      on_row_write(ctx, fn i ->
+        if i == 1, do: send(test_pid, {:started, committed_alive_at(bulk_action.id)})
+        Process.sleep(300)
+      end)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert_received {:started, %DateTime{} = started}
+      assert %{status: :completed, alive_at: committed} = reload(bulk_action)
+      assert DateTime.diff(committed, started, :millisecond) >= 600
+    end
+  end
+
   describe "the run's own ticker" do
     test "never stops the run, however often it ticks", ctx do
       put_config(:alive_interval, 1)
@@ -497,6 +553,35 @@ defmodule AshBulkDurable.Core.PollerTest do
 
       assert :ok = Worker.run_now(bulk_action.id)
       assert %{status: :completed, rows_done: 100} = reload(bulk_action)
+    end
+
+    test "a stamp that exits is only a missed stamp: the run goes on" do
+      put_config(:alive_interval, 20)
+      put_config(:bulk_action_resource, ExitingResource)
+      test_pid = self()
+
+      run =
+        spawn(fn ->
+          ticker = Liveness.start_ticker(Ecto.UUID.generate(), 1)
+          send(test_pid, {:ticker, ticker})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      assert_receive {:ticker, ticker}
+
+      log =
+        capture_log(fn ->
+          Process.sleep(200)
+          assert Process.alive?(run)
+          assert Process.alive?(ticker)
+        end)
+
+      assert log =~ "missed a liveness stamp"
+      assert :ok = Liveness.stop_ticker(ticker)
+      send(run, :stop)
     end
 
     test "stops with a run that raises", ctx do
@@ -664,6 +749,35 @@ defmodule AshBulkDurable.Core.PollerTest do
   end
 
   defp reload(bulk_action), do: Ash.get!(BulkAction, bulk_action.id, authorize?: false)
+
+  # Whether a poller with `:stale_after` `stale_after` would start the bulk
+  # action, from the hint as committed.
+  defp startable?(id, stale_after) do
+    Task.async(fn ->
+      BulkAction
+      |> Ash.Query.filter(id == ^id)
+      |> Ash.Query.do_filter(Liveness.startable(stale_after))
+      |> Ash.exists?(authorize?: false)
+    end)
+    |> Task.await()
+  end
+
+  # Calls `fun` with `i` as the owner's row `i` starts writing its region,
+  # inside the transaction that writes it.
+  defp on_row_write(ctx, fun) do
+    prefix = "#{ctx.tag}-owner-"
+
+    attach([:ash_bulk_durable, :test, :repo, :query], fn metadata ->
+      with "regions" <- metadata.source,
+           "INSERT" <> _ <- metadata.query,
+           code when is_binary(code) <-
+             metadata.params |> List.flatten() |> Enum.find(&row_code?(&1, prefix)) do
+        fun.(code |> String.replace_prefix(prefix, "") |> String.to_integer())
+      end
+    end)
+  end
+
+  defp row_code?(param, prefix), do: is_binary(param) and String.starts_with?(param, prefix)
 
   defp rows(bulk_action) do
     Row

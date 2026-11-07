@@ -9,8 +9,10 @@ defmodule AshBulkDurable.Core.Liveness do
   run started on a live bulk action is harmless, so a hint that goes stale
   while its run is alive only wastes work.
 
-  A run stamps it in its start transaction and in every phase-2 chunk it
-  commits. Between those, phase 1 can spend minutes on one row, and an
+  A run stamps it in its start transaction, in every phase-2 chunk it
+  commits, and in each locked transaction of isolation (taking a row to run
+  alone, running it, marking it failed) and of recovering a failed chunk,
+  which follow one another with almost no gap for the ticker. Between those, phase 1 can spend minutes on one row, and an
   all-or-nothing chunk holds the lock for as long as it runs, so a ticker
   linked to the run (`start_ticker/1`) also stamps it every
   `:alive_interval` (milliseconds, 30 seconds by default, in the
@@ -22,8 +24,13 @@ defmodule AshBulkDurable.Core.Liveness do
   and one that found the ticker's stamp holding it would stop the run as if
   another worker held the bulk action. So the run holds its ticker around
   each of them (`hold/1`, `release/1`): `hold/1` waits for a stamp in
-  flight, and the ticker skips its ticks until `release/1`. Those
-  transactions stamp, or need no stamp, so nothing is lost.
+  flight, and the ticker skips its ticks until `release/1`. So every one
+  of them that can follow another with little gap stamps itself; the rest
+  (forgetting lost resolutions, the verdict) are short, or end the run.
+
+  Each stamp takes the database's clock as it is written
+  (`clock_timestamp()`), not as its transaction began, so a stamp a long
+  chunk writes last is fresh when it commits.
   """
 
   import Ash.Expr, only: [expr: 1]
@@ -154,7 +161,10 @@ defmodule AshBulkDurable.Core.Liveness do
 
   defp next_tick(interval), do: System.monotonic_time(:millisecond) + interval
 
-  # A stamp that fails is only a missed hint: the run goes on.
+  # A stamp that fails is only a missed hint: the run goes on. That holds
+  # for an exit too, a pool checkout timing out for one: the ticker is
+  # linked to the run, so an exit let through would take the run down with
+  # it, and count as a stall.
   defp stamp_unless_busy({bulk_action_id, pass}) do
     Ash.transaction([Core.config(:bulk_action_resource)], fn ->
       case BulkActionLock.lock(bulk_action_id, [:queued, :running], filter: expr(pass == ^pass)) do
@@ -167,6 +177,12 @@ defmodule AshBulkDurable.Core.Liveness do
       Logger.warning(
         "ash_bulk_durable: bulk action #{bulk_action_id} missed a liveness stamp: " <>
           Exception.message(exception)
+      )
+  catch
+    :exit, reason ->
+      Logger.warning(
+        "ash_bulk_durable: bulk action #{bulk_action_id} missed a liveness stamp: " <>
+          Exception.format_exit(reason)
       )
   end
 end
