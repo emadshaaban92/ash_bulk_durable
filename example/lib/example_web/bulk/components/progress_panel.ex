@@ -408,39 +408,48 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
   # Reason-derived copy for a `:failed` bulk action. `result` is JSONB, so its keys
   # are strings (`ApplyMarkFinished` stringifies the `{:failed, %{reason:}}`
   # detail map). `{:failed, term}` bulk actions have no `"reason"` → generic copy.
-  defp failure_message(%{} = result) do
-    case result["reason"] do
-      "atomic_chunk_rolled_back" ->
-        gettext(
-          "A row failed, so the whole bulk action was rolled back (\"Apply all rows or none\" was on)."
-        )
+  defp failure_message(%{} = result), do: reason_message(result["reason"])
+  defp failure_message(_), do: gettext("The bulk action failed.")
 
-      "atomic_phase1_failed" ->
-        gettext("A row failed, so the bulk action stopped before any rows were written.")
-
-      "staged_file_download_error" ->
-        gettext("A companion file couldn't be downloaded from storage.")
-
-      "crashed" ->
-        gettext(
-          "The bulk action kept stopping before it could finish, so it was not run again. No rows were saved (\"Apply all rows or none\" was on)."
-        )
-
-      "unreadable" ->
-        gettext("What this bulk action held no longer exists, so it can't run.")
-
-      "gone" ->
-        gettext("The action this bulk action runs no longer exists, so it can't run.")
-
-      "resolver_prepare_error" ->
-        gettext("The bulk action couldn't be prepared. Please check your data and try again.")
-
-      _ ->
-        gettext("The bulk action failed.")
-    end
+  defp reason_message("atomic_chunk_rolled_back") do
+    gettext(
+      "A row failed, so the whole bulk action was rolled back (\"Apply all rows or none\" was on)."
+    )
   end
 
-  defp failure_message(_), do: gettext("The bulk action failed.")
+  defp reason_message("atomic_phase1_failed") do
+    gettext("A row failed, so the bulk action stopped before any rows were written.")
+  end
+
+  defp reason_message("staged_file_download_error") do
+    gettext("A companion file couldn't be downloaded from storage.")
+  end
+
+  defp reason_message("crashed") do
+    gettext(
+      "The bulk action kept stopping before it could finish, so it was not run again. No rows were saved (\"Apply all rows or none\" was on)."
+    )
+  end
+
+  defp reason_message("unreadable") do
+    gettext("What this bulk action held no longer exists, so it can't run.")
+  end
+
+  defp reason_message("gone") do
+    gettext("The action this bulk action runs no longer exists, so it can't run.")
+  end
+
+  defp reason_message("setup_error") do
+    gettext("The bulk action kept failing before it reached a row, so it was not run again.")
+  end
+
+  defp reason_message("resolver_prepare_error") do
+    gettext("The bulk action couldn't be prepared. Please check your data and try again.")
+  end
+
+  defp reason_message(_reason) do
+    gettext("The bulk action failed.")
+  end
 
   # Second line of the `:failed` alert: the first offending row (1-based,
   # matching the failed-rows preview) and its humanized error, when the

@@ -4,7 +4,7 @@ defmodule AshBulkDurable.Core.Changes.ReopenBulkAction do
   corrected shared `input`, when given, and sheds how it finished, the
   liveness hint its last run left included, so a poller starts it at once
   rather than once that hint goes stale. Its crash count starts again
-  (`stalled_starts`, `progress_at_start`, `shutdown_stopped` and
+  (`stalled_starts`, `setup_failures`, `progress_at_start`, `shutdown_stopped` and
   `isolating_row_id`; see "Crashes" in `AshBulkDurable.Core.Worker`). Its
   `pass` goes up by one, so a run that started before the retry stops at its
   next lock instead of carrying on into this pass with the last one's
@@ -31,6 +31,7 @@ defmodule AshBulkDurable.Core.Changes.ReopenBulkAction do
     |> Ash.Changeset.force_change_attribute(:finished_at, nil)
     |> Ash.Changeset.force_change_attribute(:alive_at, nil)
     |> Ash.Changeset.force_change_attribute(:stalled_starts, 0)
+    |> Ash.Changeset.force_change_attribute(:setup_failures, 0)
     |> Ash.Changeset.force_change_attribute(:progress_at_start, nil)
     |> Ash.Changeset.force_change_attribute(:shutdown_stopped, false)
     |> Ash.Changeset.force_change_attribute(:isolating_row_id, nil)

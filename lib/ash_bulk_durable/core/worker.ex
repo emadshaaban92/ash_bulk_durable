@@ -89,6 +89,14 @@ defmodule AshBulkDurable.Core.Worker do
   - A row status flip refused because another run of the bulk action already
     moved the row on (`RowMovedOnError`, see below) → the run stops, writing
     no verdict.
+  - An exception raised after the run's start and before its first row
+    (rebuilding the owner's scope, the runner's settings, asking storage
+    which resolutions were lost, downloading the staged files) → counted
+    under the lock as a setup failure, then raised again. The
+    `:max_setup_failures`th with no progress between →
+    `:mark_finished({:failed, %{reason:
+    :setup_error, message: ...}})`, the exception's message, before it is
+    raised. See "Setup failures" in "Crashes" below.
 
   A row that raises, or outruns `:row_resolve_timeout` in phase 1, fails like
   one that returns an error, in either phase and either mode. Only a raise from the worker's own reads and writes propagates
@@ -169,7 +177,17 @@ defmodule AshBulkDurable.Core.Worker do
     (phase 1's resolve, phase 2's run alone or its failure), so a bump given
     back once is never given back again. Every give-back is an atomic
     `attempts - 1` that stops at 0.
-  - **A retry starts the count again**: `:enqueue_retry` clears the four
+  - **Setup failures.** A run that raises before its first row moves none,
+    so a per-row one would be restarted forever, its stalled starts only
+    isolating rows it never reaches. Each such exception is counted in
+    `setup_failures`, under the lock, and the one that brings it to
+    `:max_setup_failures` fails the bulk action, `{:failed, %{reason:
+    :setup_error}}`. Only exceptions count: a run killed in its setup (the
+    stress test's chaos, a shutdown, a node lost) adds nothing, and nor
+    does an exit, such as a `GenServer.call` timeout in a storage client.
+    Only a start whose score rose sets it back to 0: one whose setup
+    succeeds but that makes no progress leaves it as it is.
+  - **A retry starts the count again**: `:enqueue_retry` clears the five
     fields, and `:reopen_with_corrections` a reopened row's `attempts`.
     Returned errors are not crashes, and bump nothing.
 
@@ -185,6 +203,8 @@ defmodule AshBulkDurable.Core.Worker do
       runs in isolation, 3 by default.
     * `:max_row_attempts` - runs alone that may die on a row before it fails
       as crashed, 2 by default.
+    * `:max_setup_failures` - starts that raise before reaching a row, with
+      no progress between, before the bulk action fails, 3 by default.
 
   ## Telemetry
 
@@ -391,7 +411,7 @@ defmodule AshBulkDurable.Core.Worker do
 
         bulk_action
         |> start_run(Keyword.get(opts, :if_stale_after))
-        |> run_started(reconstruct_scope(bulk_action))
+        |> run_started()
 
       reason ->
         finish_locked(bulk_action, {:failed, %{reason: reason}})
@@ -412,20 +432,20 @@ defmodule AshBulkDurable.Core.Worker do
 
   # The ticker stamps the liveness hint for as long as the run goes, and stops
   # with it however it ends.
-  defp run_started({:ok, running}, scope) do
+  defp run_started({:ok, running}) do
     if entered_isolation?(running), do: announce_isolation(running)
 
-    if terminal?(running.status), do: :ok, else: drive_started(running, scope)
+    if terminal?(running.status), do: :ok, else: drive_started(running)
   end
 
-  defp run_started(:busy, _scope), do: :busy
+  defp run_started(:busy), do: :busy
 
-  defp drive_started(running, scope) do
+  defp drive_started(running) do
     ticker = Liveness.start_ticker(running.id, running.pass)
     Process.put(@ticker, ticker)
 
     try do
-      drive_with_telemetry(running, scope)
+      drive_with_telemetry(running)
     after
       Process.delete(@ticker)
       Liveness.stop_ticker(ticker)
@@ -453,6 +473,7 @@ defmodule AshBulkDurable.Core.Worker do
     counted =
       count_crashes!(locked, %{
         stalled_starts: stalled_starts(locked, score),
+        setup_failures: setup_failures(locked, score),
         progress_at_start: score,
         shutdown_stopped: false,
         isolating_row_id: nil
@@ -485,6 +506,12 @@ defmodule AshBulkDurable.Core.Worker do
   defp stalled_starts(%{progress_at_start: last}, score) when score > last, do: 0
   defp stalled_starts(%{shutdown_stopped: true, stalled_starts: stalled}, _score), do: stalled
   defp stalled_starts(%{stalled_starts: stalled}, _score), do: stalled + 1
+
+  # Only progress clears them: a start that dies in its setup moves no row.
+  defp setup_failures(%{progress_at_start: last}, score) when not is_nil(last) and score > last,
+    do: 0
+
+  defp setup_failures(%{setup_failures: failures}, _score), do: failures
 
   # The poller's shutdown killed the last run, so the row it was running
   # alone didn't stop it: that row gets its bump back, unless it has run
@@ -547,14 +574,14 @@ defmodule AshBulkDurable.Core.Worker do
 
   # `[:ash_bulk_durable, :bulk_action, :start | :stop | :exception]`. The bulk action
   # reaches one terminal `mark_finished` per attempt, so the stop event's
-  # status/reason are read from the fresh row after `drive/2` returns.
-  defp drive_with_telemetry(bulk_action, scope) do
+  # status/reason are read from the fresh row after `drive/1` returns.
+  defp drive_with_telemetry(bulk_action) do
     :telemetry.span(
       [:ash_bulk_durable, :bulk_action],
       bulk_action_start_metadata(bulk_action),
       fn ->
         try do
-          drive(bulk_action, scope)
+          drive(bulk_action)
         after
           Progress.forget(bulk_action.id)
         end
@@ -568,18 +595,66 @@ defmodule AshBulkDurable.Core.Worker do
   defp terminal?(status),
     do: status in [:completed, :completed_with_errors, :failed, :cancelled]
 
-  defp drive(bulk_action, scope) do
-    settings = Runner.settings(bulk_action, scope, %{})
-
-    case forget_lost_resolutions(bulk_action, settings) do
-      :ok -> drive_rows(bulk_action, settings)
+  defp drive(bulk_action) do
+    case set_up(bulk_action) do
+      {:ok, settings, downloaded} -> drive_rows(bulk_action, settings, downloaded)
       :busy -> :ok
     end
   end
 
-  defp drive_rows(bulk_action, settings) do
+  # Everything a run does after its start and before its first row. What
+  # raises here raises again on every start, and moves no row, so neither
+  # the stall count nor isolation would ever end it: it is counted instead.
+  # A kill is not an exception, and is never counted here.
+  defp set_up(bulk_action) do
+    settings = Runner.settings(bulk_action, reconstruct_scope(bulk_action), %{})
+
+    with :ok <- forget_lost_resolutions(bulk_action, settings),
+         do: {:ok, settings, download_staged_files_with_telemetry(bulk_action, settings)}
+  rescue
+    error in RowMovedOnError ->
+      reraise error, __STACKTRACE__
+
+    error ->
+      stacktrace = __STACKTRACE__
+      count_setup_failure(bulk_action, error)
+      reraise error, stacktrace
+  end
+
+  # Under the lock, in the run's pass. `:max_setup_failures` of them in a
+  # row, with no progress between, fail the bulk action with the last
+  # exception's message. A count that can't be written (the database down,
+  # most likely) is logged, and the setup's own exception raised as before.
+  defp count_setup_failure(bulk_action, error) do
+    max = AshBulkDurable.Core.config(:max_setup_failures, 3)
+
+    in_pass(bulk_action, fn locked ->
+      counted = count_crashes!(locked, %{setup_failures: locked.setup_failures + 1})
+
+      if counted.setup_failures >= max do
+        Logger.error(
+          "ash_bulk_durable: bulk action #{bulk_action.id} raised before reaching a row in " <>
+            "#{counted.setup_failures} starts without progress; failing it: " <>
+            Exception.message(error)
+        )
+
+        mark_finished(
+          counted,
+          {:failed, %{reason: :setup_error, message: Exception.message(error)}}
+        )
+      end
+    end)
+  rescue
+    count_error ->
+      Logger.error(
+        "ash_bulk_durable: bulk action #{bulk_action.id} couldn't count its setup failure: " <>
+          Exception.message(count_error)
+      )
+  end
+
+  defp drive_rows(bulk_action, settings, downloaded) do
     terminal_bulk_action =
-      case download_staged_files_with_telemetry(bulk_action, settings) do
+      case downloaded do
         {:ok, staged_paths} ->
           # A run stopped by a row that moved on raises past this.
           try do

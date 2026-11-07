@@ -108,3 +108,10 @@
   under the bulk action lock and without counting a start. Before, every run
   of it raised before reaching a row, and a per-row one was restarted forever
   with its owner unable to abandon, retry or submit again.
+- A run that raises after its start and before its first row (the owner's
+  scope, the runner's settings, storage) counts the exception in
+  `setup_failures`, under the lock, and the `:max_setup_failures`th with no
+  progress between (3 by default) fails the bulk action with
+  `reason: :setup_error` and the exception's message. Kills are never
+  counted, and progress or a retry clears the count. Before, a per-row one
+  was restarted every `:stale_after` forever.

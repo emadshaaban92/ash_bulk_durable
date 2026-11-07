@@ -50,6 +50,7 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
      |> add_attribute(:finished_at, :utc_datetime_usec, allow_nil?: true, public?: true)
      |> add_attribute(:alive_at, :utc_datetime_usec, allow_nil?: true, public?: true)
      |> add_attribute(:stalled_starts, :integer, allow_nil?: false, public?: true, default: 0)
+     |> add_attribute(:setup_failures, :integer, allow_nil?: false, public?: true, default: 0)
      |> add_attribute(:progress_at_start, :integer, allow_nil?: true, public?: true)
      |> add_attribute(:shutdown_stopped, :boolean,
        allow_nil?: false,
@@ -345,7 +346,13 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
       {:ok, action} =
         Transformer.build_entity(Dsl, [:actions], :update,
           name: :count_crashes,
-          accept: [:stalled_starts, :progress_at_start, :shutdown_stopped, :isolating_row_id]
+          accept: [
+            :stalled_starts,
+            :setup_failures,
+            :progress_at_start,
+            :shutdown_stopped,
+            :isolating_row_id
+          ]
         )
 
       Transformer.add_entity(dsl_state, [:actions], action, type: :append)
