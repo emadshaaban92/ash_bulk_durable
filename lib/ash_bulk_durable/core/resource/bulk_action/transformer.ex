@@ -304,7 +304,9 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
   end
 
   # The liveness hint (`AshBulkDurable.Core.Liveness`), on the database's
-  # clock, so nodes whose clocks differ agree on how old it is.
+  # clock, so nodes whose clocks differ agree on how old it is. The clock as
+  # the stamp is written, not `now()`, the transaction's start: a stamp a
+  # long chunk writes last would otherwise commit already stale.
   defp add_stamp_alive_action(dsl_state) do
     if Info.action(dsl_state, :stamp_alive) do
       dsl_state
@@ -317,7 +319,7 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
             {Ash.Resource.Change.Atomic,
              [
                attribute: :alive_at,
-               expr: expr(fragment("(now() AT TIME ZONE 'utc')")),
+               expr: expr(fragment("(clock_timestamp() AT TIME ZONE 'utc')")),
                cast_atomic?: true
              ]}
         )
