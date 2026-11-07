@@ -64,6 +64,8 @@ defmodule AshBulkDurable.Test.Repo.Migrations.Initial do
       add(:error, :binary)
       add(:refused, :boolean, null: false, default: false)
       add(:record_id, :text)
+      add(:attempts, :bigint, null: false, default: 0)
+      add(:pass, :bigint, null: false, default: 0)
 
       add(:inserted_at, :utc_datetime_usec,
         null: false,
@@ -112,6 +114,12 @@ defmodule AshBulkDurable.Test.Repo.Migrations.Initial do
       add(:started_at, :utc_datetime_usec)
       add(:finished_at, :utc_datetime_usec)
       add(:alive_at, :utc_datetime_usec)
+      add(:stalled_starts, :bigint, null: false, default: 0)
+      add(:setup_failures, :bigint, null: false, default: 0)
+      add(:progress_at_start, :bigint)
+      add(:shutdown_stopped, :boolean, null: false, default: false)
+      add(:isolating_row_id, :uuid)
+      add(:pass, :bigint, null: false, default: 0)
 
       add(:inserted_at, :utc_datetime_usec,
         null: false,
@@ -326,6 +334,12 @@ defmodule AshBulkDurable.Test.Repo.Migrations.Initial do
     alter table(:bulk_actions) do
       remove(:updated_at)
       remove(:inserted_at)
+      remove(:pass)
+      remove(:isolating_row_id)
+      remove(:shutdown_stopped)
+      remove(:progress_at_start)
+      remove(:setup_failures)
+      remove(:stalled_starts)
       remove(:alive_at)
       remove(:finished_at)
       remove(:started_at)
