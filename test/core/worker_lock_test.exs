@@ -339,6 +339,26 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       assert :ok = Worker.run_now(bulk_action.id)
       assert %{status: :failed, result: %{"reason" => "unreadable"}} = reload(bulk_action)
     end
+
+    test ":gone", ctx do
+      bulk_action = submit!(ctx, 2)
+
+      Repo.query!("UPDATE bulk_actions SET action_name = 'renamed_away' WHERE id = $1", [
+        Ecto.UUID.dump!(bulk_action.id)
+      ])
+
+      locker = lock_elsewhere(bulk_action.id)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      release(locker)
+      assert statuses(bulk_action) == [:resolved, :resolved]
+      assert created(ctx) == []
+      assert_untouched(bulk_action)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :failed, result: %{"reason" => "gone"}} = reload(bulk_action)
+    end
   end
 
   describe "two runs of one bulk action" do

@@ -102,3 +102,8 @@
   by default; phase 1's last is always sent), never block or fail a run, and
   also run as `[:ash_bulk_durable, :phase1 | :all_or_nothing, :progress]`
   telemetry. The example's panel shows them.
+- A bulk action whose resource or action no longer exists (renamed or
+  removed by a deploy) is failed with `reason: :gone` before its run starts,
+  under the bulk action lock and without counting a start. Before, every run
+  of it raised before reaching a row, and a per-row one was restarted forever
+  with its owner unable to abandon, retry or submit again.

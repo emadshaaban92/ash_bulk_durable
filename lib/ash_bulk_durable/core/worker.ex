@@ -69,6 +69,9 @@ defmodule AshBulkDurable.Core.Worker do
   - A bulk action storing what no longer decodes (`StoredTerm`) →
     `:mark_finished({:failed, %{reason: :unreadable}})`, nothing run. A row
     storing it fails alone.
+  - A bulk action whose resource or action no longer exists (renamed or
+    removed by a deploy) → `:mark_finished({:failed, %{reason: :gone}})`,
+    nothing run.
   - Staged-file download error, with a row left for a resolver → each such
     row fails alone (`StagedFileError`) and the rest run. All or nothing →
     `:mark_finished({:failed, %{reason: :staged_file_download_error, ...}})`.
@@ -277,6 +280,7 @@ defmodule AshBulkDurable.Core.Worker do
   alias AshBulkDurable.Core.{
     BulkActionLock,
     CrashedRowError,
+    Introspection,
     Liveness,
     Progress,
     Reference,
@@ -382,15 +386,28 @@ defmodule AshBulkDurable.Core.Worker do
   end
 
   defp attempt(bulk_action, opts) do
-    if StoredTerm.unreadable?(bulk_action) do
-      finish_locked(bulk_action, {:failed, %{reason: :unreadable}})
-      :ok
-    else
-      emit_worker_attempt_start(bulk_action, Keyword.get(opts, :attempt))
+    case unrunnable(bulk_action) do
+      nil ->
+        emit_worker_attempt_start(bulk_action, Keyword.get(opts, :attempt))
 
-      bulk_action
-      |> start_run(Keyword.get(opts, :if_stale_after))
-      |> run_started(reconstruct_scope(bulk_action))
+        bulk_action
+        |> start_run(Keyword.get(opts, :if_stale_after))
+        |> run_started(reconstruct_scope(bulk_action))
+
+      reason ->
+        finish_locked(bulk_action, {:failed, %{reason: reason}})
+        :ok
+    end
+  end
+
+  # Why the bulk action can never run, checked before its start is counted:
+  # a run of it would raise before reaching a row on every start, and a
+  # per-row one would be restarted forever. Nil when it can run.
+  defp unrunnable(bulk_action) do
+    cond do
+      StoredTerm.unreadable?(bulk_action) -> :unreadable
+      Introspection.runnable(bulk_action) == {:error, :gone} -> :gone
+      true -> nil
     end
   end
 

@@ -429,6 +429,9 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
       "unreadable" ->
         gettext("What this bulk action held no longer exists, so it can't run.")
 
+      "gone" ->
+        gettext("The action this bulk action runs no longer exists, so it can't run.")
+
       "resolver_prepare_error" ->
         gettext("The bulk action couldn't be prepared. Please check your data and try again.")
 
