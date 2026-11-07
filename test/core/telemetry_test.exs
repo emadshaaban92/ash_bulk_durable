@@ -88,7 +88,9 @@ defmodule AshBulkDurable.Core.TelemetryTest do
       assert :ok = Worker.run_now(bulk_action_id)
 
       assert_receive {:telemetry, [:ash_bulk_durable, :worker_attempt, :start], %{system_time: _},
-                      %{bulk_action_id: ^bulk_action_id, attempt: nil, pending_rows_at_start: 3}}
+                      %{bulk_action_id: ^bulk_action_id, pending_rows_at_start: 3} = metadata}
+
+      refute Map.has_key?(metadata, :attempt)
 
       assert_receive {:telemetry, [:ash_bulk_durable, :bulk_action, :start], %{system_time: _},
                       %{
@@ -122,18 +124,6 @@ defmodule AshBulkDurable.Core.TelemetryTest do
       assert_receive {:telemetry, [:ash_bulk_durable, :bulk_action, :stop],
                       %{duration: _, rows_done: 3, rows_failed: 0},
                       %{bulk_action_id: ^bulk_action_id, status: :completed, failure_reason: nil}}
-    end
-  end
-
-  describe "an attempt given to the run" do
-    test "the attempt start reports it", %{super_user: user} do
-      suffix = System.unique_integer([:positive])
-      bulk_action = create_bulk_action!(region_rows(1, suffix), 50, user.id)
-      bulk_action_id = bulk_action.id
-      assert :ok = Worker.run(bulk_action_id, attempt: 3)
-
-      assert_receive {:telemetry, [:ash_bulk_durable, :worker_attempt, :start], _,
-                      %{bulk_action_id: ^bulk_action_id, attempt: 3, pending_rows_at_start: 1}}
     end
   end
 

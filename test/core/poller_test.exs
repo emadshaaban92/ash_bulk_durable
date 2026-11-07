@@ -172,12 +172,13 @@ defmodule AshBulkDurable.Core.PollerTest do
       assert eventually(fn -> Enum.all?([old1, old2], &(reload(&1).status == :completed)) end)
     end
 
-    test "logs a run that crashes, frees its slot and fills it", ctx do
+    test "logs a run that crashes, and leaves its slot for the next poll", ctx do
       [crashing, next] = Enum.map(1..2, fn i -> submit!(ctx, 1, user: "u#{i}") end)
       crashes = :counters.new(1, [])
+      starts = count_starts([next])
 
       # Its first run dies before it starts, so it is still queued, and the
-      # oldest: the freed slot goes to it again.
+      # oldest: filled at once, the freed slot would go to it again.
       attach([:ash_bulk_durable, :worker_attempt, :start], fn %{bulk_action_id: id} ->
         if id == crashing.id and :counters.get(crashes, 1) == 0 do
           :counters.add(crashes, 1, 1)
@@ -189,11 +190,52 @@ defmodule AshBulkDurable.Core.PollerTest do
         capture_log(fn ->
           start_poller!(max_running: 1)
           Poller.nudge()
-          assert eventually(fn -> reload(next).status == :completed end)
+          assert eventually(fn -> :counters.get(crashes, 1) == 1 and Poller.running() == [] end)
+          Process.sleep(300)
         end)
 
       assert log =~ "bulk action #{crashing.id} crashed: killed"
-      assert eventually(fn -> reload(crashing).status == :completed end)
+      assert starts.() == %{next.id => 0}
+      assert %{status: :queued} = reload(crashing)
+
+      # The next poll fills it.
+      Poller.nudge()
+      assert eventually(fn -> reload(next).status == :completed end)
+      assert %{status: :completed} = reload(crashing)
+    end
+
+    test "on shutdown clears the hint of a run it kills, so the next poll resumes it", ctx do
+      bulk_action = submit!(ctx, 2, chunk_size: 2)
+      test_pid = self()
+      once = :counters.new(1, [])
+
+      # Only the first run's chunk outlasts the grace period.
+      attach([:ash_bulk_durable, :chunk, :start], fn %{bulk_action_id: id} ->
+        if id == bulk_action.id and :counters.get(once, 1) == 0 do
+          :counters.add(once, 1, 1)
+          send(test_pid, {:chunk_started, self()})
+          Process.sleep(5_000)
+        end
+      end)
+
+      start_poller!(shutdown_grace: 200)
+      Poller.nudge()
+      assert_receive {:chunk_started, run}, 2_000
+      monitor = Process.monitor(run)
+      log = capture_log(fn -> stop_supervised!(Poller) end)
+      assert_receive {:DOWN, ^monitor, :process, ^run, :killed}, 1_000
+      refute log =~ "couldn't be marked"
+
+      assert %{status: :running, rows_done: 0, shutdown_stopped: true, alive_at: nil} =
+               reload(bulk_action)
+
+      # Another node's poller, with a stale_after the killed run's hint would
+      # still be well within, resumes it at once.
+      start_poller!(stale_after: :timer.hours(1))
+      Poller.nudge()
+      assert eventually(fn -> reload(bulk_action).status == :completed end)
+      assert %{stalled_starts: 0} = reload(bulk_action)
+      assert created(ctx) == codes(ctx, 1..2)
     end
 
     test "on shutdown lets a running chunk finish within the grace period", ctx do
