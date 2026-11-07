@@ -726,7 +726,7 @@ defmodule AshBulkDurable.FacadeTest do
       assert {:error, {:unknown_type, ".txt"}} =
                "notes.txt" |> write_file!("a,b\n1,2\n") |> AshBulkDurable.read_sheet()
 
-      assert {:error, {:in2csv, _status, _output}} =
+      assert {:error, {:xlsx, _reason}} =
                "broken.xlsx" |> write_file!("not a workbook") |> AshBulkDurable.read_sheet()
 
       assert {:error, %File.Error{}} = AshBulkDurable.read_sheet("/nonexistent/sheet.csv")

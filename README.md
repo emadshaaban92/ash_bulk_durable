@@ -41,8 +41,10 @@ def deps do
 end
 ```
 
-Reading an XLSX shells out to `in2csv`, from [csvkit](https://csvkit.readthedocs.io).
-CSV needs nothing.
+CSV and XLSX need no system packages. An XLSX is read by
+[calamine](https://github.com/tafia/calamine), a Rust library, through
+`spreadsheet`'s precompiled NIF, downloaded at compile time for the common
+Linux, macOS and Windows targets.
 
 ## Setup
 
@@ -152,6 +154,7 @@ repo's pool for `:max_running` times `:phase1_concurrency + 2`.
 | `:phase1_concurrency` | `4` | rows resolved at once |
 | `:field_handlers` | `[]` | handlers tried before the built-in ones |
 | `:disable_defaults` | `[]` | built-in handlers to drop |
+| `:excel_reader` | `AshBulkDurable.Sheet.ExcelReader.Calamine` | the `AshBulkDurable.Sheet.ExcelReader` that reads an XLSX |
 | `:pubsub_module` | none | broadcasts each update, and progress hints, on `"bulk_action:<id>"` |
 | `:progress_interval` | 1000 ms | the least time between two progress hints of one kind from a run; `0` sends every one |
 
