@@ -115,3 +115,10 @@
   `reason: :setup_error` and the exception's message. Kills are never
   counted, and progress or a retry clears the count. Before, a per-row one
   was restarted every `:stale_after` forever.
+- An XLSX is read with `xlsx_reader` instead of shelling out to csvkit's
+  `in2csv`, so no Python is needed. Booleans read as `true`/`false` (they read
+  `True`, which Ash refused), large numbers keep their digits instead of an
+  exponent, a date in any custom format reads as a date, and a workbook with a
+  dropdown list no longer gets a Python warning in its header row.
+  `read_sheet/2` takes `:sheet`, a name or 0-based index, and returns
+  `{:error, {:xlsx, reason}}` or `{:error, {:unknown_sheet, sheet}}`.

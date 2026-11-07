@@ -41,8 +41,7 @@ def deps do
 end
 ```
 
-Reading an XLSX shells out to `in2csv`, from [csvkit](https://csvkit.readthedocs.io).
-CSV needs nothing.
+CSV and XLSX are read in Elixir, with no system packages to install.
 
 ## Setup
 
