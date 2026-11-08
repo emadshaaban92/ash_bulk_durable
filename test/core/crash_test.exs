@@ -28,14 +28,21 @@ defmodule AshBulkDurable.Core.CrashTest do
   end
 
   defmodule KillingResolver do
-    @moduledoc "Kills the run resolving it: its task, and the run linked to it."
+    @moduledoc """
+    Kills the run resolving it, as running out of memory or losing the node
+    would. Killing only its own task would fail just its row.
+    """
     @behaviour AshBulkDurable.Core.Resolver
 
     @impl true
     def prepare(_args, _context), do: {:ok, nil}
 
     @impl true
-    def resolve(_value, nil, _context), do: Process.exit(self(), :kill)
+    def resolve(_value, nil, _context) do
+      [run | _] = Process.get(:"$callers")
+      Process.exit(run, :kill)
+      Process.sleep(:infinity)
+    end
 
     @impl true
     def finish(nil), do: :ok

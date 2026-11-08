@@ -16,7 +16,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
 
   import ExUnit.CaptureLog
 
-  alias AshBulkDurable.Core.{ManyMatchesError, StagedFileError, Worker}
+  alias AshBulkDurable.Core.{ManyMatchesError, RowExitError, StagedFileError, Worker}
   alias AshBulkDurable.Test.{BulkAction, Row}
   alias AshBulkDurable.Test.Region
   alias AshBulkDurable.Test.Shelf
@@ -92,6 +92,36 @@ defmodule AshBulkDurable.Core.WorkerTest do
     defp poison?(value, phase) do
       value == Application.get_env(:ash_bulk_durable, :test_poison) and
         phase == Application.get_env(:ash_bulk_durable, :test_raise_in)
+    end
+  end
+
+  defmodule StoppingResolver do
+    @moduledoc """
+    Stops on the poison value the way `:test_stop_with` names: a throw, an
+    exit, or the task dying because a process linked to it crashed.
+    """
+    @behaviour AshBulkDurable.Core.Resolver
+
+    @impl true
+    def prepare(_args, _context), do: {:ok, nil}
+
+    @impl true
+    def resolve(value, nil, _context) do
+      if value == Application.get_env(:ash_bulk_durable, :test_poison),
+        do: stop(Application.get_env(:ash_bulk_durable, :test_stop_with))
+
+      {:ok, value}
+    end
+
+    @impl true
+    def finish(nil), do: :ok
+
+    defp stop(:throw), do: throw(:test_throw)
+    defp stop(:exit), do: exit(:test_exit)
+
+    defp stop(:linked_crash) do
+      spawn_link(fn -> exit(:test_linked_crash) end)
+      Process.sleep(:infinity)
     end
   end
 
@@ -474,6 +504,78 @@ defmodule AshBulkDurable.Core.WorkerTest do
         assert fresh.rows_done == 0
         assert regions_from(suffix, user) == []
       end
+    end
+  end
+
+  describe "a row whose resolver throws or exits" do
+    setup do
+      put_poison("Region AR 2")
+      on_exit(fn -> Application.delete_env(:ash_bulk_durable, :test_stop_with) end)
+      :ok
+    end
+
+    for {stop, {kind, message}} <- [
+          throw: {:throw, "resolving the row threw: :test_throw"},
+          exit: {:exit, "resolving the row exited: :test_exit"},
+          linked_crash: {:exit, "resolving the row exited: :test_linked_crash"}
+        ] do
+      test "per row, #{stop}: fails at once with what it was, logged, the rest run", %{
+        super_user: user
+      } do
+        Application.put_env(:ash_bulk_durable, :test_stop_with, unquote(stop))
+        suffix = System.unique_integer([:positive])
+
+        bulk_action =
+          create_bulk_action!(region_rows(5, suffix, StoppingResolver),
+            user_id: user.id,
+            chunk_size: 2
+          )
+
+        log =
+          capture_log(fn ->
+            assert :ok = Worker.run_now(bulk_action.id)
+          end)
+
+        assert log =~ "bulk action #{bulk_action.id} row 1"
+
+        fresh = reload(bulk_action)
+        assert fresh.status == :completed_with_errors
+        assert fresh.rows_done == 4
+        assert fresh.stalled_starts == 0
+
+        [r1, r2, r3, r4, r5] = list_rows(bulk_action.id)
+        assert Enum.map([r1, r3, r4, r5], & &1.status) == List.duplicate(:succeeded, 4)
+        assert r2.status == :failed
+        assert r2.attempts == 0
+        assert messages(r2.error) == unquote(message)
+        assert [%{error: %RowExitError{kind: unquote(kind)}}] = r2.error
+
+        assert length(regions_from(suffix, user)) == 4
+      end
+    end
+
+    test "all or nothing: fails naming the row, nothing written", %{super_user: user} do
+      Application.put_env(:ash_bulk_durable, :test_stop_with, :throw)
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(3, suffix, StoppingResolver),
+          user_id: user.id,
+          chunk_size: 3,
+          mode: :all_or_nothing
+        )
+
+      capture_log(fn -> assert :ok = Worker.run_now(bulk_action.id) end)
+
+      fresh = reload(bulk_action)
+      assert fresh.status == :failed
+      assert fresh.result["reason"] == "atomic_phase1_failed"
+      assert fresh.result["row_index"] == 1
+      assert fresh.rows_done == 0
+      assert regions_from(suffix, user) == []
+
+      r2 = bulk_action.id |> list_rows() |> Enum.at(1)
+      assert messages(r2.error) == "resolving the row threw: :test_throw"
     end
   end
 

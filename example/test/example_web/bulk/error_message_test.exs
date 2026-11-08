@@ -1,12 +1,12 @@
 defmodule ExampleWeb.Bulk.ErrorMessageTest do
   @moduledoc """
   What no page draws here: no resolver in this app answers a reference with
-  no match, and no identity a sheet looks up by matches two records, so these
-  sentences are worded directly.
+  no match, or throws or exits, and no identity a sheet looks up by matches
+  two records, so these sentences are worded directly.
   """
   use ExUnit.Case, async: true
 
-  alias AshBulkDurable.Core.{ManyMatchesError, NoMatchError}
+  alias AshBulkDurable.Core.{ManyMatchesError, NoMatchError, RowExitError}
   alias ExampleWeb.Bulk.ErrorMessage
 
   test "a resolver finding nothing reads on its field" do
@@ -31,5 +31,13 @@ defmodule ExampleWeb.Bulk.ErrorMessageTest do
 
     assert ErrorMessage.display_error(error) ==
              "Organization: more than one result in Organization matches Name = \"Acme\""
+  end
+
+  test "a resolver that throws or exits reads as unexpected, keeping its reason off the page" do
+    error =
+      RowExitError.new(:exit, {%RuntimeError{message: "SELECT a.lsid FROM cf.application"}, []})
+
+    assert ErrorMessage.display_error(error) ==
+             "This row hit an unexpected error, so nothing was saved for it."
   end
 end
