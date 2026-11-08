@@ -27,9 +27,11 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
       "Dismiss" button (`phx-click="dismiss_bulk_action"`). A `:failed` bulk action
       additionally renders the captured root cause (first offending row +
       humanized error, when the worker recorded one), the retry controls
-      below bar the abandon button, and a "Start again with same settings"
-      button (`phx-click="retry_same_settings"`) that lands the user back on
-      the form with the bulk action's resource / action / mapping pre-selected.
+      below with an "Abandon bulk action" button (the same event, behind a
+      `data-confirm` worded for the whole bulk action), and a "Start again
+      with same settings" button (`phx-click="retry_same_settings"`) that
+      lands the user back on the form with the bulk action's resource /
+      action / mapping pre-selected.
     * `:completed_with_errors` — parked until retried or abandoned:
       a prominent "Retry with corrections" zone (file picker + an
       explicit "Retry failed rows" button that fires once the host LV has
@@ -40,6 +42,20 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
       (`phx-click="abandon_failed_rows"`, behind a `data-confirm`
       spelling out that the rows and their uploaded files are gone for
       good).
+
+  ## Uploading files again on retry
+
+  A retryable bulk action whose mapped fields need a companion file (a
+  handler's `companion_requirement/1`) gets one upload per such field in
+  the retry zone, allocated by the host LV and passed in as
+  `retry_companions` (`[%{name:, field:, requirement:}]`, each `name` a key
+  of `uploads`). Files uploaded there replace every file the bulk action
+  held. The staging sweep keeps a `:failed` bulk action's files for a day
+  after it failed (`AshBulkDurable.Core.PurgeStaleStaging`), so past that
+  the zone says they may be gone and asks for them again; before it, and
+  for `:completed_with_errors`, whose files the sweep keeps, it says they
+  are only needed to replace the ones held. A refused file shows its error
+  under its input.
 
   The re-upload `live_file_input` only renders once the host LV has
   allocated a `:retry_csv` upload (passed in via `uploads`); the
@@ -61,6 +77,11 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
   attr :failed_preview, :list, default: []
   attr :retry_filename, :string, default: nil
   attr :retry_blocked_by, :string, default: nil
+  attr :retry_companions, :list, default: []
+
+  # How long the staging sweep keeps a `:failed` bulk action's files after
+  # it failed (`AshBulkDurable.Core.PurgeStaleStaging`).
+  @failed_files_kept_seconds 24 * 60 * 60
 
   def progress_panel(%{bulk_action: nil} = assigns), do: ~H""
 
@@ -155,6 +176,8 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
             mode={@bulk_action.mode}
             retry_upload={@retry_upload}
             retry_filename={@retry_filename}
+            companions={companion_uploads(@retry_companions, @uploads)}
+            files_gone?={files_gone?(@bulk_action)}
           />
 
           <div class="card-actions justify-end items-center gap-2">
@@ -239,6 +262,8 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
   attr :mode, :atom, required: true
   attr :retry_upload, :any, default: nil
   attr :retry_filename, :string, default: nil
+  attr :companions, :list, default: []
+  attr :files_gone?, :boolean, default: false
 
   defp retry_zone(assigns) do
     ~H"""
@@ -280,9 +305,71 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
           {gettext("Retry failed rows")}
         </button>
       </div>
+
+      <div :if={@companions != []} id="retry-companions" class="flex flex-col gap-3 mt-4">
+        <div :if={@files_gone?} role="alert" class="alert alert-warning text-sm">
+          {gettext(
+            "This bulk action failed more than a day ago, so the files uploaded with it may have been deleted. Upload them again with your corrections."
+          )}
+        </div>
+        <p :if={not @files_gone?} class="text-sm text-base-content/70">
+          {gettext(
+            "The files uploaded with this bulk action are kept. Upload them again only to replace them, all together."
+          )}
+        </p>
+        <.form
+          :for={companion <- @companions}
+          for={%{}}
+          phx-change="validate_retry_upload"
+          id={"retry-companion__#{companion.field.field.name}"}
+          class="flex flex-col gap-1"
+        >
+          <label class="text-sm text-base-content/80" for={companion.upload.ref}>
+            {companion.label}
+          </label>
+          <.live_file_input upload={companion.upload} class="file-input file-input-sm" />
+          <p
+            :for={error <- upload_error_messages(companion.upload)}
+            class="text-sm text-error"
+          >
+            {error}
+          </p>
+        </.form>
+      </div>
     </div>
     """
   end
+
+  # The retry zone's companion uploads the host LV allocated, with their
+  # labels. One not (yet) in `uploads` is left out.
+  defp companion_uploads(companions, uploads) do
+    for %{name: name, field: field, requirement: requirement} <- companions,
+        upload = Map.get(uploads, name) do
+      %{
+        field: field,
+        upload: upload,
+        label: ExampleWeb.Bulk.Components.FieldMappingPanel.companion_label(field, requirement)
+      }
+    end
+  end
+
+  defp files_gone?(%{status: :failed, finished_at: %DateTime{} = finished_at}),
+    do: DateTime.diff(DateTime.utc_now(), finished_at) > @failed_files_kept_seconds
+
+  defp files_gone?(_bulk_action), do: false
+
+  defp upload_error_messages(upload) do
+    upload.entries
+    |> Enum.flat_map(&Phoenix.Component.upload_errors(upload, &1))
+    |> Enum.concat(Phoenix.Component.upload_errors(upload))
+    |> Enum.uniq()
+    |> Enum.map(&upload_error_message/1)
+  end
+
+  defp upload_error_message(:not_accepted), do: gettext("That type of file isn't accepted.")
+  defp upload_error_message(:too_large), do: gettext("That file is too large.")
+  defp upload_error_message(:too_many_files), do: gettext("Only one file can be uploaded.")
+  defp upload_error_message(_error), do: gettext("That file couldn't be uploaded.")
 
   defp retry_instructions(:all_or_nothing) do
     gettext(
@@ -315,7 +402,22 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
     >
       {gettext("Abandon failed rows")}
     </button>
+    <button
+      :if={@bulk_action.status == :failed}
+      type="button"
+      class="btn btn-sm btn-error btn-soft"
+      phx-click="abandon_failed_rows"
+      data-confirm={abandon_confirmation(@bulk_action)}
+    >
+      {gettext("Abandon bulk action")}
+    </button>
     """
+  end
+
+  defp abandon_confirmation(%{status: :failed}) do
+    gettext(
+      "This bulk action will be permanently abandoned and the files uploaded with it deleted. Download the errors sheet first if you might run it again later — it can be uploaded as a new bulk action."
+    )
   end
 
   defp abandon_confirmation(bulk_action) do

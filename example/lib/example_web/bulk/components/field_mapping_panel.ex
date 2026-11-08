@@ -207,9 +207,11 @@ defmodule ExampleWeb.Bulk.Components.FieldMappingPanel do
     """
   end
 
-  # "ZIP for Photos": the file's format from the extensions it accepts, and
-  # the field's own label.
-  defp companion_label(%{field: field, resource: resource}, %{accept: accept}) do
+  @doc """
+  "ZIP for Photos": the file's format from the extensions it accepts, and
+  the field's own label.
+  """
+  def companion_label(%{field: field, resource: resource}, %{accept: accept}) do
     gettext("%{format} for %{field}",
       format: Enum.map_join(accept, "/", &(&1 |> String.trim_leading(".") |> String.upcase())),
       field: ExampleWeb.Bulk.Utils.field_label(field.name, resource)

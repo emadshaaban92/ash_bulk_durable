@@ -161,3 +161,7 @@
   `delete_file(key, opts)` and `list_objects/1` is `list_files(prefix, opts)`.
   The core passes empty `opts` today. A host's store renames its callbacks
   and writes the file instead of returning its bytes.
+- `example/`: the `/bulk` page's retry zone takes the files a bulk action's
+  mapping needs again, beside the corrected sheet, and says when a `:failed`
+  one's files may be gone (it failed more than a day ago). A `:failed` bulk
+  action gets an "Abandon bulk action" button.
