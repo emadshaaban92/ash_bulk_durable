@@ -139,7 +139,12 @@ defmodule ExampleWeb.Bulk.LiveView do
       )
       |> assign_allowed_resources()
       |> assign(uploaded_file: nil)
-      |> assign(retry_sheet: nil, retry_filename: nil, retry_blocked_by: nil)
+      |> assign(
+        retry_sheet: nil,
+        retry_filename: nil,
+        retry_blocked_by: nil,
+        retry_companions: []
+      )
       |> assign_csv_keys()
       |> assign(errors: [])
       |> assign(
@@ -190,14 +195,13 @@ defmodule ExampleWeb.Bulk.LiveView do
   # been auto-uploaded and parsed into `retry_sheet` by `on_retry_progress/3`;
   # this handler is where the user opts in to re-running the failed rows.
   # Decoupling apply from upload lets the user re-pick a different file (or
-  # back out entirely) before committing the retry.
+  # back out entirely) before committing the retry. Files uploaded again in
+  # the retry zone replace every file the bulk action held, so they go all
+  # together or not at all.
   def on_handle_event("submit_retry", _params, socket) do
     case {socket.assigns[:bulk_action], socket.assigns[:retry_sheet]} do
       {%{} = bulk_action, %AshBulkDurable.Sheet{} = sheet} ->
-        {:noreply,
-         socket
-         |> apply_retry(bulk_action, sheet)
-         |> assign(retry_sheet: nil, retry_filename: nil)}
+        {:noreply, submit_retry(socket, bulk_action, sheet)}
 
       _ ->
         {:noreply, socket}
@@ -252,9 +256,9 @@ defmodule ExampleWeb.Bulk.LiveView do
     end
   end
 
-  # Abandon the still-`:failed` rows of a `:completed_with_errors` bulk action.
-  # Marks the bulk action `:cancelled` (which deletes its staged files once
-  # the cancel commits) then patches home.
+  # Abandon a `:failed` bulk action, or the still-`:failed` rows of a
+  # `:completed_with_errors` one. Marks the bulk action `:cancelled` (which
+  # deletes its staged files once the cancel commits) then patches home.
   def on_handle_event("abandon_failed_rows", _params, socket) do
     socket =
       case socket.assigns.bulk_action do
@@ -424,7 +428,8 @@ defmodule ExampleWeb.Bulk.LiveView do
        socket
        |> assign(:bulk_action, data)
        |> assign(:failed_preview, failed_preview(data))
-       |> assign(:bulk_action_progress, keep_progress(socket, current, data))}
+       |> assign(:bulk_action_progress, keep_progress(socket, current, data))
+       |> sync_retry_companion_uploads()}
     else
       {:noreply, socket}
     end
@@ -493,11 +498,56 @@ defmodule ExampleWeb.Bulk.LiveView do
     end
   end
 
-  defp apply_retry(socket, bulk_action, sheet) do
+  defp submit_retry(socket, bulk_action, sheet) do
+    companions = socket.assigns.retry_companions
+
+    case retry_companions_state(socket, companions) do
+      {:refused, names} ->
+        put_flash(
+          socket,
+          :error,
+          gettext("Choose another file for: %{names}", names: join_names(names))
+        )
+
+      {:in_progress, names} ->
+        put_flash(
+          socket,
+          :error,
+          gettext(
+            "Still uploading: %{names}. Please wait for the upload to finish before retrying.",
+            names: join_names(names)
+          )
+        )
+
+      {:missing, names} ->
+        put_flash(
+          socket,
+          :error,
+          gettext(
+            "The files you upload again replace all of this bulk action's files. Upload %{names} too.",
+            names: join_names(names)
+          )
+        )
+
+      state ->
+        opts =
+          if state == :all,
+            do: [companions: retry_companion_keys(socket, companions)],
+            else: []
+
+        socket
+        |> apply_retry(bulk_action, sheet, opts)
+        |> assign(retry_sheet: nil, retry_filename: nil)
+    end
+  end
+
+  defp apply_retry(socket, bulk_action, sheet, opts) do
     socket = assign(socket, :retry_blocked_by, nil)
 
-    case AshBulkDurable.retry(bulk_action, sheet, scope: scope(socket)) do
+    case AshBulkDurable.retry(bulk_action, sheet, [scope: scope(socket)] ++ opts) do
       {:ok, retried} ->
+        drop_retry_companions(socket)
+
         put_flash(
           socket,
           :info,
@@ -690,6 +740,7 @@ defmodule ExampleWeb.Bulk.LiveView do
     |> assign(:retry_sheet, nil)
     |> assign(:retry_filename, nil)
     |> assign(:retry_blocked_by, nil)
+    |> sync_retry_companion_uploads()
   end
 
   # Up to `@failed_preview_limit` failed rows (their cells + a clean error)
@@ -837,6 +888,114 @@ defmodule ExampleWeb.Bulk.LiveView do
 
     retained = MapSet.difference(allocated_names, released)
     assign(socket, :companion_upload_names, MapSet.union(retained, fresh))
+  end
+
+  # The retry zone's companion slots: one per mapped field of a retryable
+  # bulk action whose handler declares a `companion_requirement/1`, set up
+  # as the submit form's are. A slot no longer wanted (the bulk action left
+  # its retryable state) is released as the form's are.
+  defp sync_retry_companion_uploads(socket) do
+    wanted = retry_companions(socket.assigns.bulk_action)
+    wanted_names = MapSet.new(wanted, & &1.name)
+    allocated = Map.get(socket.assigns, :retry_companion_names, MapSet.new())
+
+    {socket, released} =
+      release_stale_companion_uploads(socket, MapSet.difference(allocated, wanted_names))
+
+    socket =
+      wanted
+      |> Enum.reject(&MapSet.member?(allocated, &1.name))
+      |> Enum.reduce(socket, fn %{name: name, requirement: requirement}, acc ->
+        allow_upload(acc, name,
+          accept: requirement.accept,
+          max_entries: 1,
+          max_file_size: requirement.max_bytes,
+          auto_upload: true,
+          external: &presign_companion/2
+        )
+      end)
+
+    socket
+    |> assign(
+      :retry_companion_names,
+      allocated |> MapSet.difference(released) |> MapSet.union(wanted_names)
+    )
+    |> assign(:retry_companions, wanted)
+  end
+
+  defp retry_companions(%{status: status} = bulk_action)
+       when status in [:completed_with_errors, :failed] do
+    bulk_action
+    |> Mapping.from_bulk_action()
+    |> Mapping.fields()
+    |> Enum.flat_map(fn field ->
+      case ViewOptions.companion_requirement_for(field) do
+        nil ->
+          []
+
+        requirement ->
+          [%{name: retry_companion_upload_name(field), field: field, requirement: requirement}]
+      end
+    end)
+  rescue
+    # A resource or action gone since it failed offers nothing to upload.
+    _stale_bulk_action -> []
+  end
+
+  defp retry_companions(_bulk_action), do: []
+
+  # Safe to construct at runtime: `name` is an Ash attribute/argument atom,
+  # never user input (as `ViewOptions.companion_upload_name/1`).
+  # sobelow_skip ["DOS.BinToAtom"]
+  defp retry_companion_upload_name(%{field: %{name: name}}), do: :"retry_companion__#{name}"
+
+  # `:none` when no file was uploaded again, `:all` when every one was, or
+  # what stops the retry: a refused file, one still uploading, or some of
+  # them missing.
+  defp retry_companions_state(socket, companions) do
+    states =
+      Enum.map(companions, fn %{name: name, field: field} ->
+        {retry_upload_state(socket.assigns.uploads[name]), field.field.name}
+      end)
+
+    names = fn state -> for {^state, name} <- states, do: name end
+
+    cond do
+      names.(:refused) != [] -> {:refused, names.(:refused)}
+      names.(:in_progress) != [] -> {:in_progress, names.(:in_progress)}
+      names.(:missing) == [] and states != [] -> :all
+      names.(:ok) == [] -> :none
+      true -> {:missing, names.(:missing)}
+    end
+  end
+
+  defp retry_upload_state(%{entries: [_ | _] = entries}) do
+    cond do
+      not Enum.all?(entries, & &1.valid?) -> :refused
+      Enum.all?(entries, & &1.done?) -> :ok
+      true -> :in_progress
+    end
+  end
+
+  defp retry_upload_state(_upload), do: :missing
+
+  # The staging keys of the files uploaded again, `%{field_name => key}`,
+  # left on their slots (`:postpone`) so a refused retry keeps them for the
+  # next try. `drop_retry_companions/1` consumes them once a retry is taken.
+  defp retry_companion_keys(socket, companions) do
+    companions
+    |> Enum.flat_map(fn %{name: upload_name, field: field} ->
+      consume_uploaded_entries(socket, upload_name, fn meta, _entry ->
+        {:postpone, {field.field.name, meta.key}}
+      end)
+    end)
+    |> Map.new()
+  end
+
+  defp drop_retry_companions(socket) do
+    Enum.each(socket.assigns.retry_companions, fn %{name: upload_name} ->
+      consume_uploaded_entries(socket, upload_name, fn _meta, _entry -> {:ok, nil} end)
+    end)
   end
 
   # `disallow_upload/2` raises if the slot has any entries (completed or in

@@ -133,6 +133,9 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanelTest do
 
       # No Dismiss in this state — the user is meant to retry or abandon.
       refute html =~ ">Dismiss<"
+
+      # "Abandon bulk action" is the :failed panel's.
+      refute html =~ "Abandon bulk action"
     end
 
     test "renders the retry live_file_input once a :retry_csv upload is allocated" do
@@ -244,7 +247,7 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanelTest do
       end
     end
 
-    test ":failed can be corrected and retried, but not abandoned" do
+    test ":failed can be corrected and retried, or abandoned whole" do
       html = render_panel(bulk_action(%{status: :failed, mode: :all_or_nothing, result: %{}}))
 
       assert html =~ ~s(phx-click="dismiss_bulk_action")
@@ -252,6 +255,10 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanelTest do
       assert html =~ "Upload corrections to retry"
       assert html =~ "to run the whole bulk action again"
       refute html =~ "Abandon failed rows"
+
+      assert html =~ "Abandon bulk action"
+      assert html =~ ~s(phx-click="abandon_failed_rows")
+      assert html =~ "This bulk action will be permanently abandoned"
     end
 
     test ":failed renders reason-derived copy" do

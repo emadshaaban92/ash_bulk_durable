@@ -287,6 +287,204 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
     refute product(without_file)
   end
 
+  test "a failed bulk action whose ZIP the sweep took finishes once the ZIP is uploaded again",
+       %{conn: conn, super_user: user} do
+    sku = sku()
+
+    {:ok, view, _html} = conn |> login_as(user) |> live(~p"/bulk")
+    choose(view, "create")
+
+    bulk_action =
+      submit(view, user, "sku,stock,photos\n#{sku},-1,front.pdf\n", %{"all_or_nothing" => "on"})
+
+    assert drain_finished(bulk_action).status == :failed
+    [[extracted]] = kept_files(bulk_action)
+
+    # Within the day its files are kept, so uploading them again is optional.
+    html = render(view)
+    assert html =~ "ZIP for Photos"
+    assert html =~ "are kept. Upload them again only to replace them"
+
+    # A day on, the sweep takes the ZIP, and the photo the row extracted went too.
+    sweep_staging(bulk_action)
+    sweep(extracted)
+
+    {:ok, view, html} =
+      conn |> login_as(user) |> live(~p"/bulk?bulk_action=#{bulk_action.id}")
+
+    html = if html =~ "bulk-action-panel", do: html, else: render(view)
+
+    assert html =~
+             "failed more than a day ago, so the files uploaded with it may have been deleted"
+
+    # The corrected sheet alone has nothing to extract the photo from.
+    retry(view, bulk_action)
+
+    assert %{status: :failed, result: %{"reason" => "staged_file_download_error"}} =
+             drain_finished(bulk_action)
+
+    # With the ZIP uploaded again, the row reads the new one.
+    view
+    |> file_input("#retry-companion__photos", :retry_companion__photos, [
+      %{name: "photos.zip", content: "presigned", type: "application/zip"}
+    ])
+    |> render_upload("photos.zip")
+
+    retry(view, bulk_action)
+
+    retried = Ash.get!(BulkAction, bulk_action.id, authorize?: false)
+    assert [{"photos", key}] = Map.to_list(retried.staged_files)
+    assert String.starts_with?(key, "bulk-staging/#{user.id}/")
+    refute key in Map.values(bulk_action.staged_files)
+
+    # The browser's PUT to the presigned URL.
+    TestStorage.put(key, zip([{~c"front.pdf", "the new front"}]))
+
+    assert drain_finished(bulk_action).status == :completed
+    assert %{stock: 7, photos: [photo]} = product(sku)
+    assert stored(photo) == "the new front"
+  end
+
+  test "a refused file uploaded again shows its error and the retry writes nothing",
+       %{conn: conn, super_user: user} do
+    sku = sku()
+
+    {:ok, view, _html} = conn |> login_as(user) |> live(~p"/bulk")
+    choose(view, "create")
+
+    bulk_action =
+      submit(view, user, "sku,stock,photos\n#{sku},-1,front.pdf\n", %{"all_or_nothing" => "on"})
+
+    failed = drain_finished(bulk_action)
+    assert failed.status == :failed
+    rows = AshBulkDurable.Core.open_rows(failed)
+
+    assert {:error, [[_ref, %{reason: :not_accepted}]]} =
+             view
+             |> file_input("#retry-companion__photos", :retry_companion__photos, [
+               %{name: "photos.txt", content: "not a zip", type: "text/plain"}
+             ])
+             |> render_upload("photos.txt")
+
+    assert render(view) =~ "That type of file isn&#39;t accepted."
+
+    html = retry(view, bulk_action)
+    assert html =~ "Choose another file for: photos"
+
+    assert Ash.get!(BulkAction, bulk_action.id, authorize?: false) == failed
+    assert AshBulkDurable.Core.open_rows(failed) == rows
+    refute product(sku)
+  end
+
+  test "a retry clicked while the ZIP is still uploading waits for it and writes nothing",
+       %{conn: conn, super_user: user} do
+    {:ok, view, _html} = conn |> login_as(user) |> live(~p"/bulk")
+    choose(view, "create")
+
+    bulk_action =
+      submit(view, user, "sku,stock,photos\n#{sku()},-1,front.pdf\n", %{"all_or_nothing" => "on"})
+
+    failed = drain_finished(bulk_action)
+    assert failed.status == :failed
+
+    view
+    |> file_input("#retry-companion__photos", :retry_companion__photos, [
+      %{name: "photos.zip", content: "presigned", type: "application/zip"}
+    ])
+    |> render_upload("photos.zip", 50)
+
+    assert retry(view, bulk_action) =~ "Still uploading: photos"
+    assert Ash.get!(BulkAction, bulk_action.id, authorize?: false) == failed
+  end
+
+  test "a refused retry keeps the ZIP uploaded again for the next try",
+       %{conn: conn, super_user: user} do
+    {:ok, view, _html} = conn |> login_as(user) |> live(~p"/bulk")
+    choose(view, "create")
+
+    bulk_action =
+      submit(view, user, "sku,stock,photos\n#{sku()},-1,front.pdf\n", %{"all_or_nothing" => "on"})
+
+    assert drain_finished(bulk_action).status == :failed
+    [row] = AshBulkDurable.Core.open_rows(bulk_action)
+
+    view
+    |> file_input("#retry-companion__photos", :retry_companion__photos, [
+      %{name: "photos.zip", content: "presigned", type: "application/zip"}
+    ])
+    |> render_upload("photos.zip")
+
+    # A sheet naming a row that isn't this bulk action's is refused whole.
+    upload_correction(
+      view,
+      bulk_action |> errors_sheet() |> String.replace(row.id, Ecto.UUID.generate())
+    )
+
+    assert view |> element("#bulk-action-panel button", "Retry failed rows") |> render_click() =~
+             "1 row didn&#39;t match the original bulk action."
+
+    # The ZIP is still there: the next retry takes it without uploading it again.
+    retry(view, bulk_action)
+
+    assert [{"photos", key}] =
+             Map.to_list(Ash.get!(BulkAction, bulk_action.id, authorize?: false).staged_files)
+
+    refute key in Map.values(bulk_action.staged_files)
+  end
+
+  test "a taken retry clears the ZIP uploaded again from the page",
+       %{conn: conn, super_user: user} do
+    {:ok, view, _html} = conn |> login_as(user) |> live(~p"/bulk")
+    choose(view, "create")
+
+    bulk_action =
+      submit(view, user, "sku,stock,photos\n#{sku()},-1,front.pdf\n", %{"all_or_nothing" => "on"})
+
+    assert drain_finished(bulk_action).status == :failed
+
+    view
+    |> file_input("#retry-companion__photos", :retry_companion__photos, [
+      %{name: "photos.zip", content: "presigned", type: "application/zip"}
+    ])
+    |> render_upload("photos.zip")
+
+    assert view |> element("#retry-companion__photos") |> render() =~ ~r/data-phx-done-refs="\d+"/
+
+    # The sheet as it was: the retry is taken, and fails again.
+    upload_correction(view, errors_sheet(bulk_action))
+    view |> element("#bulk-action-panel button", "Retry failed rows") |> render_click()
+    retried = Ash.get!(BulkAction, bulk_action.id, authorize?: false)
+    Enum.each(retried.staged_files, fn {_name, key} -> TestStorage.put(key, zip()) end)
+    assert drain_finished(bulk_action).status == :failed
+
+    # Failed again, the page asks for the files afresh rather than passing the
+    # taken ZIP's key again.
+    assert view |> element("#retry-companion__photos") |> render() =~ ~s(data-phx-done-refs="")
+  end
+
+  test "abandoning a failed bulk action cancels it and deletes its files",
+       %{conn: conn, super_user: user} do
+    {:ok, view, _html} = conn |> login_as(user) |> live(~p"/bulk")
+    choose(view, "create")
+
+    bulk_action =
+      submit(view, user, "sku,stock,photos\n#{sku()},-1,front.pdf\n", %{"all_or_nothing" => "on"})
+
+    assert drain_finished(bulk_action).status == :failed
+    staged = Map.values(bulk_action.staged_files)
+    assert Enum.all?(staged, &(&1 in TestStorage.keys()))
+
+    abandon = view |> element("#bulk-action-panel button", "Abandon bulk action")
+    assert render(abandon) =~ "This bulk action will be permanently abandoned"
+
+    render_click(abandon)
+
+    assert_patch(view, "/bulk")
+    refute render(view) =~ "bulk-action-panel"
+    assert Ash.get!(BulkAction, bulk_action.id, authorize?: false).status == :cancelled
+    refute Enum.any?(staged, &(&1 in TestStorage.keys()))
+  end
+
   defp sku, do: "SKU#{System.unique_integer([:positive])}"
 
   defp product! do
@@ -338,17 +536,16 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
     bulk_action
   end
 
-  defp zip do
+  defp zip(
+         files \\ [
+           {~c"front.pdf", "front.pdf"},
+           {~c"back.pdf", "back.pdf"},
+           {~c"slow.pdf", "slow.pdf"}
+         ]
+       ) do
     {:ok, path} = Briefly.create(extname: ".zip")
     File.rm!(path)
-
-    {:ok, _} =
-      :zip.create(String.to_charlist(path), [
-        {~c"front.pdf", "front.pdf"},
-        {~c"back.pdf", "back.pdf"},
-        {~c"slow.pdf", "slow.pdf"}
-      ])
-
+    {:ok, _} = :zip.create(String.to_charlist(path), files)
     File.read!(path)
   end
 

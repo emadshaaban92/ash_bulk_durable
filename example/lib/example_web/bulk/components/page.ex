@@ -57,6 +57,7 @@ defmodule ExampleWeb.Bulk.Components.Page do
           failed_preview={@failed_preview}
           retry_filename={@retry_filename}
           retry_blocked_by={@retry_blocked_by}
+          retry_companions={@retry_companions}
         />
       <% @params["bulk_action"] -> %>
         <%!--
