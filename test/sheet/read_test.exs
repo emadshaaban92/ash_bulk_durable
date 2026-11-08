@@ -162,6 +162,23 @@ defmodule AshBulkDurable.Sheet.ReadTest do
     assert {:ok, %Sheet{}} = Sheet.read(path, max_cells: 100)
   end
 
+  test "a filled cell past the last header names the row it is on, blank rows counted" do
+    path = Path.join(System.tmp_dir!(), "#{System.unique_integer([:positive])}-long.xlsx")
+    rows = [[], ["name", "qty"], ["Ann", "1"], [], ["Bob", "2", "x"]]
+    File.write!(path, workbook([{"Data", rows, ""}]))
+    on_exit(fn -> File.rm(path) end)
+
+    assert {:error, {:extra_cells, 5}} = Sheet.read(path)
+  end
+
+  test "blank rows above the header are skipped" do
+    path = Path.join(System.tmp_dir!(), "#{System.unique_integer([:positive])}-low.xlsx")
+    File.write!(path, workbook([{"Data", [[], [], ["name"], ["Ann"]], ""}]))
+    on_exit(fn -> File.rm(path) end)
+
+    assert {:ok, %Sheet{headers: ["name"], rows: [%{"name" => "Ann"}]}} = Sheet.read(path)
+  end
+
   test "a file that is not a workbook is an error, not a raise" do
     path = Path.join(System.tmp_dir!(), "#{System.unique_integer([:positive])}-broken.xlsx")
     File.write!(path, "not a workbook")

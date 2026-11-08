@@ -171,3 +171,21 @@
   points at. Before, the sweep judged it by the status it read first and
   could delete them under the retry. A retry or abandon that comes while the
   sweep holds the lock is refused, as while any other transaction holds it.
+- A sheet whose shape hides a mistake is refused instead of read with cells
+  lost: two columns under one header return `{:error, {:duplicate_headers,
+  headers}}` (blank headers may repeat), and a row with a filled cell past
+  the last named header `{:error, {:extra_cells, row}}`, `row` being its
+  number in the file. Blank headers after the last named one are dropped,
+  and blank cells under them, such as a trailing comma's, are still fine.
+  Blank rows above the header are skipped. Applies to CSV and XLSX;
+  `ExcelReader.Calamine` now keeps blank rows, so an XLSX row's number is
+  its row in the sheet.
+- A chunk whose write meets the database's own trouble (a dropped
+  connection, a deadlock or serialization failure, a lock or statement
+  timeout, the server shutting down or out of resources:
+  `Core.Transient`) no longer fails rows with it. The run raises, its rows
+  stay `:resolved`, and the next start runs them. Before, recovery failed
+  each such row with the database's message, and its owner had to retry it
+  by hand. A lock timeout on the row's own write arrives from AshPostgres
+  as `Ash.Error.Invalid.Unavailable`, and counts too. A host's own raise,
+  however it is worded, still fails its row.

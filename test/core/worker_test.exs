@@ -195,6 +195,43 @@ defmodule AshBulkDurable.Core.WorkerTest do
     def finish(nil), do: :ok
   end
 
+  defmodule DatabaseTroubleResolver do
+    @moduledoc """
+    Resolves a value to itself. Writing the poison value meets the
+    database's own trouble, a real `statement_timeout` (SQLSTATE 57014),
+    inside the chunk's transaction; writing the value in `:test_refuse` is
+    refused as a row error is.
+    """
+    @behaviour AshBulkDurable.Core.Resolver
+
+    alias AshBulkDurable.Test.Repo
+
+    @impl true
+    def prepare(_args, _context), do: {:ok, nil}
+
+    @impl true
+    def resolve(value, nil, _context), do: {:ok, value}
+
+    @impl true
+    def finish(nil), do: :ok
+
+    @impl true
+    def after_write(_record, value, _context) do
+      cond do
+        value == Application.get_env(:ash_bulk_durable, :test_poison) ->
+          Repo.query!("SET LOCAL statement_timeout = 1")
+          Repo.query!("SELECT pg_sleep(1)")
+
+        value == Application.get_env(:ash_bulk_durable, :test_refuse) ->
+          {:error,
+           Ash.Error.Changes.InvalidAttribute.exception(field: :native_name, message: "refused")}
+
+        true ->
+          :ok
+      end
+    end
+  end
+
   defmodule UnpreparableResolver do
     @moduledoc "A resolver whose chunk can't be readied, as a corrupt companion ZIP."
     @behaviour AshBulkDurable.Core.Resolver
@@ -498,6 +535,125 @@ defmodule AshBulkDurable.Core.WorkerTest do
       assert r5.status == :succeeded
 
       assert is_binary(messages(r3.error)) and messages(r3.error) != ""
+    end
+  end
+
+  describe "a row that meets the database's own trouble" do
+    setup do
+      put_poison("Region AR 2")
+      on_exit(fn -> Application.delete_env(:ash_bulk_durable, :test_refuse) end)
+      :ok
+    end
+
+    test "per row, the run raises with every row of its chunk still to run, and the next start runs them",
+         %{super_user: user} do
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(3, suffix, DatabaseTroubleResolver),
+          user_id: user.id,
+          chunk_size: 3
+        )
+
+      capture_log(fn ->
+        assert_raise Ash.Error.Unknown, ~r/57014.*statement timeout/s, fn ->
+          Worker.run_now(bulk_action.id)
+        end
+      end)
+
+      assert %{status: :running, rows_done: 0} = reload(bulk_action)
+      assert Enum.map(list_rows(bulk_action.id), & &1.status) == List.duplicate(:resolved, 3)
+      assert regions_from(suffix, user) == []
+
+      Application.delete_env(:ash_bulk_durable, :test_poison)
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      assert %{status: :completed, rows_done: 3} = reload(bulk_action)
+      assert length(regions_from(suffix, user)) == 3
+    end
+
+    test "per row, met in recovery, the run raises: the rows before it keep how they went",
+         %{super_user: user} do
+      Application.put_env(:ash_bulk_durable, :test_refuse, "Region AR 1")
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(3, suffix, DatabaseTroubleResolver),
+          user_id: user.id,
+          chunk_size: 3
+        )
+
+      capture_log(fn ->
+        assert_raise Ash.Error.Unknown, ~r/57014/, fn -> Worker.run_now(bulk_action.id) end
+      end)
+
+      assert [%{status: :failed} = r1, %{status: :resolved}, %{status: :resolved}] =
+               list_rows(bulk_action.id)
+
+      assert messages(r1.error) =~ "refused"
+      assert %{status: :running, rows_done: 0} = reload(bulk_action)
+    end
+
+    # AshPostgres turns a lock timeout on its own write into
+    # `Ash.Error.Invalid.Unavailable`, not a `Postgrex.Error`.
+    test "per row, a lock timeout on the row's own write: the run raises, and runs it once the lock is free",
+         %{super_user: user} do
+      Application.delete_env(:ash_bulk_durable, :test_poison)
+      suffix = System.unique_integer([:positive])
+      bulk_action = create_bulk_action!(region_rows(3, suffix), user_id: user.id, chunk_size: 3)
+
+      # Another transaction holds row 2's code, uncommitted, so its insert
+      # waits on it until `lock_timeout`.
+      {:ok, other} =
+        AshBulkDurable.Test.Repo.config()
+        |> Keyword.drop([:pool, :pool_size])
+        |> Postgrex.start_link()
+
+      # Unlinked, so it outlives the test process for `on_exit/1` to stop.
+      Process.unlink(other)
+      on_exit(fn -> GenServer.stop(other) end)
+      Postgrex.query!(other, "BEGIN", [])
+
+      Postgrex.query!(
+        other,
+        "INSERT INTO regions (code, name, native_name) VALUES ($1, $2, $2)",
+        ["B2-#{suffix}", "held-#{suffix}"]
+      )
+
+      AshBulkDurable.Test.Repo.query!("SET LOCAL lock_timeout = '200ms'")
+
+      capture_log(fn ->
+        assert_raise Ash.Error.Invalid, ~r/lock timeout/, fn -> Worker.run_now(bulk_action.id) end
+      end)
+
+      assert %{status: :running, rows_done: 0} = reload(bulk_action)
+      assert Enum.map(list_rows(bulk_action.id), & &1.status) == List.duplicate(:resolved, 3)
+
+      Postgrex.query!(other, "ROLLBACK", [])
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      assert %{status: :completed, rows_done: 3} = reload(bulk_action)
+      assert length(regions_from(suffix, user)) == 3
+    end
+
+    test "all or nothing, the run raises instead of failing the bulk action", %{
+      super_user: user
+    } do
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(3, suffix, DatabaseTroubleResolver),
+          user_id: user.id,
+          chunk_size: 3,
+          mode: :all_or_nothing
+        )
+
+      capture_log(fn ->
+        assert_raise Ash.Error.Unknown, ~r/57014/, fn -> Worker.run_now(bulk_action.id) end
+      end)
+
+      assert %{status: :running, rows_done: 0} = reload(bulk_action)
+      assert Enum.map(list_rows(bulk_action.id), & &1.status) == List.duplicate(:resolved, 3)
     end
   end
 

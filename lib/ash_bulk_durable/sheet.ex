@@ -54,7 +54,8 @@ defmodule AshBulkDurable.Sheet do
   @doc """
   A sheet read by `read/2`: its `headers` in the file's order, and its
   `rows`, each `%{header => cell}` with the cell trimmed. A row of blank
-  cells is dropped.
+  cells is dropped, and a row shorter than the headers reads its missing
+  cells as blank.
   """
   defstruct headers: [], rows: []
 
@@ -75,12 +76,20 @@ defmodule AshBulkDurable.Sheet do
   `{:error, {:too_many_cells, max_cells}}`, a sheet the file lacks
   `{:error, {:unknown_sheet, sheet}}`, and a file the reader cannot read
   `{:error, {:xlsx, reason}}`.
+
+  Either type is refused, rather than read with cells lost, when two
+  columns share a header, `{:error, {:duplicate_headers, headers}}` (blank
+  headers may repeat), or when a row has a filled cell past the last named
+  header, `{:error, {:extra_cells, row}}`: the classic unquoted comma.
+  `row` is the row's number in the file, its line in a CSV with no line
+  break in a cell. Blank headers after the last named one are dropped from
+  `headers`, and blank cells under them, such as a trailing comma's, are
+  fine. Blank rows above the header are skipped.
   """
   def read(path, opts \\ []) do
     case Keyword.get_lazy(opts, :type, fn -> type(path) end) do
       :csv ->
-        {:ok,
-         path |> File.read!() |> strip_bom() |> CSV.parse_string(skip_headers: false) |> build()}
+        path |> File.read!() |> strip_bom() |> CSV.parse_string(skip_headers: false) |> build()
 
       :xlsx ->
         read_xlsx(path, opts)
@@ -109,7 +118,7 @@ defmodule AshBulkDurable.Sheet do
              sheet: Keyword.get(opts, :sheet, 0),
              max_cells: Keyword.get(opts, :max_cells, @max_cells)
            ) do
-      {:ok, build(rows)}
+      build(rows)
     end
   end
 
@@ -119,21 +128,80 @@ defmodule AshBulkDurable.Sheet do
       else: {:error, %File.Error{reason: :enoent, action: "read file", path: path}}
   end
 
-  defp build([]), do: %__MODULE__{}
+  # Blank rows above the header are skipped, but counted, so a row's
+  # number is still its row in the file.
+  defp build(rows) do
+    case Enum.split_while(rows, &blank_cells?/1) do
+      {_blank, []} ->
+        {:ok, %__MODULE__{}}
 
-  defp build([headers | rows]) do
-    %__MODULE__{
-      headers: headers,
-      rows:
-        rows
-        |> Enum.map(fn row ->
-          headers
-          |> Enum.zip(Stream.concat(row, Stream.repeatedly(fn -> "" end)))
-          |> Map.new(fn {k, v} -> {k, String.trim(v)} end)
-        end)
-        |> Enum.reject(fn row -> Enum.all?(row, fn {_header, cell} -> cell == "" end) end)
-    }
+      {blank, [headers | rows]} ->
+        headers = drop_trailing_blanks(headers)
+
+        with :ok <- unique_headers(headers),
+             {:ok, rows} <- build_rows(headers, rows, length(blank) + 2) do
+          {:ok, %__MODULE__{headers: headers, rows: rows}}
+        end
+    end
   end
+
+  defp blank_cells?(cells), do: Enum.all?(cells, &(String.trim(&1) == ""))
+
+  # A header row ends at its last named column: an XLSX's is as wide as the
+  # sheet's used range, and a CSV's may end in a comma. A filled cell past
+  # it has no header, so it counts as past the last header.
+  defp drop_trailing_blanks(headers) do
+    headers |> Enum.reverse() |> Enum.drop_while(&(String.trim(&1) == "")) |> Enum.reverse()
+  end
+
+  # Two columns under one header would land on one key, the last cell
+  # winning. Blank headers repeat freely: no mapping can name them.
+  defp unique_headers(headers) do
+    case headers |> Enum.reject(&(String.trim(&1) == "")) |> duplicates() do
+      [] -> :ok
+      duplicates -> {:error, {:duplicate_headers, duplicates}}
+    end
+  end
+
+  defp duplicates(headers) do
+    headers
+    |> Enum.frequencies()
+    |> Enum.filter(fn {_header, count} -> count > 1 end)
+    |> Enum.map(fn {header, _count} -> header end)
+    |> Enum.sort()
+  end
+
+  # A short row reads its missing cells as blank. A long one is refused
+  # unless the cells past the last header are blank (a trailing comma, or
+  # the empty columns of an XLSX's used range): a filled one is the classic
+  # unquoted comma, and dropping it would shift nothing but lose data. The
+  # number is the row's in the file, `first` being the one after the header.
+  defp build_rows(headers, rows, first) do
+    width = length(headers)
+
+    rows
+    |> Enum.with_index(first)
+    |> Enum.reduce_while([], fn {row, number}, built ->
+      if row |> Enum.drop(width) |> blank_cells?(),
+        do: {:cont, [build_row(headers, row) | built]},
+        else: {:halt, {:error, {:extra_cells, number}}}
+    end)
+    |> case do
+      {:error, _reason} = error ->
+        error
+
+      built ->
+        {:ok, built |> Enum.reverse() |> Enum.reject(&blank_row?/1)}
+    end
+  end
+
+  defp build_row(headers, row) do
+    headers
+    |> Enum.zip(Stream.concat(row, Stream.repeatedly(fn -> "" end)))
+    |> Map.new(fn {k, v} -> {k, String.trim(v)} end)
+  end
+
+  defp blank_row?(row), do: Enum.all?(row, fn {_header, cell} -> cell == "" end)
 
   defp strip_bom(<<0xEF, 0xBB, 0xBF, rest::binary>>), do: rest
   defp strip_bom(content), do: content

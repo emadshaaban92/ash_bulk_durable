@@ -23,7 +23,9 @@ defmodule AshBulkDurable.Sheet.ExcelReader do
     * an empty cell as `""`.
 
   `Sheet` trims each cell, pads a short row with `""` and drops blank rows,
-  so a reader need not.
+  so a reader need not. A reader should keep blank rows, those above the
+  header included, as rows of `""`: `Sheet` names a row by its place in
+  the list, which is then its row number in the sheet.
   """
 
   @typedoc """
@@ -37,7 +39,8 @@ defmodule AshBulkDurable.Sheet.ExcelReader do
 
   @doc """
   Reads the sheet `opts` names from the XLSX at `path`, an existing file.
-  Returns its rows, the header row first, each a list of cells as above.
+  Returns its rows from the sheet's first, the header row first after any
+  blank ones, each a list of cells as above.
   Returns `{:error, {:too_many_cells, max_cells}}` for a sheet over
   `:max_cells`, `{:error, {:unknown_sheet, sheet}}` for a sheet the file
   does not have, and `{:error, {:xlsx, reason}}` for a file it cannot read.
