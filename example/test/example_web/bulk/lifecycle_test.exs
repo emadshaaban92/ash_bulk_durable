@@ -845,7 +845,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
       view |> element("#bulk-action-panel button", "Retry failed rows") |> render_click()
 
       assert render(view) =~ "Reopened 1 row for retry."
-      assert reload(bulk_action).status == :running
+      assert reload(bulk_action).status == :queued
 
       drain()
 

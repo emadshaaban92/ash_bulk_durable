@@ -464,7 +464,7 @@ defmodule AshBulkDurable.Core.CrashTest do
       assert {:ok, _retried} = Retry.retry(reload(bulk_action), scope: ctx.scope)
 
       assert %{
-               status: :running,
+               status: :queued,
                stalled_starts: 0,
                setup_failures: 0,
                progress_at_start: nil,

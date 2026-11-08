@@ -301,7 +301,7 @@ defmodule AshBulkDurable.Sheet.ErrorsSheetTest do
             row
         end)
 
-      assert {:ok, %{status: :running}} =
+      assert {:ok, %{status: :queued}} =
                AshBulkDurable.retry(bulk_action, sheet, scope: ctx.scope)
 
       bulk_action = run!(bulk_action)

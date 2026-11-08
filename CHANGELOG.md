@@ -134,3 +134,9 @@
   does. Before, it stopped the run, and the row failed only starts later, as
   crashed. Phase 1 runs its tasks unlinked, under a supervisor linked to the
   run, so they still go when the run does.
+- A retry of a `:failed` bulk action while its owner has another unresolved
+  one is refused with `{:error, %{unresolved: id}}`, that one's id, before
+  anything is written. Before, it failed with the one-unresolved index's
+  unique-constraint error. A retried bulk action is `:queued`, not
+  `:running`, until a run starts it; that run sets `started_at` again. A
+  host's own `:enqueue_retry` should set `:queued` too.

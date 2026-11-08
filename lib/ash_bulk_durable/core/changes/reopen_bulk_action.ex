@@ -1,7 +1,8 @@
 defmodule AshBulkDurable.Core.Changes.ReopenBulkAction do
   @moduledoc """
-  Implements `BulkAction.:enqueue_retry`: a finished bulk action takes its
-  corrected shared `input`, when given, and sheds how it finished, the
+  Implements `BulkAction.:enqueue_retry`: a finished bulk action is
+  `:queued` again, for a run to take to `:running` as it does a new one. It
+  takes its corrected shared `input`, when given, and sheds how it finished, the
   liveness hint its last run left included, so a poller starts it at once
   rather than once that hint goes stale. Its crash count starts again
   (`stalled_starts`, `setup_failures`, `progress_at_start`, `shutdown_stopped` and

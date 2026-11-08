@@ -103,7 +103,8 @@ defmodule AshBulkDurable do
   Reruns every row that has not succeeded, as it is or with `:input` for a
   new shared input or `:rows` for per-row corrections; see
   `AshBulkDurable.Core.Retry.retry/2`. Refused while the bulk action is
-  queued or running.
+  queued or running, and a failed one while its owner has another
+  unresolved one, `{:error, %{unresolved: id}}`.
   """
   defdelegate retry(bulk_action, opts), to: Core
 

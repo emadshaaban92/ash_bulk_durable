@@ -216,7 +216,7 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
       assert "bulk-staging/#{ctx.tag}/a.zip" in AshBulkDurable.TestStorage.keys()
 
       send(retry, :go)
-      assert_receive {:retried, {:ok, %{status: :running}}}, 2_000
+      assert_receive {:retried, {:ok, %{status: :queued}}}, 2_000
       assert "bulk-staging/#{ctx.tag}/a.zip" in AshBulkDurable.TestStorage.keys()
     end
 

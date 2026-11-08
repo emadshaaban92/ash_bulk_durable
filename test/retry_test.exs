@@ -150,7 +150,7 @@ defmodule AshBulkDurable.RetryTest do
 
       region = Ash.create!(Region, region_input(code), actor: ctx.user)
 
-      assert {:ok, %{status: :running}} = AshBulkDurable.retry(bulk_action, scope: ctx.scope)
+      assert {:ok, %{status: :queued}} = AshBulkDurable.retry(bulk_action, scope: ctx.scope)
       {bulk_action, rows} = run!(bulk_action)
 
       assert bulk_action.status == :completed
@@ -293,7 +293,7 @@ defmodule AshBulkDurable.RetryTest do
       {_bulk_action, [row]} = run!(bulk_action)
 
       {:ok, retried} = AshBulkDurable.retry(bulk_action, scope: ctx.scope)
-      assert retried.status == :running
+      assert retried.status == :queued
 
       {_bulk_action, [%{status: :failed}]} = run!(bulk_action)
 
@@ -305,7 +305,7 @@ defmodule AshBulkDurable.RetryTest do
                  scope: ctx.scope
                )
 
-      assert again.status == :running
+      assert again.status == :queued
 
       {bulk_action, [row]} = run!(bulk_action)
 
@@ -384,7 +384,7 @@ defmodule AshBulkDurable.RetryTest do
                  scope: ctx.scope
                )
 
-      assert retried.status == :running
+      assert retried.status == :queued
       assert retried.error == nil
       assert retried.result == nil
       assert retried.finished_at == nil
@@ -454,14 +454,52 @@ defmodule AshBulkDurable.RetryTest do
           mode: :all_or_nothing
         )
 
-      {failed, _rows} = run!(failed)
+      {failed, rows} = run!(failed)
       assert failed.status == :failed
 
-      {:ok, _unresolved} =
+      {:ok, unresolved} =
         AshBulkDurable.bulk_create([region_input()], Region, :create, scope: ctx.scope)
 
-      assert {:error, %Ash.Error.Invalid{}} = AshBulkDurable.retry(failed, scope: ctx.scope)
-      assert reload(failed).status == :failed
+      unresolved_id = unresolved.id
+
+      assert {:error, %{unresolved: ^unresolved_id}} =
+               AshBulkDurable.retry(failed, input: %{name: tag()}, scope: ctx.scope)
+
+      assert Map.take(reload(failed), [:status, :pass, :input, :updated_at]) ==
+               Map.take(failed, [:status, :pass, :input, :updated_at])
+
+      assert rows(failed) == rows
+    end
+
+    test "once its owner's other one is resolved, it retries", ctx do
+      {:ok, failed} =
+        AshBulkDurable.bulk_create([%{code: tag()}], Region, :create,
+          scope: ctx.scope,
+          mode: :all_or_nothing
+        )
+
+      {failed, _rows} = run!(failed)
+
+      taken = region_input()
+      Ash.create!(Region, taken, actor: ctx.user)
+      {:ok, parked} = AshBulkDurable.bulk_create([taken], Region, :create, scope: ctx.scope)
+      {parked, _rows} = run!(parked)
+      assert parked.status == :completed_with_errors
+
+      parked_id = parked.id
+      assert {:error, %{unresolved: ^parked_id}} = AshBulkDurable.retry(failed, scope: ctx.scope)
+
+      {:ok, _abandoned} = AshBulkDurable.abandon(parked, scope: ctx.scope)
+
+      fixed = region_input()
+      [row] = rows(failed)
+
+      assert {:ok, %{status: :queued}} =
+               AshBulkDurable.retry(failed, rows: %{row.id => %{input: fixed}}, scope: ctx.scope)
+
+      {failed, _rows} = run!(failed)
+      assert failed.status == :completed
+      assert codes_written([fixed.code]) == [fixed.code]
     end
   end
 
@@ -577,7 +615,7 @@ defmodule AshBulkDurable.RetryTest do
       %{bulk_action: bulk_action, first: first, second: second} = two_failed!(ctx)
       fixed = region_input()
 
-      assert {:ok, %{status: :running}} =
+      assert {:ok, %{status: :queued}} =
                AshBulkDurable.retry_row(first, input: fixed, scope: ctx.scope)
 
       {bulk_action, [first_after, _good, second_after]} = run!(bulk_action)
@@ -736,8 +774,11 @@ defmodule AshBulkDurable.RetryTest do
     test "while it is running, even held as a stale record", ctx do
       %{bulk_action: bulk_action, first: first, second: second} = two_failed!(ctx)
 
-      {:ok, running} = AshBulkDurable.retry_row(first, scope: ctx.scope)
-      assert running.status == :running
+      {:ok, queued} = AshBulkDurable.retry_row(first, scope: ctx.scope)
+      assert queued.status == :queued
+
+      # As a run's start transaction takes it.
+      running = Ash.update!(queued, %{}, action: :mark_running, authorize?: false)
 
       # `running` reads :running, `bulk_action` the state it was retried from.
       for held <- [running, bulk_action] do

@@ -16,7 +16,13 @@ defmodule AshBulkDurable.Core.Retry do
   not own, and one whose lock another transaction holds, such as a run's: that
   retry is refused at once rather than waiting for it. A caller who does not
   own it never locks it, so learns nothing of its rows. Two retries cannot
-  race: the second finds the lock held or the status moved on. One whose
+  race: the second finds the lock held or the status moved on. An owner has
+  one unresolved bulk action at a time, queued, running or parked in
+  `:completed_with_errors` (the `:one_unresolved_per_user` identity). A
+  failed one has given that slot up and a retry takes it back, so while its
+  owner has another unresolved one the retry is refused with `{:error,
+  %{unresolved: id}}`, that one's id, nothing written. A retried bulk action
+  is `:queued` again, and its run takes it to `:running`. One whose
   resource or action no longer exists, or that stored what no longer decodes
   (`AshBulkDurable.Core.StoredTerm`), returns `{:error, :gone}` to its owner,
   who can only abandon it.
@@ -35,9 +41,11 @@ defmodule AshBulkDurable.Core.Retry do
 
   @doc """
   Reruns every row of `bulk_action` that has not succeeded. Returns `{:ok,
-  bulk_action}`; `{:error, %{unmatched: ids}}` with nothing written when
-  `:rows` names a row that is not one of them; or `{:error, error}` when
-  refused.
+  bulk_action}`, the bulk action `:queued`; `{:error, %{unmatched: ids}}`
+  with nothing written when `:rows` names a row that is not one of them;
+  `{:error, %{unresolved: id}}` with nothing written when it failed and its
+  owner has another unresolved bulk action since, `id`; or `{:error,
+  error}` when refused.
 
   Options:
 
@@ -143,6 +151,7 @@ defmodule AshBulkDurable.Core.Retry do
   defp under_lock(resources, bulk_action, corrections, shared, opts, rows) do
     with {:ok, locked} <- lock(bulk_action, opts),
          :ok <- Introspection.runnable(locked),
+         :ok <- slot_free(locked),
          {:ok, rows} <- rows.(locked),
          :ok <- Introspection.readable(rows),
          :ok <- all_known(corrections, rows) do
@@ -186,6 +195,28 @@ defmodule AshBulkDurable.Core.Retry do
          )}
     end
   end
+
+  # A `:failed` bulk action is out of its owner's one unresolved slot (the
+  # `:one_unresolved_per_user` identity), which `:enqueue_retry` puts it back
+  # in: read under the lock, before any row is written, which one holds it
+  # now, if any, through the same status set as the identity's. One parked in
+  # `:completed_with_errors` holds the slot itself. A bulk action submitted in
+  # the instant between this read and the update is still refused, by the
+  # identity, as an `Ash.Error.Invalid`.
+  defp slot_free(%{status: :failed} = bulk_action) do
+    Core.config(:bulk_action_resource)
+    |> Ash.Query.for_read(:fetch_for_user_unresolved, %{user_id: bulk_action.user_id},
+      authorize?: false
+    )
+    |> BulkActionLock.pin()
+    |> Ash.read_one!(authorize?: false)
+    |> case do
+      nil -> :ok
+      holder -> {:error, %{unresolved: holder.id}}
+    end
+  end
+
+  defp slot_free(_bulk_action), do: :ok
 
   defp all_known(corrections, rows) do
     case Map.keys(corrections) -- Enum.map(rows, & &1.id) do
