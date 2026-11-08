@@ -772,7 +772,7 @@ defmodule AshBulkDurable.FacadeTest do
   end
 
   describe "abandon/2 after an all-or-nothing failure" do
-    test "refuses one that failed outright, which holds no failed rows to give up", ctx do
+    test "abandons one that failed outright, its rows never run", ctx do
       [first, second] = region_inputs(2)
 
       {:ok, bulk_action} =
@@ -784,8 +784,14 @@ defmodule AshBulkDurable.FacadeTest do
       {failed, _rows} = run!(bulk_action)
       assert failed.status == :failed
 
-      assert {:error, %Ash.Error.Invalid{}} = AshBulkDurable.abandon(failed, scope: ctx.scope)
-      assert Ash.get!(BulkAction, failed.id, authorize?: false).status == :failed
+      assert {:ok, %BulkAction{status: :cancelled}} =
+               AshBulkDurable.abandon(failed, scope: ctx.scope)
+
+      assert Enum.all?(rows(failed), &(&1.status != :succeeded))
+      # Final: it is neither retried nor abandoned again.
+      cancelled = Ash.get!(BulkAction, failed.id, authorize?: false)
+      assert {:error, %Ash.Error.Invalid{}} = AshBulkDurable.retry(cancelled, scope: ctx.scope)
+      assert {:error, %Ash.Error.Invalid{}} = AshBulkDurable.abandon(cancelled, scope: ctx.scope)
     end
   end
 end

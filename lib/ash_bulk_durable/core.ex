@@ -93,9 +93,9 @@ defmodule AshBulkDurable.Core do
   @doc """
   Abandons `bulk_action`: its rows that have not succeeded are never run,
   and it frees its owner to start another. Only a bulk action that finished
-  with failed rows is abandoned; one queued or running, or already
-  finished, is refused, as is one `scope`'s owner does not own. Returns
-  `{:ok, bulk_action}` or `{:error, error}`.
+  with failed rows, or failed outright, is abandoned; one queued or running,
+  or already completed or cancelled, is refused, as is one `scope`'s owner
+  does not own. Returns `{:ok, bulk_action}` or `{:error, error}`.
 
   The cancel is a verdict, so it is written under the bulk action lock
   (`AshBulkDurable.Core.BulkActionLock`), its status read there. One whose
@@ -124,12 +124,12 @@ defmodule AshBulkDurable.Core do
     end
   end
 
+  @abandonable [:completed_with_errors, :failed]
+
   # A refusal is returned as the transaction's value, nothing written; a
   # failed write rolls back.
   defp cancel(bulk_action, owner, resource) do
-    case BulkActionLock.lock(bulk_action.id, [:completed_with_errors],
-           filter: expr(user_id == ^owner)
-         ) do
+    case BulkActionLock.lock(bulk_action.id, @abandonable, filter: expr(user_id == ^owner)) do
       {:ok, locked} ->
         case Ash.update(locked, %{result: :cancelled}, action: :mark_finished, authorize?: false) do
           {:ok, cancelled} -> {:ok, cancelled}
@@ -141,7 +141,7 @@ defmodule AshBulkDurable.Core do
          Ash.Error.to_error_class(
            Ash.Error.Changes.StaleRecord.exception(
              resource: resource,
-             filter: %{id: bulk_action.id, status: :completed_with_errors, user_id: owner}
+             filter: %{id: bulk_action.id, status: @abandonable, user_id: owner}
            )
          )}
     end

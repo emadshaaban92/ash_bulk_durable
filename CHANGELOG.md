@@ -140,3 +140,10 @@
   unique-constraint error. A retried bulk action is `:queued`, not
   `:running`, until a run starts it; that run sets `started_at` again. A
   host's own `:enqueue_retry` should set `:queued` too.
+- A failed bulk action whose staged files the daily sweep took can be
+  finished with them again: `retry/2` and `retry_row/2` take
+  `:staged_files`, which replace every file the bulk action held, and a
+  retry with a corrected sheet takes `:companions`, checked as the sheet
+  verbs check theirs. `abandon/2` also takes a `:failed` bulk action, and
+  deletes its staged files at once. A host that defines its own
+  `:enqueue_retry` needs a `staged_files` argument only to stage files again.

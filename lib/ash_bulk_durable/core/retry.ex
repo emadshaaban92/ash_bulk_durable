@@ -56,6 +56,12 @@ defmodule AshBulkDurable.Core.Retry do
       for a row found by an identity), `:tenant` (a value or a lookup, the
       tenant it acts in instead), `:metadata`, and `:error`, a refusal that
       keeps the row failed.
+    * `:staged_files` — `%{name => storage_key}`, files staged again for
+      the resolvers, as `AshBulkDurable.Core.create/4` takes them, in place
+      of every file the bulk action held. For one whose files the daily
+      sweep deleted (`AshBulkDurable.Core.PurgeStaleStaging`), so a row
+      that needs one runs again rather than fails without it. Its old keys
+      are the sweep's to delete.
 
   Raises `ArgumentError` for a `:lookup` or `:tenant` on a row whose target
   is a record selected by its primary key, which stays the record selected.
@@ -75,8 +81,9 @@ defmodule AshBulkDurable.Core.Retry do
   before reaching them is refused with `{:error, %{unprocessed: count}}`,
   nothing written: `retry/2` resumes them.
 
-  Takes `:scope`, and `:input`, `:lookup`, `:tenant` and `:metadata` as a correction in
-  `retry/2`'s `:rows`. Returns as `retry/2`, a row no longer failed being
+  Takes `:scope` and `:staged_files` as `retry/2` does, and `:input`,
+  `:lookup`, `:tenant` and `:metadata` as a correction in `retry/2`'s
+  `:rows`. Returns as `retry/2`, a row no longer failed being
   unmatched. An all-or-nothing bulk action has no row by itself: raises
   `ArgumentError`.
   """
@@ -166,11 +173,25 @@ defmodule AshBulkDurable.Core.Retry do
   defp write(resources, rows, corrections, shared, locked, opts) do
     pass = locked.pass + 1
 
+    enqueued =
+      shared
+      |> Map.put(:pass, pass)
+      |> put_staged_files(opts)
+
     with :ok <- reopen_rows(rows, corrections, shared, locked, pass),
-         {:ok, retried} <- enqueue(locked, Map.put(shared, :pass, pass), opts) do
+         {:ok, retried} <- enqueue(locked, enqueued, opts) do
       {:ok, retried}
     else
       {:error, error} -> Ash.DataLayer.rollback(resources, error)
+    end
+  end
+
+  # Only when given, so a host's own `:enqueue_retry` needs the argument
+  # only once it stages files again.
+  defp put_staged_files(arguments, opts) do
+    case Keyword.get(opts, :staged_files) do
+      nil -> arguments
+      staged -> Map.put(arguments, :staged_files, Map.new(staged))
     end
   end
 

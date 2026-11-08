@@ -223,6 +223,24 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
       reread = Ash.get!(BulkAction, bulk_action.id, authorize?: false)
       assert reread.status == :completed
     end
+
+    test "a failed bulk action takes a cancel, and no other verdict" do
+      failed =
+        Ash.update!(create_bulk_action!(), %{result: {:failed, :worker_lost}},
+          action: :mark_finished,
+          authorize?: false
+        )
+
+      for result <- [:completed, :completed_with_errors, {:failed, :again}] do
+        assert {:error, %Ash.Error.Invalid{errors: errors}} =
+                 Ash.update(failed, %{result: result}, action: :mark_finished, authorize?: false)
+
+        assert Enum.any?(errors, &match?(%Ash.Error.Changes.StaleRecord{}, &1))
+      end
+
+      assert Ash.update!(failed, %{result: :cancelled}, action: :mark_finished, authorize?: false).status ==
+               :cancelled
+    end
   end
 
   describe ":enqueue_retry" do

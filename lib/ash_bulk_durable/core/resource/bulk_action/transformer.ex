@@ -439,6 +439,13 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
           allow_nil?: true
         )
 
+      staged_files_argument =
+        Transformer.build_entity!(Dsl, [:actions, :update], :argument,
+          name: :staged_files,
+          type: :map,
+          allow_nil?: true
+        )
+
       reopen =
         Transformer.build_entity!(Dsl, [:actions, :update], :change,
           change: AshBulkDurable.Core.Changes.ReopenBulkAction
@@ -454,7 +461,7 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
           name: :enqueue_retry,
           accept: [],
           require_atomic?: false,
-          arguments: [input_argument, pass_argument],
+          arguments: [input_argument, pass_argument, staged_files_argument],
           changes: [reopen, set_status]
         )
 
