@@ -28,21 +28,21 @@ defmodule AshBulkDurable.TestStorage do
   def keys, do: Agent.get(__MODULE__, &Map.keys(&1))
 
   @impl true
-  def get_object(key) do
+  def fetch_file(key, path, _opts) do
     case Agent.get(__MODULE__, &Map.get(&1, key)) do
       nil -> {:error, :not_found}
-      %{body: body} -> {:ok, body}
+      %{body: body} -> File.write(path, body)
     end
   end
 
   @impl true
-  def delete_object(key) do
+  def delete_file(key, _opts) do
     Agent.update(__MODULE__, &Map.delete(&1, key))
     :ok
   end
 
   @impl true
-  def list_objects(prefix) do
+  def list_files(prefix, _opts) do
     objects =
       __MODULE__
       |> Agent.get(& &1)

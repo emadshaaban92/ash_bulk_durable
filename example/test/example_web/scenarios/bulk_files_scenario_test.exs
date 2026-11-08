@@ -229,7 +229,7 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
       """)
 
     # The ZIP goes before the worker reads it.
-    Enum.each(bulk_action.staged_files, fn {_name, key} -> TestStorage.delete_object(key) end)
+    Enum.each(bulk_action.staged_files, fn {_name, key} -> TestStorage.delete_file(key, []) end)
 
     assert capture_log(fn ->
              assert %{status: :completed_with_errors, rows_done: 1} =
@@ -278,7 +278,7 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
         %{"all_or_nothing" => "on"}
       )
 
-    Enum.each(bulk_action.staged_files, fn {_name, key} -> TestStorage.delete_object(key) end)
+    Enum.each(bulk_action.staged_files, fn {_name, key} -> TestStorage.delete_file(key, []) end)
 
     assert %{status: :failed, result: %{"reason" => "staged_file_download_error"}} =
              drain_finished(bulk_action)
@@ -420,5 +420,5 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
   end
 
   # A day on, a sweep takes what no record references.
-  defp sweep(key), do: :ok = TestStorage.delete_object(key)
+  defp sweep(key), do: :ok = TestStorage.delete_file(key, [])
 end

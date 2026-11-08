@@ -97,8 +97,9 @@ config :ash_bulk_durable,
 
 - `AshBulkDurable.Core.Owner` says who a bulk action belongs to, and how the
   worker acts as them again.
-- `AshBulkDurable.Core.Storage` reads, lists and deletes staged files. The
-  library ships no adapter.
+- `AshBulkDurable.Core.Storage` fetches, deletes and lists staged files. The
+  worker has each staged file written to a temporary file, so a large one is
+  never held in memory. The library ships no store.
 
 Add the poller last to each node's supervision tree, after the repo, anything
 that migrates it, and the PubSub and endpoint a run broadcasts through. It then

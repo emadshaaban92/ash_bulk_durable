@@ -37,6 +37,14 @@ defmodule Example.Test.TestStorage do
   def keys, do: Agent.get(__MODULE__, &Map.keys(&1))
 
   @impl true
+  def fetch_file(key, path, _opts) do
+    case get_object(key) do
+      {:ok, body} -> File.write(path, body)
+      error -> error
+    end
+  end
+
+  @doc "The bytes stored at `key`, for assertions."
   def get_object(key) do
     case Agent.get(__MODULE__, &Map.get(&1, key)) do
       nil -> {:error, :not_found}
@@ -45,13 +53,13 @@ defmodule Example.Test.TestStorage do
   end
 
   @impl true
-  def delete_object(key) do
+  def delete_file(key, _opts) do
     Agent.update(__MODULE__, &Map.delete(&1, key))
     :ok
   end
 
   @impl true
-  def list_objects(prefix) do
+  def list_files(prefix, _opts) do
     objects =
       __MODULE__
       |> Agent.get(& &1)
@@ -89,9 +97,9 @@ defmodule Example.Test.SlowStorage do
     TestStorage.put_object(key, body)
   end
 
-  defdelegate get_object(key), to: TestStorage
-  defdelegate delete_object(key), to: TestStorage
-  defdelegate list_objects(prefix), to: TestStorage
+  defdelegate fetch_file(key, path, opts), to: TestStorage
+  defdelegate delete_file(key, opts), to: TestStorage
+  defdelegate list_files(prefix, opts), to: TestStorage
   defdelegate exists?(key), to: TestStorage
   defdelegate presigned_put_url(key, opts), to: TestStorage
   defdelegate presigned_get_url(key, opts), to: TestStorage

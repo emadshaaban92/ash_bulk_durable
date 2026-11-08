@@ -250,7 +250,7 @@ defmodule ExampleWeb.BulkScenarioTest do
     assert %{status: :completed_with_errors} = finish(view, context.user)
 
     written = book(isbn(context.tag, 1))
-    assert {:ok, "the-cover"} = LocalStorage.get_object(written.cover)
+    assert {:ok, "the-cover"} = File.read(LocalStorage.path(written.cover))
     assert render(view) =~ "no file named"
   end
 

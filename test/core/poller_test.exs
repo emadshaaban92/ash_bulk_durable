@@ -33,9 +33,9 @@ defmodule AshBulkDurable.Core.PollerTest do
 
   defmodule RaisingStorage do
     @moduledoc "A store that is down."
-    def get_object(_key), do: raise("storage is down")
-    def list_objects(_prefix), do: {:ok, []}
-    def delete_object(_key), do: :ok
+    def fetch_file(_key, _path, _opts), do: raise("storage is down")
+    def list_files(_prefix, _opts), do: {:ok, []}
+    def delete_file(_key, _opts), do: :ok
   end
 
   defmodule ExitingResource do

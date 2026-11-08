@@ -26,13 +26,13 @@ defmodule ExampleWeb.Bulk.ErrorsSheetUrlTest do
     @behaviour ExampleWeb.Bulk.Storage
 
     @impl true
-    def get_object(_key), do: {:error, :not_stubbed}
+    def fetch_file(_key, _path, _opts), do: {:error, :not_stubbed}
 
     @impl true
-    def delete_object(_key), do: :ok
+    def delete_file(_key, _opts), do: :ok
 
     @impl true
-    def list_objects(_prefix), do: {:ok, []}
+    def list_files(_prefix, _opts), do: {:ok, []}
 
     @impl true
     def presigned_put_url(key, _opts), do: "https://test.local/put/#{key}"
@@ -57,13 +57,13 @@ defmodule ExampleWeb.Bulk.ErrorsSheetUrlTest do
     @behaviour ExampleWeb.Bulk.Storage
 
     @impl true
-    def get_object(_key), do: {:error, :not_stubbed}
+    def fetch_file(_key, _path, _opts), do: {:error, :not_stubbed}
 
     @impl true
-    def delete_object(_key), do: :ok
+    def delete_file(_key, _opts), do: :ok
 
     @impl true
-    def list_objects(_prefix), do: {:ok, []}
+    def list_files(_prefix, _opts), do: {:ok, []}
 
     @impl true
     def presigned_put_url(key, _opts), do: "https://test.local/put/#{key}"
