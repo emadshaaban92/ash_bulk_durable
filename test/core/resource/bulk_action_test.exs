@@ -133,7 +133,7 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
       assert %BulkAction{} = create_bulk_action!(%{user_id: user_id})
     end
 
-    test "retrying a :completed_with_errors bulk action flips it to :running without a violation" do
+    test "retrying a :completed_with_errors bulk action flips it to :queued without a violation" do
       user_id = Ecto.UUID.generate()
       first = create_bulk_action!(%{user_id: user_id})
 
@@ -144,10 +144,10 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
         )
 
       # The bulk action already holds the one-unresolved slot; the
-      # completed_with_errors → running flip stays inside the index
+      # completed_with_errors → queued flip stays inside the index
       # predicate, so it can never collide with itself.
       retried = Ash.update!(parked, %{}, action: :enqueue_retry, authorize?: false)
-      assert retried.status == :running
+      assert retried.status == :queued
     end
   end
 
@@ -251,7 +251,7 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
           |> Ash.update!(%{result: result}, action: :mark_finished, authorize?: false)
 
         assert Ash.update!(finished, %{}, action: :enqueue_retry, authorize?: false).status ==
-                 :running
+                 :queued
       end
     end
   end

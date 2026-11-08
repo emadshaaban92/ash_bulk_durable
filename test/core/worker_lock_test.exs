@@ -804,7 +804,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       assert %{status: :completed_with_errors, pass: 0} = reload(bulk_action)
       bring_back!(gone)
 
-      assert {:ok, %{status: :running, pass: 1}} =
+      assert {:ok, %{status: :queued, pass: 1}} =
                AshBulkDurable.retry(bulk_action, scope: ctx.scope, input: %{region_id: new.id})
 
       send(a, :go)
@@ -813,7 +813,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       # A applied nothing of the new pass, and wrote no verdict.
       assert region_of(b3) == nil
       assert statuses(bulk_action) == [:succeeded, :succeeded, :resolved]
-      assert %{status: :running, result: nil, finished_at: nil} = reload(bulk_action)
+      assert %{status: :queued, result: nil, finished_at: nil} = reload(bulk_action)
 
       assert :ok = Worker.run_now(bulk_action.id)
       assert region_of(b3) == new.id
@@ -832,13 +832,13 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       assert %{status: :failed, result: %{"reason" => "resolver_prepare_error"}} =
                reload(bulk_action)
 
-      assert {:ok, %{status: :running, pass: 1}} =
+      assert {:ok, %{status: :queued, pass: 1}} =
                AshBulkDurable.retry(bulk_action, scope: ctx.scope)
 
       send(a, :go)
       assert_receive {:done, ^a, :ok}, 5_000
 
-      assert %{status: :running, result: nil, finished_at: nil, pass: 1} = reload(bulk_action)
+      assert %{status: :queued, result: nil, finished_at: nil, pass: 1} = reload(bulk_action)
     end
   end
 
@@ -859,7 +859,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       assert :ok = Worker.run_now(bulk_action.id)
       assert %{status: :completed_with_errors, pass: 0} = reload(bulk_action)
       free!(ctx, 1)
-      assert {:ok, %{status: :running, pass: 1}} = retry_with!(ctx, bulk_action, "new")
+      assert {:ok, %{status: :queued, pass: 1}} = retry_with!(ctx, bulk_action, "new")
       assert [%{status: :pending, pass: 1, resolved_data: reopened}] = rows(bulk_action)
 
       send(a, :go)
@@ -867,7 +867,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
 
       # A wrote nothing of its old input, and no verdict.
       assert [%{status: :pending, pass: 1, resolved_data: ^reopened}] = rows(bulk_action)
-      assert %{status: :running, result: nil, finished_at: nil} = reload(bulk_action)
+      assert %{status: :queued, result: nil, finished_at: nil} = reload(bulk_action)
 
       assert :ok = Worker.run_now(bulk_action.id)
       assert %{status: :completed, rows_done: 1} = reload(bulk_action)
@@ -885,7 +885,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       # that resolves.
       assert :ok = Worker.run_now(bulk_action.id)
       assert %{status: :completed_with_errors, pass: 0} = reload(bulk_action)
-      assert {:ok, %{status: :running, pass: 1}} = retry_with!(ctx, bulk_action, "new")
+      assert {:ok, %{status: :queued, pass: 1}} = retry_with!(ctx, bulk_action, "new")
       assert [%{status: :pending, error: nil}] = rows(bulk_action)
 
       send(a, :go)
@@ -893,7 +893,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
 
       # A's failure of the old input is not on the row.
       assert [%{status: :pending, error: nil}] = rows(bulk_action)
-      assert %{status: :running, result: nil, finished_at: nil} = reload(bulk_action)
+      assert %{status: :queued, result: nil, finished_at: nil} = reload(bulk_action)
 
       assert :ok = Worker.run_now(bulk_action.id)
       assert %{status: :completed, rows_done: 1} = reload(bulk_action)
@@ -929,7 +929,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       # The row keeps the retry's input and pass, nothing resolved of A's.
       assert [%{status: :pending, pass: 1, resolved_data: resolved}] = rows(bulk_action)
       refute Map.has_key?(resolved, "native_name")
-      assert %{status: :running, result: nil, pass: 1} = reload(bulk_action)
+      assert %{status: :queued, result: nil, pass: 1} = reload(bulk_action)
 
       assert :ok = Worker.run_now(bulk_action.id)
       assert %{status: :completed, rows_done: 1} = reload(bulk_action)
@@ -947,7 +947,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       assert :ok = Worker.run_now(bulk_action.id)
       assert %{status: :completed_with_errors, pass: 0} = reload(bulk_action)
 
-      assert {:ok, %{status: :running, pass: 1}} =
+      assert {:ok, %{status: :queued, pass: 1}} =
                AshBulkDurable.retry(bulk_action, scope: ctx.scope)
 
       assert [%{status: :pending, error: nil}, %{status: :pending, error: nil}] =
@@ -960,7 +960,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
       assert [%{status: :pending, error: nil}, %{status: :pending, error: nil}] =
                rows(bulk_action)
 
-      assert %{status: :running, result: nil, finished_at: nil, pass: 1} = reload(bulk_action)
+      assert %{status: :queued, result: nil, finished_at: nil, pass: 1} = reload(bulk_action)
     end
   end
 

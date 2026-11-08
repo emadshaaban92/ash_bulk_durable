@@ -446,7 +446,7 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
 
       set_status =
         Transformer.build_entity!(Dsl, [:actions, :update], :change,
-          change: {Ash.Resource.Change.SetAttribute, [attribute: :status, value: :running]}
+          change: {Ash.Resource.Change.SetAttribute, [attribute: :status, value: :queued]}
         )
 
       {:ok, action} =
