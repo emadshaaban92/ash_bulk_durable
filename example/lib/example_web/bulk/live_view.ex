@@ -139,7 +139,7 @@ defmodule ExampleWeb.Bulk.LiveView do
       )
       |> assign_allowed_resources()
       |> assign(uploaded_file: nil)
-      |> assign(retry_sheet: nil, retry_filename: nil)
+      |> assign(retry_sheet: nil, retry_filename: nil, retry_blocked_by: nil)
       |> assign_csv_keys()
       |> assign(errors: [])
       |> assign(
@@ -494,6 +494,8 @@ defmodule ExampleWeb.Bulk.LiveView do
   end
 
   defp apply_retry(socket, bulk_action, sheet) do
+    socket = assign(socket, :retry_blocked_by, nil)
+
     case AshBulkDurable.retry(bulk_action, sheet, scope: scope(socket)) do
       {:ok, retried} ->
         put_flash(
@@ -525,6 +527,20 @@ defmodule ExampleWeb.Bulk.LiveView do
             "%{count} row didn't match the original bulk action. No rows were changed.",
             "%{count} rows didn't match the original bulk action. No rows were changed.",
             count
+          )
+        )
+
+      # A failed bulk action gave up its owner's one unresolved slot, and
+      # another bulk action of theirs holds it now: trying again keeps
+      # failing until that one is finished or abandoned. The panel links to
+      # it, and following the link mounts the page on it.
+      {:error, %{unresolved: holder_id}} ->
+        socket
+        |> assign(:retry_blocked_by, "#{bulk_path(socket)}?bulk_action=#{holder_id}")
+        |> put_flash(
+          :error,
+          gettext(
+            "Another bulk action of yours is still open. Finish or abandon it before retrying this one. Nothing was changed."
           )
         )
 
@@ -673,6 +689,7 @@ defmodule ExampleWeb.Bulk.LiveView do
     |> assign(:failed_preview, failed_preview(bulk_action))
     |> assign(:retry_sheet, nil)
     |> assign(:retry_filename, nil)
+    |> assign(:retry_blocked_by, nil)
   end
 
   # Up to `@failed_preview_limit` failed rows (their cells + a clean error)

@@ -21,8 +21,11 @@ defmodule AshBulkDurable.Core.Retry do
   `:completed_with_errors` (the `:one_unresolved_per_user` identity). A
   failed one has given that slot up and a retry takes it back, so while its
   owner has another unresolved one the retry is refused with `{:error,
-  %{unresolved: id}}`, that one's id, nothing written. A retried bulk action
-  is `:queued` again, and its run takes it to `:running`. One whose
+  %{unresolved: id}}`, that one's id, nothing written, including when that
+  one is submitted while the retry runs. Inside a transaction of the
+  caller's, that late submit aborts the caller's transaction instead, and
+  the identity's error rolls it back. A retried bulk action is `:queued`
+  again, and its run takes it to `:running`. One whose
   resource or action no longer exists, or that stored what no longer decodes
   (`AshBulkDurable.Core.StoredTerm`), returns `{:error, :gone}` to its owner,
   who can only abandon it.
@@ -148,9 +151,11 @@ defmodule AshBulkDurable.Core.Retry do
     resources = [Core.config(:bulk_action_resource), Core.config(:row_resource)]
 
     with {:ok, result} <-
-           Ash.transaction(resources, fn ->
+           resources
+           |> Ash.transaction(fn ->
              under_lock(resources, bulk_action, corrections, shared, opts, rows)
-           end) do
+           end)
+           |> slot_taken_meanwhile(opts) do
       Poller.nudge_after(result)
     end
   end
@@ -222,22 +227,58 @@ defmodule AshBulkDurable.Core.Retry do
   # in: read under the lock, before any row is written, which one holds it
   # now, if any, through the same status set as the identity's. One parked in
   # `:completed_with_errors` holds the slot itself. A bulk action submitted in
-  # the instant between this read and the update is still refused, by the
-  # identity, as an `Ash.Error.Invalid`.
+  # the instant between this read and the update is refused by the identity
+  # instead, see `slot_taken_meanwhile/2`.
   defp slot_free(%{status: :failed} = bulk_action) do
-    Core.config(:bulk_action_resource)
-    |> Ash.Query.for_read(:fetch_for_user_unresolved, %{user_id: bulk_action.user_id},
-      authorize?: false
-    )
-    |> BulkActionLock.pin()
-    |> Ash.read_one!(authorize?: false)
-    |> case do
+    case unresolved_holder(bulk_action.user_id, &BulkActionLock.pin/1) do
       nil -> :ok
       holder -> {:error, %{unresolved: holder.id}}
     end
   end
 
   defp slot_free(_bulk_action), do: :ok
+
+  # The identity's unique violation aborted the transaction, rolling every
+  # row back, so the holder is read after it, outside it: the same refusal
+  # as `slot_free/1`'s. One that has resolved since leaves nothing to name,
+  # and the violation is returned as it is.
+  defp slot_taken_meanwhile({:error, error} = refused, opts) do
+    with true <- unresolved_violation?(error),
+         %{id: id} <- unresolved_holder(Owner.worker_key(Keyword.fetch!(opts, :scope))) do
+      {:error, %{unresolved: id}}
+    else
+      _ -> refused
+    end
+  end
+
+  defp slot_taken_meanwhile(result, _opts), do: result
+
+  defp unresolved_holder(user_id, pin \\ & &1) do
+    Core.config(:bulk_action_resource)
+    |> Ash.Query.for_read(:fetch_for_user_unresolved, %{user_id: user_id}, authorize?: false)
+    |> pin.()
+    |> Ash.read_one!(authorize?: false)
+  end
+
+  # AshPostgres reports a unique violation with the index's name, which it
+  # names for an identity as below.
+  defp unresolved_violation?(%Ash.Error.Invalid{errors: errors}) do
+    resource = Core.config(:bulk_action_resource)
+
+    index =
+      AshPostgres.DataLayer.Info.identity_index_names(resource)[:one_unresolved_per_user] ||
+        "#{AshPostgres.DataLayer.Info.table(resource)}_one_unresolved_per_user_index"
+
+    Enum.any?(errors, fn
+      %Ash.Error.Changes.InvalidAttribute{private_vars: vars} ->
+        vars[:constraint_type] == :unique and vars[:constraint] == index
+
+      _other ->
+        false
+    end)
+  end
+
+  defp unresolved_violation?(_error), do: false
 
   defp all_known(corrections, rows) do
     case Map.keys(corrections) -- Enum.map(rows, & &1.id) do

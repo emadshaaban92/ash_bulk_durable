@@ -36,6 +36,14 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
     Ash.get!(BulkAction, bulk_action.id, authorize?: false)
   end
 
+  defp failed!(bulk_action) do
+    Repo.query!("UPDATE bulk_actions SET status = 'failed' WHERE id = $1", [
+      Ecto.UUID.dump!(bulk_action.id)
+    ])
+
+    Ash.get!(BulkAction, bulk_action.id, authorize?: false)
+  end
+
   defp rows(bulk_action) do
     Row
     |> Ash.Query.filter(bulk_action_id == ^bulk_action.id)
@@ -120,6 +128,62 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
 
       assert Enum.map(rows(bulk_action), & &1.status) == [:failed, :failed]
       assert Ash.get!(BulkAction, bulk_action.id, authorize?: false) == bulk_action
+    end
+  end
+
+  describe "retry of a failed bulk action while a submit takes its owner's slot" do
+    # A failed one has given up the owner's one unresolved slot, so its retry
+    # checks the slot under the lock. A submit can still land after that
+    # check: the one-unresolved index refuses the retry's update instead.
+    test "is refused with the submitted one's id, nothing written", ctx do
+      bulk_action = failed!(finished_with_errors!(ctx))
+      rows = rows(bulk_action)
+      test_pid = self()
+
+      retry =
+        spawn_link(fn ->
+          :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
+
+          receive do
+            :start -> :ok
+          end
+
+          send(test_pid, {:retried, AshBulkDurable.retry(bulk_action, scope: ctx.scope)})
+        end)
+
+      # The retry stops at its first row write, past the slot check.
+      handler = "submit-during-retry-#{ctx.tag}"
+
+      :telemetry.attach(
+        handler,
+        [:ash_bulk_durable, :test, :repo, :query],
+        fn _event, _measurements, %{source: source, query: query}, _config ->
+          if self() == retry and source == "bulk_action_rows" and
+               String.starts_with?(query, "UPDATE") do
+            :telemetry.detach(handler)
+            send(test_pid, :retrying)
+
+            receive do
+              :go -> :ok
+            end
+          end
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+      send(retry, :start)
+      assert_receive :retrying, 2_000
+
+      input = %{code: "#{ctx.tag}-new", name: "New", native_name: "New"}
+      {:ok, submitted} = AshBulkDurable.bulk_create([input], Region, :create, scope: ctx.scope)
+      submitted_id = submitted.id
+
+      send(retry, :go)
+      assert_receive {:retried, {:error, %{unresolved: ^submitted_id}}}, 2_000
+
+      assert Ash.get!(BulkAction, bulk_action.id, authorize?: false) == bulk_action
+      assert rows(bulk_action) == rows
     end
   end
 
