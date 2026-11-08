@@ -23,7 +23,7 @@ defmodule AshBulkDurable.Core.Changes.RunRow do
   """
   use Ash.Resource.Change
 
-  alias AshBulkDurable.Core.{Progress, Runner}
+  alias AshBulkDurable.Core.{Progress, Runner, Transient}
 
   @impl true
   def batch_change(changesets, _opts, _context), do: changesets
@@ -37,19 +37,30 @@ defmodule AshBulkDurable.Core.Changes.RunRow do
     # same transaction and a failure names the row it came from. The chunk's
     # atomicity comes from the worker wrapping this whole `:run` batch in one
     # transaction.
-    {results, succeeded} =
-      Enum.map_reduce(pairs, 0, fn {changeset, row}, succeeded ->
-        with {:ok, record} <- run_row(settings, row),
-             {:ok, row} <- mark_succeeded(row, record) do
-          {{:ok, row}, succeeded + 1}
-        else
-          {:error, error} -> {{:error, on_row(changeset, error)}, succeeded}
-        end
+    {results, {succeeded, trouble}} =
+      Enum.map_reduce(pairs, {0, nil}, fn
+        {changeset, _row}, {succeeded, trouble} when trouble != nil ->
+          {{:error, on_row(changeset, trouble)}, {succeeded, trouble}}
+
+        {changeset, row}, {succeeded, nil} ->
+          with {:ok, record} <- run_row(settings, row),
+               {:ok, row} <- mark_succeeded(row, record) do
+            {{:ok, row}, {succeeded + 1, nil}}
+          else
+            {:error, error} -> {{:error, on_row(changeset, error)}, {succeeded, trouble(error)}}
+          end
       end)
 
-    if succeeded > 0, do: bulk_action |> bump_rows_done(succeeded) |> report_progress()
+    if succeeded > 0 and is_nil(trouble),
+      do: bulk_action |> bump_rows_done(succeeded) |> report_progress()
+
     results
   end
+
+  # The database's own trouble (`Transient`) has aborted the transaction, so
+  # nothing after it can run: the rows left fail with it unrun, and the
+  # worker raises it, leaving them all for the next start.
+  defp trouble(error), do: if(Transient.transient?(error), do: error)
 
   # A raise fails its row like any other error, so the rows around it still
   # run: every attempt would hit it again, and take them down with it.

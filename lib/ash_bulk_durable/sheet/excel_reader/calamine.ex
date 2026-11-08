@@ -21,10 +21,7 @@ defmodule AshBulkDurable.Sheet.ExcelReader.Calamine do
     with {:ok, name} <- sheet_name(path, sheet, max_cells),
          {:ok, rows} <-
            xlsx(Spreadsheet.parse(path, sheet: name, max_cells: max_cells), max_cells) do
-      {:ok,
-       rows
-       |> Enum.reject(fn row -> Enum.all?(row, &is_nil/1) end)
-       |> Enum.map(fn row -> Enum.map(row, &cell/1) end)}
+      {:ok, Enum.map(rows, fn row -> Enum.map(row, &cell/1) end)}
     end
   end
 

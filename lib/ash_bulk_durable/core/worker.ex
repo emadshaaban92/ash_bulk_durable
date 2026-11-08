@@ -91,6 +91,15 @@ defmodule AshBulkDurable.Core.Worker do
   - Per-row chunk rollback → recovery, halving the chunk's rows (rows
     succeed or fail individually); the bulk action lands in
     `:completed_with_errors` if any row landed `:failed`.
+  - A chunk, a recovery try or a row run alone that rolls back with the
+    database's own trouble (a dropped connection, a deadlock, a lock or
+    statement timeout: `AshBulkDurable.Core.Transient`), in either mode →
+    raised, with no recovery and no row failed: its rows stay `:resolved`,
+    and the next start runs them. Starts that keep meeting it with no
+    progress are counted like any crash (see "Crashes" below), so trouble
+    that never clears ends as a crash does: per row, the row that meets it
+    fails alone as crashed; all or nothing, the bulk action fails
+    `:crashed`.
   - A row status flip refused because another run of the bulk action already
     moved the row on (`RowMovedOnError`, see below) → the run stops, writing
     no verdict.
@@ -105,13 +114,15 @@ defmodule AshBulkDurable.Core.Worker do
 
   A row that raises, or outruns `:row_resolve_timeout` in phase 1, fails like
   one that returns an error, in either phase and either mode. Only a raise from the worker's own reads and writes propagates
-  out of the run; the bulk action stays `:running`, and is started again once
-  its liveness hint goes stale.
+  out of the run, and in phase 2 the database's own trouble met by a row
+  (above); the bulk action stays `:running`, and is started again once its
+  liveness hint goes stale.
 
   ## Recovering a failed chunk
 
   A per-row chunk whose rows return errors (a validation error, a constraint
-  violation; a row that raises counts too) rolls back as a whole, so its
+  violation; a row that raises counts too, the database's own trouble
+  aside) rolls back as a whole, so its
   rows are tried again in smaller sets, each set in a locked transaction of
   its own (`SKIP LOCKED`). Each try reads again, under the lock and on its
   connection, which of its rows are still `:resolved`, and drops the rest:
@@ -318,7 +329,8 @@ defmodule AshBulkDurable.Core.Worker do
     Runner,
     StagedFileError,
     Storage,
-    StoredTerm
+    StoredTerm,
+    Transient
   }
 
   alias AshBulkDurable.Core.Worker.RowMovedOnError
@@ -841,11 +853,17 @@ defmodule AshBulkDurable.Core.Worker do
   end
 
   # A refused flip fails a batch like a row failure would, but it is not one:
-  # another run wrote the row, so this one stops. Rolled back anywhere else,
-  # the transaction raises as `Ash.update!/3` would.
+  # another run wrote the row, so this one stops. Nor is the database's own
+  # trouble (`Transient`): the run raises, leaving the rows `:resolved` for
+  # the next start, rather than recovering them or failing them with it.
+  # Rolled back anywhere else, the transaction raises as `Ash.update!/3`
+  # would.
   defp rolled_back(writing, error, bulk_action_id) do
     raise_if_moved_on!(error, bulk_action_id)
-    if writing, do: {:rolled_back, writing, error}, else: raise(Ash.Error.to_error_class(error))
+
+    if writing && not Transient.transient?(error),
+      do: {:rolled_back, writing, error},
+      else: raise(Ash.Error.to_error_class(error))
   end
 
   defp start_running(%{status: :queued} = locked),
@@ -1674,7 +1692,12 @@ defmodule AshBulkDurable.Core.Worker do
     end
   end
 
-  defp first_error(%{errors: [error | _]}), do: error
+  # The database's own trouble, when a row met it, comes first: the rows
+  # after it in the chunk fail only because it aborted the transaction
+  # (`in_failed_sql_transaction`), and may be reported before it.
+  defp first_error(%{errors: [error | _] = errors}),
+    do: Enum.find(errors, error, &Transient.transient?/1)
+
   defp first_error(_result), do: :unknown
 
   # `[:ash_bulk_durable, :chunk, :start | :stop | :exception]`, as
