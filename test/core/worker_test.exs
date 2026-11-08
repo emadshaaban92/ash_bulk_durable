@@ -19,7 +19,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
   alias AshBulkDurable.Core.{ManyMatchesError, RowExitError, StagedFileError, Worker}
   alias AshBulkDurable.Test.{BulkAction, Row}
   alias AshBulkDurable.Test.Region
-  alias AshBulkDurable.Test.Shelf
+  alias AshBulkDurable.Test.{PagedBin, Shelf}
 
   @region_resource_name "AshBulkDurable.Test.Region"
 
@@ -848,6 +848,51 @@ defmodule AshBulkDurable.Core.WorkerTest do
                %{status: :succeeded},
                %{status: :succeeded}
              ] = list_rows(bulk_action.id) |> Enum.sort_by(& &1.row_index)
+    end
+  end
+
+  describe "an update whose target matches more than one record" do
+    # Looked up by a key that isn't unique, through a primary read that pages.
+    # One row a chunk: ETS keeps what a chunk wrote when the chunk is rerun.
+    test "fails its row alone, changing none of them", %{super_user: user} do
+      suffix = System.unique_integer([:positive])
+      [shared, single] = ["A#{suffix}", "B#{suffix}"]
+      matches = for _n <- 1..2, do: Ash.create!(PagedBin, %{aisle: shared})
+      only = Ash.create!(PagedBin, %{aisle: single})
+
+      bulk_action =
+        Ash.create!(
+          BulkAction,
+          %{
+            user_id: user.id,
+            resource_name: inspect(PagedBin),
+            action_name: :update,
+            action_type: :update,
+            total_rows: 2,
+            mode: :per_row,
+            chunk_size: 1,
+            rows: [
+              %{target: %{lookup: %{aisle: shared}}, input: %{aisle: "moved"}},
+              %{target: %{lookup: %{aisle: single}}, input: %{aisle: "moved"}}
+            ]
+          },
+          action: :create,
+          authorize?: false
+        )
+
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      assert reload(bulk_action).status == :completed_with_errors
+
+      assert [
+               %{status: :failed, error: [%{error: %ManyMatchesError{field: nil} = error}]},
+               %{status: :succeeded}
+             ] = list_rows(bulk_action.id)
+
+      assert error.resource == PagedBin
+      assert error.criteria == %{aisle: shared}
+      assert Enum.map(matches, &Ash.reload!(&1).aisle) == [shared, shared]
+      assert Ash.reload!(only).aisle == "moved"
     end
   end
 

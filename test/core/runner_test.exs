@@ -70,7 +70,7 @@ defmodule AshBulkDurable.Core.RunnerTest do
 
   defp settings(ctx, opts \\ []) do
     %Runner.Settings{
-      resource: Region,
+      resource: Keyword.get(opts, :resource, Region),
       action_name: Keyword.get(opts, :action_name, :create),
       action_type: Keyword.get(opts, :action_type, :create),
       mode: :per_row,
@@ -264,6 +264,67 @@ defmodule AshBulkDurable.Core.RunnerTest do
                Runner.run_row(settings, row)
 
       assert code == "NO-SUCH-#{ctx.i}"
+    end
+
+    # A key that isn't unique, read through a primary read that pages: the
+    # row acts on neither match.
+    test "a lookup matching two records fails the row naming what it looked up", ctx do
+      for resource <- [PagedBin, LimitedBin] do
+        aisle = "A#{System.unique_integer([:positive])}"
+        settings = settings(ctx, resource: resource, action_name: :update, action_type: :update)
+        row = row(%{aisle: aisle <> " moved"}, target: %{lookup: %{aisle: aisle}})
+
+        first = Ash.create!(resource, %{aisle: aisle})
+        second = Ash.create!(resource, %{aisle: aisle})
+
+        assert {:error, %ManyMatchesError{field: nil} = error} = Runner.run_row(settings, row)
+        assert error.resource == resource
+        assert error.criteria == %{aisle: aisle}
+
+        assert Enum.map([first, second], &Ash.reload!(&1).aisle) == [aisle, aisle]
+      end
+    end
+
+    test "names a clause however many relationships deep it goes" do
+      error = %ManyMatchesError{
+        resource: PagedBin,
+        criteria: %{shelf: %{owner: %{email: "a@example.com"}, code: "S1"}, aisle: "A1"}
+      }
+
+      assert Exception.message(error) ==
+               ~s(more than one Paged Bin matches aisle = "A1", shelf.code = "S1", ) <>
+                 ~s(shelf.owner.email = "a@example.com")
+    end
+
+    test "a destroy whose lookup matches two records fails the row, destroying neither", ctx do
+      for resource <- [PagedBin, LimitedBin] do
+        aisle = "A#{System.unique_integer([:positive])}"
+        settings = settings(ctx, resource: resource, action_name: :destroy, action_type: :destroy)
+        row = row(%{}, target: %{lookup: %{aisle: aisle}})
+
+        bins = for _n <- 1..2, do: Ash.create!(resource, %{aisle: aisle})
+
+        assert {:error, %ManyMatchesError{field: nil, criteria: %{aisle: ^aisle}}} =
+                 Runner.run_row(settings, row)
+
+        assert Enum.map(bins, &Ash.reload!(&1).id) == Enum.map(bins, & &1.id)
+      end
+    end
+
+    test "a lookup matching two records keeps the clause through a relationship it read by",
+         ctx do
+      aisle = "A#{System.unique_integer([:positive])}"
+      shelf = Ash.create!(Shelf, %{code: "S" <> aisle}, authorize?: false)
+      for _n <- 1..2, do: Ash.create!(PagedBin, %{aisle: aisle, shelf_id: shelf.id})
+      lookup = %{aisle: aisle, shelf: %{code: shelf.code}}
+      settings = settings(ctx, resource: PagedBin, action_name: :update, action_type: :update)
+
+      assert {:error, %ManyMatchesError{criteria: ^lookup} = error} =
+               Runner.run_row(settings, row(%{aisle: "moved"}, target: %{lookup: lookup}))
+
+      assert Exception.message(error) ==
+               "more than one Paged Bin matches aisle = #{inspect(aisle)}, " <>
+                 "shelf.code = #{inspect(shelf.code)}"
     end
 
     test "destroys the record its target looks up, returning it",
