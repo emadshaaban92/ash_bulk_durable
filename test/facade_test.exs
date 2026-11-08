@@ -9,7 +9,7 @@ defmodule AshBulkDurable.FacadeTest do
 
   require Ash.Query
 
-  alias AshBulkDurable.Core.Worker
+  alias AshBulkDurable.Core.{NoMatchError, Worker}
   alias AshBulkDurable.Test.{Book, Shelf}
   alias AshBulkDurable.Test.{BulkAction, Row}
   alias AshBulkDurable.Test.Branch
@@ -263,7 +263,7 @@ defmodule AshBulkDurable.FacadeTest do
 
       assert bulk_action.status == :completed_with_errors
       assert found.record_id == person.id
-      assert [%{error: %Ash.Error.Query.NotFound{primary_key: %{email: ^missing}}}] = gone.error
+      assert [%{error: %NoMatchError{field: nil, criteria: %{email: ^missing}}}] = gone.error
 
       sheet = AshBulkDurable.errors_sheet(bulk_action)
       assert [%{"email" => cell}] = sheet.rows

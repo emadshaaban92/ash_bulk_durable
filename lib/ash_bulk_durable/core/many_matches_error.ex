@@ -27,7 +27,10 @@ defmodule AshBulkDurable.Core.ManyMatchesError do
   def in_order(criteria),
     do: Enum.sort_by(criteria, fn {key, value} -> {is_composite(value), to_string(key)} end)
 
-  defp criteria_text(criteria),
+  # Shared with `AshBulkDurable.Core.NoMatchError`, which reads its criteria
+  # the same way.
+  @doc false
+  def criteria_text(criteria),
     do: criteria |> in_order() |> Enum.map_join(", ", &criterion/1)
 
   defp criterion({key, nested}) when is_composite(nested),
@@ -35,7 +38,8 @@ defmodule AshBulkDurable.Core.ManyMatchesError do
 
   defp criterion({key, value}), do: "#{key} = #{inspect(value)}"
 
-  defp label(resource) do
+  @doc false
+  def label(resource) do
     resource
     |> Ash.Resource.Info.short_name()
     |> to_string()
