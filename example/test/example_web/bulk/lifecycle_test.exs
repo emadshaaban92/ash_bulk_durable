@@ -309,7 +309,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
       html = render(view)
       assert html =~ "Completed with errors"
       assert html =~ missing
-      assert html =~ "Code: could not be found"
+      assert html =~ "Code: no result in Region matches Code = &quot;#{missing}&quot;"
       refute html =~ "not_found"
       assert html =~ "Download errors sheet"
     end
@@ -332,7 +332,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
 
       html = render(view)
       assert html =~ "Failed"
-      assert html =~ "Row #{length(codes)}: Code: could not be found"
+      assert html =~ "Row #{length(codes)}: Code: no result in Region matches"
       assert_error_on_row(fresh, missing)
     end
   end
@@ -355,7 +355,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
       fresh = reload(bulk_action)
       assert fresh.status == :failed
       assert fresh.rows_done == 0
-      assert render(view) =~ "Row #{length(codes)}: Code: could not be found"
+      assert render(view) =~ "Row #{length(codes)}: Code: no result in Region matches"
       assert_error_on_row(fresh, missing)
     end
   end
@@ -372,7 +372,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
     rows = Enum.map(rows, &Map.new(Enum.zip(headers, &1)))
 
     {[offending], others} = Enum.split_with(rows, &(&1["code"] == code))
-    assert offending["last_error"] =~ "could not be found"
+    assert offending["last_error"] == ~s(Code: no result in Region matches Code = "#{code}")
     assert others != []
     assert Enum.all?(others, &(&1["last_error"] == ""))
   end

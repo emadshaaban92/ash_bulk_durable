@@ -239,7 +239,7 @@ defmodule AshBulkDurable.Sheet.ErrorsSheetTest do
       assert [%{"last_error" => ""}, %{"last_error" => error, "code" => code}] =
                AshBulkDurable.errors_sheet(run!(bulk_action)).rows
 
-      assert error =~ ~s(code: "#{missing}" not found)
+      assert error == ~s(no Region matches code = "#{missing}")
       assert code == missing
     end
 
@@ -261,7 +261,7 @@ defmodule AshBulkDurable.Sheet.ErrorsSheetTest do
       assert [%{"last_error" => ""}, %{"last_error" => error}] =
                AshBulkDurable.errors_sheet(run!(bulk_action)).rows
 
-      assert error =~ ~s(id: "#{gone.id}" not found)
+      assert error == ~s(no Branch matches id = "#{gone.id}")
     end
 
     test "is headers alone when no row is left", ctx do

@@ -63,6 +63,10 @@ defmodule ExampleWeb.Bulk.ErrorMessage do
   defp word(%StoredError{error: %UnreadableRowError{}}),
     do: [gettext("What this row held no longer exists, so nothing was saved for it.")]
 
+  defp word(%StoredError{error: %NoMatchError{field: nil, resource: resource} = error})
+       when not is_nil(resource),
+       do: [on_fields(target_keys(error), no_match(error))]
+
   defp word(%StoredError{error: %NoMatchError{field: field} = error}),
     do: [on_field(field, no_match(error))]
 
@@ -82,6 +86,9 @@ defmodule ExampleWeb.Bulk.ErrorMessage do
 
   defp no_match(%NoMatchError{resource: nil}), do: gettext("no match found")
 
+  defp no_match(%NoMatchError{resource: resource, criteria: criteria}) when criteria == %{},
+    do: gettext("the row names no %{resource}", resource: resource_label(resource))
+
   defp no_match(%NoMatchError{resource: resource, criteria: criteria}) do
     gettext("no result in %{resource} matches %{criteria}",
       resource: resource_label(resource),
@@ -90,9 +97,9 @@ defmodule ExampleWeb.Bulk.ErrorMessage do
   end
 
   # An update's or destroy's target names no field: it reads on the keys the
-  # row looked it up by, as a target finding nothing does, not on a clause
-  # through a relationship, which only narrows the lookup.
-  defp target_keys(%ManyMatchesError{criteria: criteria}) do
+  # row looked it up by, not on a clause through a relationship, which only
+  # narrows the lookup (the message names that clause).
+  defp target_keys(%{criteria: criteria}) do
     for {key, value} <- ManyMatchesError.in_order(criteria), not is_composite(value), do: key
   end
 

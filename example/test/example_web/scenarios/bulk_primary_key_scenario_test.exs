@@ -93,7 +93,7 @@ defmodule ExampleWeb.Scenarios.BulkPrimaryKeyScenarioTest do
     html = render(view)
     assert html =~ "1 of 2 rows done"
     # Not refused, which would say the booking exists: it isn't theirs to find.
-    assert html =~ "could not be found"
+    assert html =~ "Id: no result in Booking matches"
 
     assert Ash.reload!(own, authorize?: false).status == :cancelled
     assert Ash.reload!(theirs, authorize?: false).status == :active
@@ -125,7 +125,7 @@ defmodule ExampleWeb.Scenarios.BulkPrimaryKeyScenarioTest do
     assert reload(bulk_action).status == :completed_with_errors
     html = render(view)
     assert html =~ "2 of 4 rows done"
-    assert html =~ "could not be found"
+    assert html =~ "Id: no result in Region matches Id = &quot;not-a-key&quot;"
     refute html =~ "Ash.Query"
     refute html =~ "Ecto.Query"
     assert Ash.reload!(first, authorize?: false).name == renamed
@@ -165,7 +165,7 @@ defmodule ExampleWeb.Scenarios.BulkPrimaryKeyScenarioTest do
     assert reload(bulk_action).status == :failed
     html = render(view)
     assert html =~ "Row 2:"
-    assert html =~ "could not be found"
+    assert html =~ "Id: no result in Region matches"
     refute html =~ "Ash.Query"
     refute Ash.reload!(region, authorize?: false).name == renamed
   end

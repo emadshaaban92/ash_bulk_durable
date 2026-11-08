@@ -19,7 +19,9 @@ defmodule AshBulkDurable.Core.Runner do
       "O1"}}`) to narrow the lookup without naming a tenant. A lookup
       matching more than one record (by a key that isn't unique, say)
       fails its row with `AshBulkDurable.Core.ManyMatchesError` rather than
-      acting on one of them.
+      acting on one of them, and one matching none fails it with
+      `AshBulkDurable.Core.NoMatchError`. Neither names a field; their
+      criteria are the whole lookup.
     * `:tenant` — the tenant the row acts in, a value or a reference;
       without one the row acts in the bulk action's `tenant`.
 
@@ -544,19 +546,13 @@ defmodule AshBulkDurable.Core.Runner do
     end
   end
 
-  # Names the values the row looked up, not a clause through a relationship
-  # (it only narrows the lookup), so each is reported against the input the
-  # reader can correct.
-  defp not_found(settings, lookup) do
-    Ash.Error.Query.NotFound.exception(
-      primary_key: Map.reject(lookup, fn {_key, value} -> is_composite(value) end),
-      resource: settings.resource
-    )
-  end
-
   # A target is no input, so it names no field. Its criteria are the whole
-  # lookup, a clause through a relationship included: the matches all passed
-  # it, so leaving it out would name more records than the row looked up.
+  # lookup, a clause through a relationship included: the clause narrowed the
+  # read, so leaving it out would name records the row never looked up (an
+  # A1 under another shelf, say).
+  defp not_found(settings, lookup),
+    do: %NoMatchError{resource: settings.resource, criteria: lookup}
+
   defp many_targets(settings, lookup),
     do: %ManyMatchesError{resource: settings.resource, criteria: lookup}
 

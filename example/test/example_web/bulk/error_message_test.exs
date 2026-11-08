@@ -69,6 +69,23 @@ defmodule ExampleWeb.Bulk.ErrorMessageTest do
                "Name = \"Acme\", Organization Code = \"ACME\""
   end
 
+  test "a target matching nothing reads on its keys, naming the clause it was narrowed by" do
+    error = %NoMatchError{
+      resource: Example.Accounts.Membership,
+      criteria: %{name: "Acme", organization: %{code: "ACME"}}
+    }
+
+    assert ErrorMessage.display_error(error) ==
+             "Name: no result in Membership matches " <>
+               "Name = \"Acme\", Organization Code = \"ACME\""
+  end
+
+  test "a target the row named no lookup for names its resource" do
+    error = %NoMatchError{resource: Example.Accounts.Organization}
+
+    assert ErrorMessage.display_error(error) == "the row names no Organization"
+  end
+
   test "a clause two relationships deep is labelled through both" do
     error = %ManyMatchesError{
       resource: Example.Accounts.Membership,

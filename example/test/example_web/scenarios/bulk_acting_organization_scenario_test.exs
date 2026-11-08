@@ -134,7 +134,8 @@ defmodule ExampleWeb.Scenarios.BulkActingOrganizationScenarioTest do
              context.here.name
 
     # Refused by the read, not only the write: they no longer see its people.
-    assert errors_sheet(owner) =~ "could not be found,#{context.here.email}"
+    assert errors_sheet(owner) =~
+             ~s(no result in User matches Email = ""#{context.here.email}""",#{context.here.email})
   end
 
   test "a super user acting in no organization keeps reaching every one after switching",

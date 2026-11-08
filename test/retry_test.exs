@@ -37,7 +37,7 @@ defmodule AshBulkDurable.RetryTest do
     def finish(_state), do: :ok
   end
 
-  alias AshBulkDurable.Core.Worker
+  alias AshBulkDurable.Core.{NoMatchError, Worker}
   alias AshBulkDurable.Test.{BulkAction, Row}
   alias AshBulkDurable.Test.Branch
   alias AshBulkDurable.Test.Region
@@ -437,7 +437,7 @@ defmodule AshBulkDurable.RetryTest do
 
       assert bulk_action.result["reason"] == "atomic_chunk_rolled_back"
       assert bulk_action.result["row_index"] == 1
-      assert [%{error: %Ash.Error.Query.NotFound{}}] = bulk_action.error
+      assert [%{error: %NoMatchError{field: nil}}] = bulk_action.error
 
       Ash.create!(Region, missing, actor: ctx.user)
       {:ok, _retried} = AshBulkDurable.retry(bulk_action, scope: ctx.scope)

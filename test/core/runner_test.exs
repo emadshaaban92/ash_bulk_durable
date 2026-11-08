@@ -14,7 +14,7 @@ defmodule AshBulkDurable.Core.RunnerTest do
   """
   use AshBulkDurable.DataCase, async: true
 
-  alias AshBulkDurable.Core.{ManyMatchesError, Runner}
+  alias AshBulkDurable.Core.{ManyMatchesError, NoMatchError, Runner}
   alias AshBulkDurable.Test.{LimitedBin, PagedBin, Region, Shelf}
   alias AshBulkDurable.Test.Scope
 
@@ -260,10 +260,39 @@ defmodule AshBulkDurable.Core.RunnerTest do
       settings = settings(ctx, action_name: :update, action_type: :update)
       row = row(%{name: "x"}, target: %{lookup: %{code: "NO-SUCH-#{ctx.i}"}})
 
-      assert {:error, %Ash.Error.Query.NotFound{primary_key: %{code: code}}} =
-               Runner.run_row(settings, row)
+      assert {:error, %NoMatchError{field: nil} = error} = Runner.run_row(settings, row)
+      assert error.resource == Region
+      assert error.criteria == %{code: "NO-SUCH-#{ctx.i}"}
+    end
 
-      assert code == "NO-SUCH-#{ctx.i}"
+    # The clause narrowed the read, so the row names it: an A1 exists, only
+    # not under this shelf.
+    test "a lookup matching no record keeps the clause through a relationship it read by",
+         ctx do
+      aisle = "A#{System.unique_integer([:positive])}"
+
+      [here, there] =
+        for code <- ["S", "T"], do: Ash.create!(Shelf, %{code: code <> aisle}, authorize?: false)
+
+      Ash.create!(PagedBin, %{aisle: aisle, shelf_id: there.id})
+      lookup = %{aisle: aisle, shelf: %{code: here.code}}
+      settings = settings(ctx, resource: PagedBin, action_name: :update, action_type: :update)
+
+      assert {:error, %NoMatchError{field: nil, criteria: ^lookup} = error} =
+               Runner.run_row(settings, row(%{aisle: "moved"}, target: %{lookup: lookup}))
+
+      assert Exception.message(error) ==
+               "no Paged Bin matches aisle = #{inspect(aisle)}, shelf.code = #{inspect(here.code)}"
+    end
+
+    test "a row with no lookup names the resource it looked in", ctx do
+      settings = settings(ctx, action_name: :update, action_type: :update)
+
+      assert {:error, %NoMatchError{field: nil, criteria: criteria} = error} =
+               Runner.run_row(settings, row(%{name: "x"}))
+
+      assert criteria == %{}
+      assert Exception.message(error) == "the row names no Region"
     end
 
     # A key that isn't unique, read through a primary read that pages: the
