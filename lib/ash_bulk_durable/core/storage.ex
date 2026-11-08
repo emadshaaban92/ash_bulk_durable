@@ -25,7 +25,8 @@ defmodule AshBulkDurable.Core.Storage do
 
   @doc """
   Writes the file stored at `key` to `path`, a file the worker created and
-  removes when it is done. Answers `:ok` once the whole file is there.
+  removes when it is done. The file is already there, empty, so the store
+  overwrites it. Answers `:ok` once the whole file is there.
   A missing key, or any other failure, is `{:error, term}`.
   """
   @callback fetch_file(key(), path :: Path.t(), opts :: keyword()) :: :ok | {:error, term()}

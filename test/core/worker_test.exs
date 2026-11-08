@@ -225,7 +225,69 @@ defmodule AshBulkDurable.Core.WorkerTest do
     def list_files(_prefix, _opts), do: {:ok, []}
   end
 
+  defmodule PathRecordingStorage do
+    @moduledoc false
+    # Tells the test which temp path each fetch was handed. A key ending in
+    # `ok` is fetched, `error` fails and `raise` raises, each after writing
+    # some bytes, as a store that dies mid-download would.
+    @behaviour AshBulkDurable.Core.Storage
+
+    @impl true
+    def fetch_file(key, path, _opts) do
+      send(Application.fetch_env!(:ash_bulk_durable, :test_fetch_pid), {:fetched, key, path})
+      File.write!(path, "partial")
+
+      cond do
+        String.ends_with?(key, "ok") -> :ok
+        String.ends_with?(key, "error") -> {:error, :test_storage_offline}
+        String.ends_with?(key, "raise") -> raise "storage is down"
+      end
+    end
+
+    @impl true
+    def delete_file(_key, _opts), do: :ok
+
+    @impl true
+    def list_files(_prefix, _opts), do: {:ok, []}
+  end
+
   # ── Setup helpers ─────────────────────────────────────────────────────
+
+  # Runs a bulk action whose first staged file fetches and whose second ends
+  # in `failing`, and checks that neither temp path is left on disk.
+  defp assert_fetches_leave_no_temp_file(user, failing) do
+    put_storage(PathRecordingStorage)
+    Application.put_env(:ash_bulk_durable, :test_fetch_pid, self())
+    on_exit(fn -> Application.delete_env(:ash_bulk_durable, :test_fetch_pid) end)
+
+    rows =
+      1
+      |> region_rows(System.unique_integer([:positive]))
+      |> Enum.map(&put_in(&1, [:input, :name], {:resolve, AshBulkDurable.EchoResolver, "Name"}))
+
+    prefix = "bulk-staging/#{user.id}/abc/companions"
+    {ok_key, failing_key} = {"#{prefix}/a.ok", "#{prefix}/b.#{failing}"}
+
+    bulk_action =
+      create_bulk_action!(rows,
+        user_id: user.id,
+        chunk_size: 1,
+        staged_files: %{"a" => ok_key, "b" => failing_key}
+      )
+
+    capture_log(fn ->
+      if failing == "raise" do
+        assert_raise RuntimeError, "storage is down", fn -> Worker.run_now(bulk_action.id) end
+      else
+        assert :ok = Worker.run_now(bulk_action.id)
+      end
+    end)
+
+    assert_received {:fetched, ^ok_key, fetched}
+    assert_received {:fetched, ^failing_key, failed}
+    refute File.exists?(fetched), "#{failing}: the file fetched first is still on disk"
+    refute File.exists?(failed), "#{failing}: the file that failed is still on disk"
+  end
 
   defp messages(stored), do: Enum.map_join(stored, "; ", & &1.message)
 
@@ -1019,6 +1081,18 @@ defmodule AshBulkDurable.Core.WorkerTest do
 
       assert [%{name: name}] = regions_named(found.id, user)
       assert name == found.id
+    end
+
+    test "a fetch that fails leaves no temp file, the ones fetched before it included", %{
+      super_user: user
+    } do
+      assert_fetches_leave_no_temp_file(user, "error")
+    end
+
+    test "a fetch that raises leaves no temp file, the ones fetched before it included", %{
+      super_user: user
+    } do
+      assert_fetches_leave_no_temp_file(user, "raise")
     end
 
     test "rows with nothing left to resolve run without the staged files", %{super_user: user} do
