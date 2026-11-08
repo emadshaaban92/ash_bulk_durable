@@ -135,11 +135,12 @@
   crashed. Phase 1 runs its tasks unlinked, under a supervisor linked to the
   run, so they still go when the run does.
 - A retry of a `:failed` bulk action while its owner has another unresolved
-  one is refused with `{:error, %{unresolved: id}}`, that one's id, before
-  anything is written. Before, it failed with the one-unresolved index's
-  unique-constraint error. A retried bulk action is `:queued`, not
-  `:running`, until a run starts it; that run sets `started_at` again. A
-  host's own `:enqueue_retry` should set `:queued` too.
+  one is refused with `{:error, %{unresolved: id}}`, that one's id, with
+  nothing written, also when that one was submitted while the retry ran.
+  Before, it failed with the one-unresolved index's unique-constraint
+  error. A retried bulk action is `:queued`, not `:running`, until a run
+  starts it; that run sets `started_at` again. A host's own
+  `:enqueue_retry` should set `:queued` too.
 - A failed bulk action whose staged files the daily sweep took can be
   finished with them again: `retry/2` and `retry_row/2` take
   `:staged_files`, which replace every file the bulk action held, and a

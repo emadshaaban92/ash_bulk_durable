@@ -44,7 +44,10 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
   The re-upload `live_file_input` only renders once the host LV has
   allocated a `:retry_csv` upload (passed in via `uploads`); the
   "Retry failed rows" button is enabled once the host signals a file is
-  parsed and staged (via `retry_filename`). The errors-sheet modal's
+  parsed and staged (via `retry_filename`). A retry refused because
+  another of the owner's bulk actions holds their one unresolved slot
+  leaves `retry_blocked_by`, that one's page, and the panel says so with a
+  link to it. The errors-sheet modal's
   async state is threaded in via `errors_sheet` (the `%AsyncResult{}`
   from `assign_async`).
   """
@@ -57,6 +60,7 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
   attr :errors_sheet, :any, default: nil
   attr :failed_preview, :list, default: []
   attr :retry_filename, :string, default: nil
+  attr :retry_blocked_by, :string, default: nil
 
   def progress_panel(%{bulk_action: nil} = assigns), do: ~H""
 
@@ -129,6 +133,22 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
             rows={@failed_preview}
             total_failed={failed_count(@bulk_action)}
           />
+
+          <div
+            :if={@retry_blocked_by && retryable?(@bulk_action)}
+            id="retry-blocked"
+            role="alert"
+            class="alert alert-warning"
+          >
+            <span>
+              {gettext(
+                "Your other open bulk action has to be finished or abandoned before this one can be retried."
+              )}
+            </span>
+            <.link navigate={@retry_blocked_by} class="btn btn-sm">
+              {gettext("Open it")}
+            </.link>
+          </div>
 
           <.retry_zone
             :if={retryable?(@bulk_action)}

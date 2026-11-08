@@ -906,6 +906,56 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
                Enum.sort([first.code, third.code, fixed_code])
     end
 
+    # A failed bulk action gave up its owner's one unresolved slot, so a
+    # bulk action submitted from another tab takes it, and the retry is
+    # refused until that one is finished or abandoned.
+    test "a failed bulk action's retry, while another tab's bulk action holds the slot, " <>
+           "says so, links to that one and changes nothing",
+         %{conn: conn, super_user: user} do
+      [_first, taken, _third] = rows = region_rows()
+      Ash.create!(Region, taken, actor: user)
+
+      {:ok, view, _html} = conn |> login_as(user) |> live(~p"/bulk")
+
+      view
+      |> ready_to_submit(rows)
+      |> form("#main_form", %{"all_or_nothing" => "on"})
+      |> render_submit()
+
+      render_async(view, 2000)
+      failed = unresolved_bulk_action(user.id)
+      drain()
+      failed = reload(failed)
+      assert failed.status == :failed
+      failed_rows = list_rows(failed.id)
+
+      {_other_tab, holder} = submit_bulk_action(conn, user)
+      assert holder.status == :queued
+      refute holder.id == failed.id
+
+      fixed_code = "T#{System.unique_integer([:positive])}"
+
+      upload_corrected(view, failed, fn
+        %{"code" => code} = row when code == taken.code -> %{row | "code" => fixed_code}
+        row -> row
+      end)
+
+      html = view |> element("#bulk-action-panel button", "Retry failed rows") |> render_click()
+
+      assert html =~ "Another bulk action of yours is still open."
+      refute html =~ "Please try again"
+      assert reload(failed) == failed
+      assert list_rows(failed.id) == failed_rows
+
+      holder_path = "/bulk?bulk_action=#{holder.id}"
+
+      assert {:error, {:live_redirect, %{to: ^holder_path}}} =
+               view |> element("#retry-blocked a", "Open it") |> render_click()
+
+      {:ok, _holder_view, html} = conn |> login_as(user) |> live(holder_path)
+      assert html =~ "Waiting to start"
+    end
+
     test "a sheet naming a row that is not this bulk action's changes nothing", %{
       conn: conn,
       super_user: user

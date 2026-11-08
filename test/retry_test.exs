@@ -501,6 +501,28 @@ defmodule AshBulkDurable.RetryTest do
       assert failed.status == :completed
       assert codes_written([fixed.code]) == [fixed.code]
     end
+
+    # A parked bulk action holds its owner's slot itself, so only the index's
+    # own violation may turn a rolled-back write into `%{unresolved: id}`.
+    test "a write refused for another reason while the slot is held comes back as it is", ctx do
+      taken = region_input()
+      Ash.create!(Region, taken, actor: ctx.user)
+      {:ok, parked} = AshBulkDurable.bulk_create([taken], Region, :create, scope: ctx.scope)
+      {parked, rows} = run!(parked)
+      assert parked.status == :completed_with_errors
+      [row] = rows
+
+      assert {:error, %Ash.Error.Invalid{}} =
+               AshBulkDurable.retry(parked,
+                 rows: %{row.id => %{metadata: "not a map"}},
+                 scope: ctx.scope
+               )
+
+      assert Map.take(reload(parked), [:status, :pass, :updated_at]) ==
+               Map.take(parked, [:status, :pass, :updated_at])
+
+      assert rows(parked) == rows
+    end
   end
 
   describe "retry with a shared input" do

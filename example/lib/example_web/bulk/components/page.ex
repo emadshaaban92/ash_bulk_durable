@@ -34,6 +34,7 @@ defmodule ExampleWeb.Bulk.Components.Page do
   attr :errors_sheet, :any, default: nil
   attr :failed_preview, :list, default: []
   attr :retry_filename, :string, default: nil
+  attr :retry_blocked_by, :string, default: nil
   attr :params, :map, default: %{}
 
   def bulk_page(assigns) do
@@ -55,6 +56,7 @@ defmodule ExampleWeb.Bulk.Components.Page do
           errors_sheet={@errors_sheet}
           failed_preview={@failed_preview}
           retry_filename={@retry_filename}
+          retry_blocked_by={@retry_blocked_by}
         />
       <% @params["bulk_action"] -> %>
         <%!--
