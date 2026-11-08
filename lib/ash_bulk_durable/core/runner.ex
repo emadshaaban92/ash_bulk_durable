@@ -43,6 +43,7 @@ defmodule AshBulkDurable.Core.Runner do
     ManyMatchesError,
     NoMatchError,
     Reference,
+    RowExitError,
     RowTimeoutError,
     StoredTerm,
     UnreadableRowError
@@ -328,6 +329,23 @@ defmodule AshBulkDurable.Core.Runner do
 
     {:error, exception}
   end
+
+  @doc """
+  What a throw or exit while resolving `row` fails it with, logged as a raise
+  is. `stacktrace` is `[]` when the task resolving the row died, since then
+  there is none.
+  """
+  def row_exited(kind, reason, stacktrace, row) do
+    Logger.error(
+      "bulk action #{row.bulk_action_id} row #{row.row_index} #{exited(kind)}: " <>
+        Exception.format(kind, reason, stacktrace)
+    )
+
+    {:error, RowExitError.new(kind, reason)}
+  end
+
+  defp exited(:throw), do: "threw"
+  defp exited(:exit), do: "exited"
 
   @doc "What a row whose resolution outran `timeout` fails with, logged as a raise is."
   def row_timed_out(timeout, row) do

@@ -1152,27 +1152,41 @@ defmodule AshBulkDurable.Core.Worker do
 
   # The timeout runs per task, and an overrun kills only that task, so one
   # slow row fails alone. Left to the default it would exit this process,
-  # where no rescue reaches, and every attempt would meet the same row.
+  # where no rescue reaches, and every attempt would meet the same row. The
+  # tasks are unlinked for the same reason: a task that dies (a process
+  # linked to it crashed, or it was killed) fails its row with the reason,
+  # instead of taking the run down with it. Their supervisor is linked to
+  # this process, so the tasks still go when the run does.
   defp resolve_rows(rows, settings, resolvers, concurrency, atomic?) do
     timeout = AshBulkDurable.Core.config(:row_resolve_timeout, @row_resolve_timeout)
+    {:ok, tasks} = Task.Supervisor.start_link()
 
-    rows
-    |> Task.async_stream(
-      fn row -> {row, resolve_one_row(row, settings, resolvers)} end,
-      max_concurrency: concurrency,
-      ordered: false,
-      timeout: timeout,
-      on_timeout: :kill_task,
-      zip_input_on_exit: true
-    )
-    |> Enum.reduce_while({:ok, 0}, fn
-      {:ok, {row, result}}, {status, failed} ->
-        reduce_resolution(result, row, status, failed, settings, atomic?)
+    try do
+      tasks
+      |> Task.Supervisor.async_stream_nolink(
+        rows,
+        fn row -> {row, resolve_one_row(row, settings, resolvers)} end,
+        max_concurrency: concurrency,
+        ordered: false,
+        timeout: timeout,
+        on_timeout: :kill_task,
+        zip_input_on_exit: true
+      )
+      |> Enum.reduce_while({:ok, 0}, fn
+        {:ok, {row, result}}, {status, failed} ->
+          reduce_resolution(result, row, status, failed, settings, atomic?)
 
-      {:exit, {row, :timeout}}, {status, failed} ->
-        error = Runner.row_timed_out(timeout, row)
-        reduce_resolution({:error, error}, row, status, failed, settings, atomic?)
-    end)
+        {:exit, {row, :timeout}}, {status, failed} ->
+          error = Runner.row_timed_out(timeout, row)
+          reduce_resolution({:error, error}, row, status, failed, settings, atomic?)
+
+        {:exit, {row, reason}}, {status, failed} ->
+          result = Runner.row_exited(:exit, reason, [], row)
+          reduce_resolution(result, row, status, failed, settings, atomic?)
+      end)
+    after
+      Supervisor.stop(tasks)
+    end
   end
 
   # Each row it is handed has been committed, resolved or failed, by the time
@@ -1199,7 +1213,9 @@ defmodule AshBulkDurable.Core.Worker do
   # One row through the `:resolve` action. The resolution happens in the
   # action's `before_transaction` hook (`AshBulkDurable.Core.Changes.ResolveRow`);
   # the settings, in the row's tenant, and the prepared resolvers ride in on
-  # the context.
+  # the context. A raise, throw or exit fails the row at once with what it
+  # was: let through, it would stop the run, and only crash counting would
+  # fail the row, starts later and as crashed.
   defp resolve_one_row(row, settings, resolvers) do
     Ash.update(row, %{},
       action: :resolve,
@@ -1210,6 +1226,8 @@ defmodule AshBulkDurable.Core.Worker do
     )
   rescue
     exception -> Runner.row_raised(exception, __STACKTRACE__, row)
+  catch
+    kind, reason -> Runner.row_exited(kind, reason, __STACKTRACE__, row)
   end
 
   # ── Phase 2: chunk loop ────────────────────────────────────────────────

@@ -128,3 +128,9 @@
   chosen with `config :ash_bulk_durable, excel_reader: ...`;
   `AshBulkDurable.Sheet.ExcelReader.Calamine` is the default and, for now,
   the only one.
+- A resolver that throws or exits, or whose task dies (a process linked to
+  it crashed, or it was killed alone), fails its row at once with
+  `Core.RowExitError`, which says what it threw or why it exited, as a raise
+  does. Before, it stopped the run, and the row failed only starts later, as
+  crashed. Phase 1 runs its tasks unlinked, under a supervisor linked to the
+  run, so they still go when the run does.

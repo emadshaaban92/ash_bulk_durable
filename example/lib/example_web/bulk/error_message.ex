@@ -16,6 +16,7 @@ defmodule ExampleWeb.Bulk.ErrorMessage do
     CrashedRowError,
     ManyMatchesError,
     NoMatchError,
+    RowExitError,
     RowTimeoutError,
     StagedFileError,
     StoredError,
@@ -35,6 +36,9 @@ defmodule ExampleWeb.Bulk.ErrorMessage do
   def display_error(error), do: error |> StoredError.from() |> display()
 
   defp word(%StoredError{error: %Ash.Error.Unknown.UnknownError{}}),
+    do: [gettext("This row hit an unexpected error, so nothing was saved for it.")]
+
+  defp word(%StoredError{error: %RowExitError{}}),
     do: [gettext("This row hit an unexpected error, so nothing was saved for it.")]
 
   defp word(%StoredError{error: %RowTimeoutError{}}),
