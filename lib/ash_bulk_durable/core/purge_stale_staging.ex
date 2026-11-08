@@ -30,10 +30,14 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
       bulk action (`:completed` / `:cancelled`, or `:failed` more than a
       day ago).
 
-  The sweep is idempotent and takes no lock. The preserve-set comes from
-  reading the unresolved bulk actions (same status set as the partial
-  unique index on `BulkAction`, so at most one per user) plus those that
-  failed within the day.
+  The sweep is idempotent. It reads the bulk actions holding the stale keys,
+  and deletes the keys of those that read as releasable only under their
+  locks (`AshBulkDurable.Core.BulkActionLock`), once each still is: a retry
+  writes under the same lock, so one that reopened a long-`:failed` bulk
+  action after that read, or holds its lock while the sweep runs, keeps its
+  files. A retry or abandon that comes while the sweep holds the lock is
+  refused, as either is while another transaction holds it. A key no bulk action
+  holds is deleted without a lock.
 
   `AshBulkDurable.Core.Poller` runs `sweep/0` on each node, every
   `:staging_sweep_interval`.
@@ -47,9 +51,12 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
   cancel ran inside a caller's transaction, or storage failed), the next
   sweep reclaims the `:cancelled` bulk action's files.
   """
+  import Ash.Expr, only: [expr: 1]
+
+  require Ash.Expr
   require Ash.Query
 
-  alias AshBulkDurable.Core.Storage
+  alias AshBulkDurable.Core.{BulkActionLock, Storage}
 
   @staging_prefix "bulk-staging/"
   @stale_after_seconds 24 * 60 * 60
@@ -90,17 +97,14 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
     case Storage.list_files(@staging_prefix) do
       {:ok, objects} ->
         cutoff = DateTime.add(DateTime.utc_now(), -@stale_after_seconds, :second)
-        keep = keys_to_preserve(cutoff)
-        Enum.each(objects, &maybe_purge(&1, keep, cutoff))
+
+        objects
+        |> Enum.filter(&stale?(&1, cutoff))
+        |> Enum.map(& &1.key)
+        |> purge(cutoff)
 
       {:error, _term} ->
         :ok
-    end
-  end
-
-  defp maybe_purge(object, keep, cutoff) do
-    if stale?(object, cutoff) and not MapSet.member?(keep, object.key) do
-      Storage.delete_file(object.key)
     end
   end
 
@@ -110,21 +114,68 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
 
   defp stale?(_object, _cutoff), do: false
 
-  # Every staging key claimed by a bulk action whose status still warrants
-  # preservation: one of the one-unresolved statuses (capped by the partial
-  # unique index at one bulk action per user), or `:failed` within the last
-  # day, while its owner can still retry it. Any staging key NOT in this set
-  # (orphan or worker-exited terminal) is fair game to delete once it's past
-  # the staleness cutoff.
-  defp keys_to_preserve(cutoff) do
+  defp purge([], _cutoff), do: :ok
+
+  # Groups the stale keys by the bulk actions holding them. A key nobody
+  # holds is deleted outright. The keys of a group whose holders all read as
+  # releasable are deleted under the holders' locks, and only once each still
+  # is, so a retry committed since the read, or in flight, keeps them.
+  defp purge(keys, cutoff) do
+    holders = holders(keys)
+
+    keys
+    |> Enum.group_by(&(holders |> Map.get(&1, []) |> Enum.sort_by(fn holder -> holder.id end)))
+    |> Enum.each(fn
+      {[], keys} ->
+        Enum.each(keys, &Storage.delete_file/1)
+
+      {holders, keys} ->
+        if Enum.all?(holders, &releasable?(&1, cutoff)),
+          do: delete_under_locks(Enum.map(holders, & &1.id), keys, cutoff)
+    end)
+  end
+
+  # `%{key => [bulk_action]}`: every bulk action whose `staged_files` names
+  # one of `keys`, whatever its status.
+  defp holders(keys) do
     bulk_action_resource()
     |> Ash.Query.filter(
-      status in [:queued, :running, :completed_with_errors] or
-        (status == :failed and finished_at > ^cutoff)
+      fragment(
+        "EXISTS (SELECT 1 FROM jsonb_each_text(?) AS staged(name, key) WHERE staged.key = ANY(?))",
+        staged_files,
+        type(^keys, {:array, :string})
+      )
     )
     |> Ash.read!(authorize?: false)
-    |> Enum.flat_map(&Map.values(&1.staged_files))
-    |> MapSet.new()
+    |> Enum.flat_map(fn bulk_action ->
+      Enum.map(Map.values(bulk_action.staged_files), &{&1, bulk_action})
+    end)
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+  end
+
+  # The statuses whose files the sweep may delete (see the moduledoc), a
+  # `:failed` one's only once it failed over a day ago.
+  @released [:completed, :failed, :cancelled]
+
+  defp releasable?(%{status: :failed, finished_at: %DateTime{} = finished_at}, cutoff),
+    do: DateTime.compare(finished_at, cutoff) != :gt
+
+  defp releasable?(%{status: status}, _cutoff), do: status in @released
+
+  # Holds every holder's lock (`AshBulkDurable.Core.BulkActionLock`) while
+  # its status still releases its files, and deletes the keys with the locks
+  # held. A retry takes the same lock before it writes, so it either
+  # committed first, and the holder no longer matches, or is refused at once
+  # while the delete holds it, as is an abandon. A holder another transaction has locked, such
+  # as a retry's, keeps its files to the next sweep.
+  defp delete_under_locks(ids, keys, cutoff) do
+    Ash.transaction([bulk_action_resource()], fn ->
+      released =
+        expr(status != :failed or is_nil(finished_at) or finished_at <= ^cutoff)
+
+      if Enum.all?(ids, &match?({:ok, _}, BulkActionLock.lock(&1, @released, filter: released))),
+        do: Enum.each(keys, &Storage.delete_file/1)
+    end)
   end
 
   defp bulk_action_resource, do: AshBulkDurable.Core.config(:bulk_action_resource)

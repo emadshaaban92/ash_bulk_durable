@@ -71,8 +71,9 @@ defmodule AshBulkDurable.Core.Poller do
   (`AshBulkDurable.Core.PurgeStaleStaging.sweep/0`) in a task. The first
   lands at a random time within the first hour, so nodes restarted together
   don't all sweep at once, and a node restarted more often than the interval
-  still sweeps. The sweep holds no lock: nodes sweeping at once only delete
-  the same keys.
+  still sweeps. Nodes sweeping at once only delete the same keys: the sweep
+  locks only a bulk action whose keys it deletes, and skips one another
+  transaction holds.
 
   ## Options
 

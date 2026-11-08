@@ -1,9 +1,9 @@
 defmodule AshBulkDurable.Core.BulkActionLockTest do
   @moduledoc """
-  `BulkActionLock`, `Retry` taking it before any row, and `abandon/2` taking
-  it before its write. A lock held by another transaction needs a second
-  real connection, so this test runs outside the sandbox and deletes what it
-  wrote.
+  `BulkActionLock`, `Retry` taking it before any row, `abandon/2` taking
+  it before its write, and the staging sweep taking it before its deletes.
+  A lock held by another transaction needs a second real connection, so this
+  test runs outside the sandbox and deletes what it wrote.
   """
   use ExUnit.Case, async: false
 
@@ -12,7 +12,7 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
   require Ash.Expr
   require Ash.Query
 
-  alias AshBulkDurable.Core.BulkActionLock
+  alias AshBulkDurable.Core.{BulkActionLock, PurgeStaleStaging}
   alias AshBulkDurable.Test.{BulkAction, Region, Repo, Row, Scope, User}
 
   setup do
@@ -301,6 +301,156 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
       assert writes.() == 1
       refute "bulk-staging/#{ctx.tag}/a.zip" in AshBulkDurable.TestStorage.keys()
     end
+  end
+
+  describe "the staging sweep" do
+    setup do
+      AshBulkDurable.StorageHelpers.put_config(:storage, AshBulkDurable.TestStorage)
+      start_supervised!(AshBulkDurable.TestStorage)
+      :ok
+    end
+
+    test "keeps the files of a long-failed bulk action while a retry's transaction " <>
+           "holds it",
+         ctx do
+      bulk_action = failed_a_day_ago!(ctx)
+      key = "bulk-staging/#{ctx.tag}/a.zip"
+      test_pid = self()
+
+      retry =
+        spawn_link(fn ->
+          :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
+          send(test_pid, {:retried, AshBulkDurable.retry(bulk_action, scope: ctx.scope)})
+        end)
+
+      # The retry stops at its first row write, its lock held.
+      handler = "sweep-during-retry-#{ctx.tag}"
+
+      :telemetry.attach(
+        handler,
+        [:ash_bulk_durable, :test, :repo, :query],
+        fn _event, _measurements, %{source: source, query: query}, _config ->
+          if self() == retry and source == "bulk_action_rows" and
+               String.starts_with?(query, "UPDATE") do
+            :telemetry.detach(handler)
+            send(test_pid, :retrying)
+
+            receive do
+              :go -> :ok
+            end
+          end
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+      assert_receive :retrying, 2_000
+
+      assert :ok = PurgeStaleStaging.sweep()
+      assert key in AshBulkDurable.TestStorage.keys()
+
+      send(retry, :go)
+      assert_receive {:retried, {:ok, %{status: :queued}}}, 2_000
+      assert key in AshBulkDurable.TestStorage.keys()
+    end
+
+    test "keeps the files of a long-failed bulk action retried after it read them", ctx do
+      bulk_action = failed_a_day_ago!(ctx)
+      key = "bulk-staging/#{ctx.tag}/a.zip"
+      test_pid = self()
+      handler = "retry-after-sweep-read-#{ctx.tag}"
+
+      # The retry commits from a connection of its own once the sweep has
+      # read which bulk actions hold its stale keys, before it locks them.
+      :telemetry.attach(
+        handler,
+        [:ash_bulk_durable, :test, :repo, :query],
+        fn _event, _measurements, %{source: source, query: query}, _config ->
+          if self() == test_pid and source == "bulk_actions" and
+               String.starts_with?(query, "SELECT") and
+               not String.contains?(query, "FOR NO KEY UPDATE") do
+            :telemetry.detach(handler)
+
+            retried =
+              Task.async(fn ->
+                :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
+                AshBulkDurable.retry(bulk_action, scope: ctx.scope)
+              end)
+              |> Task.await()
+
+            send(test_pid, {:retried, retried})
+          end
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      assert :ok = PurgeStaleStaging.sweep()
+      assert_received {:retried, {:ok, %{status: :queued}}}
+      assert key in AshBulkDurable.TestStorage.keys()
+    end
+
+    test "keeps a file two long-failed bulk actions share once one is retried after it " <>
+           "read them",
+         ctx do
+      retried = failed_a_day_ago!(ctx)
+      _other = failed_a_day_ago!(ctx)
+      key = "bulk-staging/#{ctx.tag}/a.zip"
+      test_pid = self()
+      handler = "retry-one-holder-#{ctx.tag}"
+
+      # Both read as releasable; one is retried before the sweep locks them.
+      :telemetry.attach(
+        handler,
+        [:ash_bulk_durable, :test, :repo, :query],
+        fn _event, _measurements, %{source: source, query: query}, _config ->
+          if self() == test_pid and source == "bulk_actions" and
+               String.starts_with?(query, "SELECT") and
+               not String.contains?(query, "FOR NO KEY UPDATE") do
+            :telemetry.detach(handler)
+
+            result =
+              Task.async(fn ->
+                :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
+                AshBulkDurable.retry(retried, scope: ctx.scope)
+              end)
+              |> Task.await()
+
+            send(test_pid, {:retried, result})
+          end
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      assert :ok = PurgeStaleStaging.sweep()
+      assert_received {:retried, {:ok, %{status: :queued}}}
+      assert key in AshBulkDurable.TestStorage.keys()
+    end
+
+    test "deletes the files of a long-failed bulk action no one else holds", ctx do
+      failed_a_day_ago!(ctx)
+
+      assert :ok = PurgeStaleStaging.sweep()
+      refute "bulk-staging/#{ctx.tag}/a.zip" in AshBulkDurable.TestStorage.keys()
+    end
+  end
+
+  # A bulk action that failed over a day ago, its rows failed, and one file
+  # staged for it over a day ago too: the sweep's to delete.
+  defp failed_a_day_ago!(ctx) do
+    bulk_action = with_staged_file!(finished_with_errors!(ctx), ctx)
+    a_day_ago = DateTime.add(DateTime.utc_now(), -(24 * 60 * 60 + 60), :second)
+
+    Repo.query!(
+      "UPDATE bulk_actions SET status = 'failed', finished_at = $1 WHERE id = $2",
+      [a_day_ago, Ecto.UUID.dump!(bulk_action.id)]
+    )
+
+    AshBulkDurable.TestStorage.put("bulk-staging/#{ctx.tag}/a.zip", "x", a_day_ago)
+    Ash.get!(BulkAction, bulk_action.id, authorize?: false)
   end
 
   # One file staged for `bulk_action`, in the store and on the record.
