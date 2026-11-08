@@ -126,5 +126,6 @@
   and returns `{:error, {:too_many_cells, max_cells}}`, `{:error,
   {:unknown_sheet, sheet}}` or `{:error, {:xlsx, reason}}`. The reader is an `AshBulkDurable.Sheet.ExcelReader` behaviour,
   chosen with `config :ash_bulk_durable, excel_reader: ...`;
-  `AshBulkDurable.Sheet.ExcelReader.Calamine` is the default and, for now,
-  the only one.
+  `AshBulkDurable.Sheet.ExcelReader.Calamine` is the default, and
+  `AshBulkDurable.Sheet.ExcelReader.XlsxReader` reads it in pure Elixir
+  with xlsx_reader.
