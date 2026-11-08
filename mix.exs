@@ -53,6 +53,8 @@ defmodule AshBulkDurable.MixProject do
       {:spark, "~> 2.7"},
       {:nimble_csv, "~> 1.3"},
       {:spreadsheet, "~> 0.7"},
+      {:xlsx_reader, "~> 0.8"},
+      {:saxy, "~> 1.5"},
       {:briefly, "~> 0.5"},
       {:telemetry, "~> 1.2"},
 
