@@ -971,30 +971,36 @@ defmodule AshBulkDurable.Core.Worker do
     |> Ash.read!(authorize?: false)
   end
 
+  # Each file goes to a temp file the worker creates first. A fetch that
+  # fails takes every temp file of this run with it, the ones fetched before
+  # it included, so nothing is left on disk until the process exits.
   defp fetch_staged_files(keys) do
-    Enum.reduce_while(keys, {:ok, %{}}, fn {name, key}, {:ok, acc} ->
-      case fetch_one_blob(key) do
-        {:ok, tmp_path} ->
-          {:cont, {:ok, Map.put(acc, name, tmp_path)}}
+    Enum.reduce_while(keys, {:ok, %{}}, fn {name, key}, {:ok, fetched} ->
+      tmp = Briefly.create!(prefix: "ash_bulk_durable_")
+      fetched = Map.put(fetched, name, tmp)
+
+      case fetch_one_blob(key, tmp, fetched) do
+        :ok ->
+          {:cont, {:ok, fetched}}
 
         {:error, term} ->
+          delete_local_staged_tmp(fetched)
           {:halt, {:error, term}}
       end
     end)
   end
 
-  # sobelow_skip ["Traversal.FileModule"]
-  defp fetch_one_blob(key) do
-    tmp = Briefly.create!(prefix: "ash_bulk_durable_")
-
+  # A store that raises, or answers neither `:ok` nor `{:error, _}`, still
+  # leaves no temp file behind; the raise then goes on up as before.
+  defp fetch_one_blob(key, tmp, fetched) do
     case Storage.fetch_file(key, tmp) do
-      :ok ->
-        {:ok, tmp}
-
-      {:error, term} ->
-        File.rm(tmp)
-        {:error, term}
+      :ok -> :ok
+      {:error, term} -> {:error, term}
     end
+  catch
+    kind, reason ->
+      delete_local_staged_tmp(fetched)
+      :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
   # sobelow_skip ["Traversal.FileModule"]
