@@ -40,6 +40,7 @@ defmodule AshBulkDurable.Core.Runner do
   alias AshBulkDurable.Core.{
     BulkActionLock,
     Introspection,
+    ManyMatchesError,
     NoMatchError,
     Reference,
     RowTimeoutError,
@@ -352,6 +353,7 @@ defmodule AshBulkDurable.Core.Runner do
     case Reference.resolve(reference, resolvers, context) do
       {:ok, value} -> {:ok, value}
       {:error, :not_found} -> {:error, no_match(key, reference)}
+      {:error, :ambiguous} -> {:error, many_matches(key, reference)}
       {:error, error} -> {:error, error}
     end
   end
@@ -363,6 +365,14 @@ defmodule AshBulkDurable.Core.Runner do
     do: %NoMatchError{field: key, resource: resource, criteria: criteria(identity, values)}
 
   defp no_match(key, {:resolve, _module, _args}), do: %NoMatchError{field: key}
+
+  defp many_matches(key, {:lookup, resource, identity, values}),
+    do: many_matches(key, {:lookup, resource, identity, values, []})
+
+  defp many_matches(key, {:lookup, resource, identity, values, _opts}),
+    do: %ManyMatchesError{field: key, resource: resource, criteria: criteria(identity, values)}
+
+  defp many_matches(key, {:resolve, _module, _args}), do: %ManyMatchesError{field: key}
 
   # Every key/value pair the caller supplied shows up, pinpointing which one
   # didn't match.

@@ -16,9 +16,10 @@ defmodule AshBulkDurable.Core.WorkerTest do
 
   import ExUnit.CaptureLog
 
-  alias AshBulkDurable.Core.{StagedFileError, Worker}
+  alias AshBulkDurable.Core.{ManyMatchesError, StagedFileError, Worker}
   alias AshBulkDurable.Test.{BulkAction, Row}
   alias AshBulkDurable.Test.Region
+  alias AshBulkDurable.Test.Shelf
 
   @region_resource_name "AshBulkDurable.Test.Region"
 
@@ -715,6 +716,36 @@ defmodule AshBulkDurable.Core.WorkerTest do
                list_rows(bulk_action.id) |> Enum.sort_by(& &1.row_index)
 
       assert messages(error) =~ "no match"
+    end
+  end
+
+  describe "a lookup that matches more than one record" do
+    test "fails its row alone, writing to none of them", %{super_user: user} do
+      suffix = System.unique_integer([:positive])
+      aisle = "A#{suffix}"
+
+      for code <- ["S1", "S2"],
+          do: Ash.create!(Shelf, %{code: code <> aisle, aisle: aisle}, authorize?: false)
+
+      [ambiguous | others] = region_rows(3, suffix)
+      lookup = {:lookup, Shelf, :place, %{aisle: aisle, bay: nil}}
+
+      bulk_action =
+        create_bulk_action!([put_in(ambiguous.input.native_name, lookup) | others],
+          user_id: user.id,
+          chunk_size: 2
+        )
+
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      assert reload(bulk_action).status == :completed_with_errors
+      assert length(regions_from(suffix, user)) == 2
+
+      assert [
+               %{status: :failed, error: [%{error: %ManyMatchesError{field: :native_name}}]},
+               %{status: :succeeded},
+               %{status: :succeeded}
+             ] = list_rows(bulk_action.id) |> Enum.sort_by(& &1.row_index)
     end
   end
 

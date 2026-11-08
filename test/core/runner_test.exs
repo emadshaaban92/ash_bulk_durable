@@ -14,8 +14,8 @@ defmodule AshBulkDurable.Core.RunnerTest do
   """
   use AshBulkDurable.DataCase, async: true
 
-  alias AshBulkDurable.Core.Runner
-  alias AshBulkDurable.Test.Region
+  alias AshBulkDurable.Core.{ManyMatchesError, Runner}
+  alias AshBulkDurable.Test.{LimitedBin, PagedBin, Region, Shelf}
   alias AshBulkDurable.Test.Scope
 
   # Uppercases what it is given.
@@ -52,8 +52,21 @@ defmodule AshBulkDurable.Core.RunnerTest do
     def finish(nil), do: :ok
   end
 
+  defmodule AmbiguousResolver do
+    @behaviour AshBulkDurable.Core.Resolver
+
+    @impl true
+    def prepare(_args, _context), do: {:ok, nil}
+
+    @impl true
+    def resolve(_args, nil, _context), do: {:error, :ambiguous}
+
+    @impl true
+    def finish(nil), do: :ok
+  end
+
   # The chunk's resolvers, as the worker prepares them.
-  @resolvers %{UpperCaseResolver => nil, FailingResolver => nil}
+  @resolvers %{UpperCaseResolver => nil, FailingResolver => nil, AmbiguousResolver => nil}
 
   defp settings(ctx, opts \\ []) do
     %Runner.Settings{
@@ -119,6 +132,54 @@ defmodule AshBulkDurable.Core.RunnerTest do
                Runner.resolve_references(settings(ctx), row, @resolvers)
 
       assert Exception.message(error) =~ "no User matches email = #{inspect(missing)}"
+    end
+
+    test "a lookup that matches two records names the input, the resource and the criteria",
+         ctx do
+      aisle = "A#{System.unique_integer([:positive])}"
+
+      # A null in a composite identity: Postgres and Ash keep nulls distinct,
+      # so both shelves hold the same place.
+      for code <- ["S1", "S2"],
+          do: Ash.create!(Shelf, %{code: code <> aisle, aisle: aisle}, authorize?: false)
+
+      row = row(%{shelf_id: {:lookup, Shelf, :place, %{aisle: aisle, bay: nil}}})
+
+      assert {:error, %ManyMatchesError{field: :shelf_id} = error} =
+               Runner.resolve_references(settings(ctx), row, @resolvers)
+
+      assert error.criteria == %{aisle: aisle, bay: nil}
+
+      assert Exception.message(error) ==
+               "more than one Shelf matches aisle = #{inspect(aisle)}, bay = nil"
+    end
+
+    test "a lookup reads past a primary read's pagination, refusing a second match", ctx do
+      for resource <- [PagedBin, LimitedBin] do
+        aisle = "A#{System.unique_integer([:positive])}"
+        lookup = {:lookup, resource, :aisle, aisle}
+        row = row(%{name: lookup})
+
+        bin = Ash.create!(resource, %{aisle: aisle})
+        bin_id = bin.id
+
+        assert {:ok, %{"name" => ^bin_id}} =
+                 Runner.resolve_references(settings(ctx), row, @resolvers)
+
+        Ash.create!(resource, %{aisle: aisle})
+
+        assert {:error, %ManyMatchesError{field: :name}} =
+                 Runner.resolve_references(settings(ctx), row, @resolvers)
+      end
+    end
+
+    test "a resolver finding more than one match fails without naming a resource", ctx do
+      row = row(%{name: {:resolve, AmbiguousResolver, "acme"}})
+
+      assert {:error, %ManyMatchesError{field: :name, resource: nil} = error} =
+               Runner.resolve_references(settings(ctx), row, @resolvers)
+
+      assert Exception.message(error) == "more than one match found"
     end
   end
 
