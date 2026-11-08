@@ -66,12 +66,17 @@ defmodule AshBulkDurable.Core.Worker do
 
   ## Failure surface
 
-  - A bulk action storing what no longer decodes (`StoredTerm`) →
-    `:mark_finished({:failed, %{reason: :unreadable}})`, nothing run. A row
-    storing it fails alone.
-  - A bulk action whose resource or action no longer exists (renamed or
-    removed by a deploy) → `:mark_finished({:failed, %{reason: :gone}})`,
-    nothing run.
+  - A bulk action storing what no longer decodes (`StoredTerm`) → counted
+    as a setup failure, nothing run; the `:max_setup_failures`th →
+    `:mark_finished({:failed, %{reason: :unreadable}})`. A row storing it
+    fails alone.
+  - A bulk action whose resource or action doesn't exist (renamed or
+    removed by a deploy) → counted as a setup failure, nothing run; the
+    `:max_setup_failures`th → `:mark_finished({:failed, %{reason: :gone}})`.
+    Counted rather than failed at once since both answers come from the
+    node's own code: during a rolling deploy, a node still on the old
+    release gives them for what only the new release has. See "Setup
+    failures" in "Crashes" below.
   - Staged-file download error, with a row left for a resolver → each such
     row fails alone (`StagedFileError`) and the rest run. All or nothing →
     `:mark_finished({:failed, %{reason: :staged_file_download_error, ...}})`.
@@ -187,6 +192,12 @@ defmodule AshBulkDurable.Core.Worker do
     does an exit, such as a `GenServer.call` timeout in a storage client.
     Only a start whose score rose sets it back to 0: one whose setup
     succeeds but that makes no progress leaves it as it is.
+  - **Unrunnable here.** A start that finds the bulk action `:gone` or
+    `:unreadable` on its node runs nothing and counts a setup failure too,
+    without raising, its start's liveness hint left to go stale, so the
+    next start comes a `:stale_after` later, maybe on a node that has what
+    it names. The `:max_setup_failures`th fails it with that reason, not
+    `:setup_error`.
   - **A retry starts the count again**: `:enqueue_retry` clears the five
     fields, and `:reopen_with_corrections` a reopened row's `attempts`.
     Returned errors are not crashes, and bump nothing.
@@ -405,23 +416,18 @@ defmodule AshBulkDurable.Core.Worker do
   end
 
   defp attempt(bulk_action, opts) do
-    case unrunnable(bulk_action) do
-      nil ->
-        emit_worker_attempt_start(bulk_action)
+    emit_worker_attempt_start(bulk_action)
 
-        bulk_action
-        |> start_run(Keyword.get(opts, :if_stale_after))
-        |> run_started()
-
-      reason ->
-        finish_locked(bulk_action, {:failed, %{reason: reason}})
-        :ok
-    end
+    bulk_action
+    |> start_run(Keyword.get(opts, :if_stale_after))
+    |> run_started()
   end
 
-  # Why the bulk action can never run, checked before its start is counted:
-  # a run of it would raise before reaching a row on every start, and a
-  # per-row one would be restarted forever. Nil when it can run.
+  # Why this node can't run the bulk action, checked once its start is
+  # counted: a run of it would raise before reaching a row. Both answers come
+  # from this node's code, not from what the bulk action stores, so during a
+  # rolling deploy a node still on the old release gives them for what only
+  # the new one has. Nil when it can run.
   defp unrunnable(bulk_action) do
     cond do
       StoredTerm.unreadable?(bulk_action) -> :unreadable
@@ -435,7 +441,11 @@ defmodule AshBulkDurable.Core.Worker do
   defp run_started({:ok, running}) do
     if entered_isolation?(running), do: announce_isolation(running)
 
-    if terminal?(running.status), do: :ok, else: drive_started(running)
+    cond do
+      terminal?(running.status) -> :ok
+      reason = unrunnable(running) -> count_unrunnable(running, reason)
+      true -> drive_started(running)
+    end
   end
 
   defp run_started(:busy), do: :busy
@@ -621,11 +631,35 @@ defmodule AshBulkDurable.Core.Worker do
       reraise error, stacktrace
   end
 
-  # Under the lock, in the run's pass. `:max_setup_failures` of them in a
-  # row, with no progress between, fail the bulk action with the last
-  # exception's message. A count that can't be written (the database down,
-  # most likely) is logged, and the setup's own exception raised as before.
   defp count_setup_failure(bulk_action, error) do
+    count_setup_failure(
+      bulk_action,
+      "raised before reaching a row",
+      %{reason: :setup_error, message: Exception.message(error)}
+    )
+  end
+
+  # A start that found the bulk action unrunnable here runs nothing, and its
+  # liveness hint goes stale on its own, so the next start comes a
+  # `:stale_after` later, maybe on an upgraded node. The
+  # `:max_setup_failures`th with no progress between fails it with the
+  # reason itself, so an owner can still abandon or retry one gone for good.
+  defp count_unrunnable(running, reason) do
+    Logger.warning(
+      "ash_bulk_durable: bulk action #{running.id} can't run on this node (#{reason}); " <>
+        "leaving it for a later start"
+    )
+
+    count_setup_failure(running, "couldn't run (#{reason})", %{reason: reason})
+    :ok
+  end
+
+  # Under the lock, in the run's pass. `:max_setup_failures` of them in a
+  # row, with no progress between, fail the bulk action with `verdict`, the
+  # last one's. A count that can't be written (the database down, most
+  # likely) is logged, and the run goes on as it would have: a setup's own
+  # exception is raised again.
+  defp count_setup_failure(bulk_action, what, verdict) do
     max = AshBulkDurable.Core.config(:max_setup_failures, 3)
 
     in_pass(bulk_action, fn locked ->
@@ -633,15 +667,12 @@ defmodule AshBulkDurable.Core.Worker do
 
       if counted.setup_failures >= max do
         Logger.error(
-          "ash_bulk_durable: bulk action #{bulk_action.id} raised before reaching a row in " <>
-            "#{counted.setup_failures} starts without progress; failing it: " <>
-            Exception.message(error)
+          "ash_bulk_durable: bulk action #{bulk_action.id} #{what} in " <>
+            "#{counted.setup_failures} starts without progress; failing it" <>
+            failure_detail(verdict)
         )
 
-        mark_finished(
-          counted,
-          {:failed, %{reason: :setup_error, message: Exception.message(error)}}
-        )
+        mark_finished(counted, {:failed, verdict})
       end
     end)
   rescue
@@ -651,6 +682,9 @@ defmodule AshBulkDurable.Core.Worker do
           Exception.message(count_error)
       )
   end
+
+  defp failure_detail(%{message: message}), do: ": " <> message
+  defp failure_detail(_verdict), do: ""
 
   defp drive_rows(bulk_action, settings, downloaded) do
     terminal_bulk_action =

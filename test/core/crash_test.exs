@@ -299,26 +299,32 @@ defmodule AshBulkDurable.Core.CrashTest do
   end
 
   describe "a bulk action whose action is gone" do
-    # A deploy renamed or removed what it runs: every start would raise
-    # before reaching a row, so the first fails it, uncounted.
+    # A deploy renamed or removed what it runs, or this node is still on the
+    # release before the one that added it: each start counts a setup
+    # failure, running nothing, and the third fails it as gone.
     for {mode, column, name} <- [
           {:per_row, "action_name", "renamed_away"},
           {:all_or_nothing, "action_name", "renamed_away"},
           {:per_row, "resource_name", "AshBulkDurable.Test.NoLongerHere"}
         ] do
-      test "#{mode}, its #{column} gone: failed on the first start, nothing run", ctx do
+      test "#{mode}, its #{column} gone: counted, and failed on the third start, nothing run",
+           ctx do
         bulk_action = submit!(ctx, 2, mode: unquote(mode))
         set!(bulk_action, "#{unquote(column)} = $2", [unquote(name)])
 
-        assert :ok = Worker.run_now(bulk_action.id)
+        capture_log(fn ->
+          for failures <- 1..2 do
+            assert :ok = Worker.run_now(bulk_action.id)
 
-        assert %{
-                 status: :failed,
-                 result: %{"reason" => "gone"},
-                 alive_at: nil,
-                 progress_at_start: nil,
-                 stalled_starts: 0
-               } = failed = reload(bulk_action)
+            assert %{status: :running, setup_failures: ^failures, result: nil} =
+                     reload(bulk_action)
+          end
+
+          assert :ok = Worker.run_now(bulk_action.id)
+        end)
+
+        assert %{status: :failed, result: %{"reason" => "gone"}, setup_failures: 3} =
+                 failed = reload(bulk_action)
 
         assert statuses(bulk_action) == [:resolved, :resolved]
         assert created(ctx) == []
@@ -330,6 +336,28 @@ defmodule AshBulkDurable.Core.CrashTest do
         # The verdict frees the owner to submit again.
         assert %{status: :queued} = submit!(ctx, 1)
       end
+    end
+
+    test "a rolling deploy: an old node's start is counted and spaced, an upgraded one runs it",
+         ctx do
+      bulk_action = submit!(ctx, 2)
+      set!(bulk_action, "action_name = 'added_by_the_next_release'")
+
+      # The old node's start runs nothing, and leaves its hint to go stale,
+      # so a poller starts it again only a `:stale_after` later.
+      capture_log(fn -> assert :ok = Worker.run_now(bulk_action.id) end)
+      assert %{status: :running, setup_failures: 1, alive_at: alive_at} = reload(bulk_action)
+      assert alive_at
+      assert :busy = Worker.run(bulk_action.id, if_stale_after: :timer.minutes(1))
+      assert statuses(bulk_action) == [:resolved, :resolved]
+
+      # An upgraded node has the action.
+      set!(bulk_action, "action_name = 'create'")
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      assert %{status: :completed} = reload(bulk_action)
+      assert statuses(bulk_action) == [:succeeded, :succeeded]
+      assert length(created(ctx)) == 2
     end
   end
 

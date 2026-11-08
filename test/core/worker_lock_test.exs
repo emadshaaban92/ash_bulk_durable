@@ -7,6 +7,8 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
   """
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   require Ash.Query
 
   defmodule EchoResolver do
@@ -327,17 +329,24 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
         Ecto.UUID.dump!(bulk_action.id)
       ])
 
-      locker = lock_elsewhere(bulk_action.id)
+      # The run that found it unrunnable counts that under the lock, and
+      # counts nothing while another transaction holds it.
+      locker = lock_after_start(bulk_action)
 
-      assert :ok = Worker.run_now(bulk_action.id)
+      capture_log(fn -> assert :ok = Worker.run_now(bulk_action.id) end)
 
       release(locker)
       assert statuses(bulk_action) == [:resolved, :resolved]
       assert created(ctx) == []
-      assert_untouched(bulk_action)
+      assert_no_verdict(bulk_action)
+      assert reload(bulk_action).setup_failures == 0
 
-      assert :ok = Worker.run_now(bulk_action.id)
-      assert %{status: :failed, result: %{"reason" => "unreadable"}} = reload(bulk_action)
+      capture_log(fn ->
+        for _start <- 1..3, do: assert(:ok = Worker.run_now(bulk_action.id))
+      end)
+
+      assert %{status: :failed, result: %{"reason" => "unreadable"}, setup_failures: 3} =
+               reload(bulk_action)
     end
 
     test ":gone", ctx do
@@ -347,17 +356,24 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
         Ecto.UUID.dump!(bulk_action.id)
       ])
 
-      locker = lock_elsewhere(bulk_action.id)
+      # The run that found it unrunnable counts that under the lock, and
+      # counts nothing while another transaction holds it.
+      locker = lock_after_start(bulk_action)
 
-      assert :ok = Worker.run_now(bulk_action.id)
+      capture_log(fn -> assert :ok = Worker.run_now(bulk_action.id) end)
 
       release(locker)
       assert statuses(bulk_action) == [:resolved, :resolved]
       assert created(ctx) == []
-      assert_untouched(bulk_action)
+      assert_no_verdict(bulk_action)
+      assert reload(bulk_action).setup_failures == 0
 
-      assert :ok = Worker.run_now(bulk_action.id)
-      assert %{status: :failed, result: %{"reason" => "gone"}} = reload(bulk_action)
+      capture_log(fn ->
+        for _start <- 1..3, do: assert(:ok = Worker.run_now(bulk_action.id))
+      end)
+
+      assert %{status: :failed, result: %{"reason" => "gone"}, setup_failures: 3} =
+               reload(bulk_action)
     end
   end
 
