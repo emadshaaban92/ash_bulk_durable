@@ -154,3 +154,10 @@
   verbs check theirs. `abandon/2` also takes a `:failed` bulk action, and
   deletes its staged files at once. A host that defines its own
   `:enqueue_retry` needs a `staged_files` argument only to stage files again.
+- `AshBulkDurable.Core.Storage` is worded as what the core wants done, not
+  as S3 operations, and the worker no longer reads a staged file into
+  memory: `get_object/1` is `fetch_file(key, path, opts)`, which writes the
+  file to a temporary path the worker hands over; `delete_object/1` is
+  `delete_file(key, opts)` and `list_objects/1` is `list_files(prefix, opts)`.
+  The core passes empty `opts` today. A host's store renames its callbacks
+  and writes the file instead of returning its bytes.

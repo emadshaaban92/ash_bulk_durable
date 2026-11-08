@@ -75,7 +75,7 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
   def delete_staging(bulk_action) do
     bulk_action.staged_files
     |> Map.values()
-    |> Enum.each(&Storage.delete_object/1)
+    |> Enum.each(&Storage.delete_file/1)
 
     :ok
   end
@@ -87,7 +87,7 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
   recently failed bulk action holds.
   """
   def sweep do
-    case Storage.list_objects(@staging_prefix) do
+    case Storage.list_files(@staging_prefix) do
       {:ok, objects} ->
         cutoff = DateTime.add(DateTime.utc_now(), -@stale_after_seconds, :second)
         keep = keys_to_preserve(cutoff)
@@ -100,7 +100,7 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
 
   defp maybe_purge(object, keep, cutoff) do
     if stale?(object, cutoff) and not MapSet.member?(keep, object.key) do
-      Storage.delete_object(object.key)
+      Storage.delete_file(object.key)
     end
   end
 

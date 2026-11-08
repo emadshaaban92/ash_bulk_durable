@@ -216,13 +216,13 @@ defmodule AshBulkDurable.Core.WorkerTest do
     @behaviour AshBulkDurable.Core.Storage
 
     @impl true
-    def get_object(_key), do: {:error, :test_storage_offline}
+    def fetch_file(_key, _path, _opts), do: {:error, :test_storage_offline}
 
     @impl true
-    def delete_object(_key), do: :ok
+    def delete_file(_key, _opts), do: :ok
 
     @impl true
-    def list_objects(_prefix), do: {:ok, []}
+    def list_files(_prefix, _opts), do: {:ok, []}
   end
 
   # ── Setup helpers ─────────────────────────────────────────────────────

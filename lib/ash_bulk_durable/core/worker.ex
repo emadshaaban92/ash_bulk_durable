@@ -985,13 +985,14 @@ defmodule AshBulkDurable.Core.Worker do
 
   # sobelow_skip ["Traversal.FileModule"]
   defp fetch_one_blob(key) do
-    case Storage.get_object(key) do
-      {:ok, body} ->
-        tmp = Briefly.create!(prefix: "ash_bulk_durable_")
-        File.write!(tmp, body)
+    tmp = Briefly.create!(prefix: "ash_bulk_durable_")
+
+    case Storage.fetch_file(key, tmp) do
+      :ok ->
         {:ok, tmp}
 
       {:error, term} ->
+        File.rm(tmp)
         {:error, term}
     end
   end
@@ -1008,7 +1009,7 @@ defmodule AshBulkDurable.Core.Worker do
   # status the worker never set.
   defp maybe_delete_staging(bulk_action) do
     if delete_staging?(bulk_action.status) do
-      Enum.each(bulk_action.staged_files, fn {_name, key} -> Storage.delete_object(key) end)
+      Enum.each(bulk_action.staged_files, fn {_name, key} -> Storage.delete_file(key) end)
     end
 
     :ok

@@ -14,10 +14,10 @@ defmodule Example.BulkActions.LocalStorage do
   @default_expiry 3600
 
   @impl AshBulkDurable.Core.Storage
-  def get_object(key), do: File.read(path(key))
+  def fetch_file(key, dest, _opts), do: File.cp(path(key), dest)
 
   @impl AshBulkDurable.Core.Storage
-  def delete_object(key) do
+  def delete_file(key, _opts) do
     case File.rm(path(key)) do
       {:error, :enoent} -> :ok
       other -> other
@@ -25,7 +25,7 @@ defmodule Example.BulkActions.LocalStorage do
   end
 
   @impl AshBulkDurable.Core.Storage
-  def list_objects(prefix) do
+  def list_files(prefix, _opts) do
     objects =
       for file <- Path.wildcard(path(prefix) <> "/**"), File.regular?(file) do
         %{

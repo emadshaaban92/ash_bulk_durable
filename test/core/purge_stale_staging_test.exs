@@ -415,13 +415,13 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       @behaviour AshBulkDurable.Core.Storage
 
       @impl true
-      def get_object(_key), do: {:error, :not_found}
+      def fetch_file(_key, _path, _opts), do: {:error, :not_found}
 
       @impl true
-      def delete_object(_key), do: raise("storage is down")
+      def delete_file(_key, _opts), do: raise("storage is down")
 
       @impl true
-      def list_objects(_prefix), do: {:ok, []}
+      def list_files(_prefix, _opts), do: {:ok, []}
     end
 
     setup %{super_user: user} do
