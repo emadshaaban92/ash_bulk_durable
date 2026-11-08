@@ -165,3 +165,9 @@
   mapping needs again, beside the corrected sheet, and says when a `:failed`
   one's files may be gone (it failed more than a day ago). A `:failed` bulk
   action gets an "Abandon bulk action" button.
+- The daily sweep deletes a bulk action's staged files only under its lock,
+  once its status still lets them go, so a retry that reopens a `:failed`
+  bulk action past its day while the sweep runs keeps the files it still
+  points at. Before, the sweep judged it by the status it read first and
+  could delete them under the retry. A retry or abandon that comes while the
+  sweep holds the lock is refused, as while any other transaction holds it.

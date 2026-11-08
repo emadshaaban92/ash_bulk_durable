@@ -160,6 +160,21 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       refute key_cancelled in remaining
     end
 
+    test "keeps a key a long-:failed bulk action shares with a :completed_with_errors one" do
+      user_id = Ecto.UUID.generate()
+      {failed, [key]} = create_bulk_action!(["logo.zip"], user_id)
+      finish!(failed, {:failed, %{reason: :worker_lost}})
+      finished_ago!(failed, @day_seconds + 60 * 60)
+
+      {with_errors, [^key]} = create_bulk_action!(["logo.zip"], user_id)
+      finish!(with_errors, :completed_with_errors)
+      TestStorage.put(key, "x", old())
+
+      assert :ok = PurgeStaleStaging.sweep()
+
+      assert key in TestStorage.keys()
+    end
+
     test "sweep/0 keeps a :failed bulk action's old files for a day after it failed" do
       {failed, [key]} = create_bulk_action!(["logo.zip"])
       finish!(failed, {:failed, %{reason: :worker_lost}})
