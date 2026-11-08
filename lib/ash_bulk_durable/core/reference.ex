@@ -9,7 +9,9 @@ defmodule AshBulkDurable.Core.Reference do
       `values` is the identity's one value, or a map of its keys' values, a
       `nil` matching a null column. `opts[:filter]` is an expression the
       record must also match (a relationship's own filter). No match is
-      `{:error, :not_found}`.
+      `{:error, :not_found}`, and more than one is `{:error, :ambiguous}`:
+      a lookup by a key that isn't unique, or by a `nil` in a composite
+      identity, never picks one of its matches.
     * `{:resolve, module, args}`: whatever `module`, an
       `AshBulkDurable.Core.Resolver`, resolves `args` to.
 
@@ -17,6 +19,7 @@ defmodule AshBulkDurable.Core.Reference do
   what it needs once for all of them; `finish/1` releases it.
   """
 
+  alias Ash.Error.Invalid.MultipleResults
   alias AshBulkDurable.Core.Resolver.Context
 
   @doc "Whether `value` is a reference."
@@ -55,15 +58,18 @@ defmodule AshBulkDurable.Core.Reference do
   def resolve({:lookup, resource, identity, values, opts}, _prepared, %Context{} = context) do
     read_action = Ash.Resource.Info.primary_action!(resource, :read).name
 
+    # `read_one` reads past the action's pagination, which `read` would
+    # apply, and refuses a second record the limit lets through.
     resource
     |> Ash.Query.for_read(read_action, %{}, scope: context.scope, tenant: context.tenant)
     |> Ash.Query.filter_input(identity_filter(resource, identity, values))
     |> filter(opts[:filter])
-    |> Ash.Query.limit(1)
+    |> Ash.Query.limit(2)
     |> Ash.read_one(scope: context.scope, tenant: context.tenant)
     |> case do
       {:ok, nil} -> {:error, :not_found}
       {:ok, record} -> {:ok, primary_key(resource, record)}
+      {:error, %Ash.Error.Invalid{errors: [%MultipleResults{}]}} -> {:error, :ambiguous}
       {:error, error} -> {:error, error}
     end
   end

@@ -14,6 +14,7 @@ defmodule ExampleWeb.Bulk.ErrorMessage do
 
   alias AshBulkDurable.Core.{
     CrashedRowError,
+    ManyMatchesError,
     NoMatchError,
     RowTimeoutError,
     StagedFileError,
@@ -59,6 +60,9 @@ defmodule ExampleWeb.Bulk.ErrorMessage do
   defp word(%StoredError{error: %NoMatchError{field: field} = error}),
     do: [on_field(field, no_match(error))]
 
+  defp word(%StoredError{error: %ManyMatchesError{field: field} = error}),
+    do: [on_field(field, many_matches(error))]
+
   defp word(%StoredError{error: error, message: message}) do
     case form_errors(error) do
       [] -> [message]
@@ -70,12 +74,27 @@ defmodule ExampleWeb.Bulk.ErrorMessage do
 
   defp no_match(%NoMatchError{resource: resource, criteria: criteria}) do
     gettext("no result in %{resource} matches %{criteria}",
-      resource: ExampleWeb.Bulk.Utils.humanize(Ash.Resource.Info.short_name(resource)),
-      criteria:
-        Enum.map_join(criteria, ", ", fn {key, value} ->
-          "#{ExampleWeb.Bulk.Utils.field_label(key, resource)} = \"#{Sheet.FieldHandler.cell(value)}\""
-        end)
+      resource: resource_label(resource),
+      criteria: criteria_label(criteria, resource)
     )
+  end
+
+  defp many_matches(%ManyMatchesError{resource: nil}), do: gettext("more than one match found")
+
+  defp many_matches(%ManyMatchesError{resource: resource, criteria: criteria}) do
+    gettext("more than one result in %{resource} matches %{criteria}",
+      resource: resource_label(resource),
+      criteria: criteria_label(criteria, resource)
+    )
+  end
+
+  defp resource_label(resource),
+    do: ExampleWeb.Bulk.Utils.humanize(Ash.Resource.Info.short_name(resource))
+
+  defp criteria_label(criteria, resource) do
+    Enum.map_join(criteria, ", ", fn {key, value} ->
+      "#{ExampleWeb.Bulk.Utils.field_label(key, resource)} = \"#{Sheet.FieldHandler.cell(value)}\""
+    end)
   end
 
   defp form_errors(error) when is_exception(error) do
