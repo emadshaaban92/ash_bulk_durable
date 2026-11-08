@@ -1,58 +1,37 @@
 defmodule Example.BulkActions.LocalStorage do
   @moduledoc """
-  Storage on the local disk: the engine's `AshBulkDurable.Core.Storage`, the
-  screens' `ExampleWeb.Bulk.Storage`, and the files rows extract. Swap it for
-  an object store in a real deployment.
+  Storage on the local disk: the engine's `AshBulkDurable.Core.Storage`
+  (`AshBulkDurable.Storage.Local`), the screens' `ExampleWeb.Bulk.Storage`, and
+  the files rows extract. Swap it for an object store on more than one node
+  without a shared volume.
 
   A "presigned" URL is a signed token `ExampleWeb.StorageController` honours,
   so the browser talks to storage the way it would to an object store.
   """
-  @behaviour AshBulkDurable.Core.Storage
+  use AshBulkDurable.Storage.Local
+
   @behaviour ExampleWeb.Bulk.Storage
+
+  alias AshBulkDurable.Storage.Local
 
   @salt "storage"
   @default_expiry 3600
 
-  @impl AshBulkDurable.Core.Storage
-  def fetch_file(key, dest, _opts), do: File.cp(path(key), dest)
-
-  @impl AshBulkDurable.Core.Storage
-  def delete_file(key, _opts) do
-    case File.rm(path(key)) do
-      {:error, :enoent} -> :ok
-      other -> other
-    end
-  end
-
-  @impl AshBulkDurable.Core.Storage
-  def list_files(prefix, _opts) do
-    objects =
-      for file <- Path.wildcard(path(prefix) <> "/**"), File.regular?(file) do
-        %{
-          key: Path.relative_to(file, root()),
-          last_modified:
-            file |> File.stat!(time: :posix) |> Map.fetch!(:mtime) |> DateTime.from_unix!()
-        }
-      end
-
-    {:ok, objects}
-  end
-
   @impl ExampleWeb.Bulk.Storage
-  def upload(key, source, _opts) do
-    target = path(key)
-    File.mkdir_p!(Path.dirname(target))
-    File.cp(source, target)
-  end
+  def upload(key, source, _opts), do: put_file(key, source, [])
 
   @doc "Whether an object sits at `key`."
   def exists?(key), do: File.exists?(path(key))
 
-  @doc "Writes `body` at `key`."
+  @doc "Writes `body` at `key`, through `put_file/3` so it lands whole."
   def put_object(key, body) do
-    target = path(key)
-    File.mkdir_p!(Path.dirname(target))
-    File.write(target, body)
+    source = Briefly.create!(prefix: "example_put_")
+
+    try do
+      with :ok <- File.write(source, body), do: put_file(key, source, [])
+    after
+      File.rm(source)
+    end
   end
 
   @impl ExampleWeb.Bulk.Storage
@@ -81,13 +60,11 @@ defmodule Example.BulkActions.LocalStorage do
 
   @doc "Where `key` sits on disk."
   def path(key) do
-    case Path.safe_relative(key) do
-      {:ok, relative} -> Path.join(root(), relative)
-      :error -> raise ArgumentError, "unsafe storage key: #{inspect(key)}"
+    case Local.path(key) do
+      {:ok, path} -> path
+      {:error, :unsafe_key} -> raise ArgumentError, "unsafe storage key: #{inspect(key)}"
     end
   end
 
   defp url(grant), do: "/storage/" <> Phoenix.Token.sign(ExampleWeb.Endpoint, @salt, grant)
-
-  defp root, do: Application.get_env(:example, :storage_dir, "priv/storage")
 end

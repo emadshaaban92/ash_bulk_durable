@@ -36,6 +36,8 @@ config :ash_bulk_durable,
   pubsub_module: ExampleWeb.Endpoint,
   field_handlers: [Example.BulkActions.FileHandler]
 
+config :ash_bulk_durable, AshBulkDurable.Storage.Local, root: "priv/storage"
+
 # The `/bulk` screens copied into this app.
 config :example, :bulk, resources: [Example.Library.Author, Example.Library.Book]
 

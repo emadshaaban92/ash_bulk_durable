@@ -10,8 +10,9 @@ defmodule AshBulkDurable.Core.Storage do
       orphan-staging sweep.
 
   Putting a file there and handing the browser somewhere to upload it are
-  its callers'. The package ships no store: the host names a module that
-  implements this behaviour,
+  its callers'. The host names the module that implements this behaviour:
+  the disk store the package ships outside the core (see the README), or
+  one of its own,
 
       config :ash_bulk_durable,
         storage: MyApp.BulkActions.Storage
@@ -39,14 +40,41 @@ defmodule AshBulkDurable.Core.Storage do
   timestamp. Used by `AshBulkDurable.Core.PurgeStaleStaging` to age-gate the
   orphan sweep — the worker can't clean up keys for bulk actions whose submit
   transaction never committed, so the sweep lists the prefix and deletes
-  what's stale.
+  what's stale. The core passes a prefix ending in `/` (`bulk-staging/`), so
+  a store may read it as a directory or as the start of every key.
   """
   @callback list_files(prefix :: String.t(), opts :: keyword()) ::
               {:ok, [%{key: key(), last_modified: DateTime.t()}]} | {:error, term()}
 
+  @doc """
+  Checks the store's own configuration, so a node that cannot use it fails
+  when `AshBulkDurable.Core.Poller` starts rather than at its first sweep or
+  fetch. Optional; a store without it is taken as configured.
+  """
+  @callback check_config(opts :: keyword()) :: :ok | {:error, String.t()}
+
+  @optional_callbacks check_config: 1
+
   def fetch_file(key, path), do: impl().fetch_file(key, path, [])
   def delete_file(key), do: impl().delete_file(key, [])
   def list_files(prefix), do: impl().list_files(prefix, [])
+
+  @doc """
+  Raises `ArgumentError` when the configured store says its configuration
+  is wrong. Does nothing when no store is configured, or when it has no
+  `c:check_config/1`.
+  """
+  def check_config! do
+    with store when not is_nil(store) <- AshBulkDurable.Core.config(:storage),
+         true <- Code.ensure_loaded?(store) and function_exported?(store, :check_config, 1),
+         {:error, message} <- store.check_config([]) do
+      raise ArgumentError,
+            "ash_bulk_durable: the `:storage` module #{inspect(store)} " <>
+              "is not configured: #{message}"
+    end
+
+    :ok
+  end
 
   defp impl do
     AshBulkDurable.Core.config(:storage) ||

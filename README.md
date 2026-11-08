@@ -99,7 +99,18 @@ config :ash_bulk_durable,
   worker acts as them again.
 - `AshBulkDurable.Core.Storage` fetches, deletes and lists staged files. The
   worker has each staged file written to a temporary file, so a large one is
-  never held in memory. The library ships no store.
+  never held in memory. `AshBulkDurable.Storage.Local` keeps them on the
+  server's disk, under a configured `:root`, for an app on one node or on
+  several that share a volume:
+
+  ```elixir
+  config :ash_bulk_durable, storage: AshBulkDurable.Storage.Local
+  config :ash_bulk_durable, AshBulkDurable.Storage.Local, root: "/var/lib/my_app/bulk_files"
+  ```
+
+  On several nodes without a shared volume, a run can start on a node that
+  doesn't hold its files, and the rows that need them fail; use an object
+  store there.
 
 Add the poller last to each node's supervision tree, after the repo, anything
 that migrates it, and the PubSub and endpoint a run broadcasts through. It then
