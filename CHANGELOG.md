@@ -104,10 +104,10 @@
   also run as `[:ash_bulk_durable, :phase1 | :all_or_nothing, :progress]`
   telemetry. The example's panel shows them.
 - A bulk action whose resource or action no longer exists (renamed or
-  removed by a deploy) is failed with `reason: :gone` before its run starts,
-  under the bulk action lock and without counting a start. Before, every run
-  of it raised before reaching a row, and a per-row one was restarted forever
-  with its owner unable to abandon, retry or submit again.
+  removed by a deploy) is failed with `reason: :gone`, under the bulk action
+  lock. Before, every run of it raised before reaching a row, and a per-row
+  one was restarted forever with its owner unable to abandon, retry or submit
+  again.
 - A run that raises after its start and before its first row (the owner's
   scope, the runner's settings, storage) counts the exception in
   `setup_failures`, under the lock, and the `:max_setup_failures`th with no
@@ -115,6 +115,12 @@
   `reason: :setup_error` and the exception's message. Kills are never
   counted, and progress or a retry clears the count. Before, a per-row one
   was restarted every `:stale_after` forever.
+- A start that finds its bulk action `:gone` or `:unreadable` counts a setup
+  failure too, running nothing, instead of failing it at once, and the
+  `:max_setup_failures`th fails it with that reason. Both answers come from
+  the node's own code, so during a rolling deploy a node still on the old
+  release failed what only the new release could run; now the next start
+  comes a `:stale_after` later, maybe on an upgraded node.
 - An XLSX is read with calamine, a Rust library, through the `spreadsheet`
   package's precompiled NIF, instead of shelling out to csvkit's `in2csv`, so
   no Python is needed. Booleans read as `true`/`false` (they read `True`,

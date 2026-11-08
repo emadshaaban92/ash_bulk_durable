@@ -22,6 +22,7 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
   use ExampleWeb.ConnCase, async: true
 
   import Phoenix.LiveViewTest
+  import ExUnit.CaptureLog
 
   require Ash.Query
 
@@ -711,7 +712,9 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
       {_view, bulk_action} = submit_bulk_action(conn, user)
       store_vanished!("bulk_actions", "input", bulk_action.id)
 
-      assert 1 = drain()
+      # Each start counts it as a setup failure, as a node on an older release
+      # would; the third fails it.
+      capture_log(fn -> for _start <- 1..3, do: assert(1 = drain()) end)
 
       assert reload(bulk_action).status == :failed
       assert Enum.all?(list_rows(bulk_action.id), &(&1.status != :succeeded))
