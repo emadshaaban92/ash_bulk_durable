@@ -54,7 +54,8 @@ defmodule AshBulkDurable do
   """
 
   alias AshBulkDurable.{Core, Sheet}
-  alias AshBulkDurable.Sheet.{ErrorsSheet, Mapping}
+  alias AshBulkDurable.Core.Owner
+  alias AshBulkDurable.Sheet.{Companions, ErrorsSheet, Mapping}
 
   defdelegate action_source(), to: Core
   defdelegate config(key, default \\ nil), to: Core
@@ -101,10 +102,10 @@ defmodule AshBulkDurable do
 
   @doc """
   Reruns every row that has not succeeded, as it is or with `:input` for a
-  new shared input or `:rows` for per-row corrections; see
-  `AshBulkDurable.Core.Retry.retry/2`. Refused while the bulk action is
-  queued or running, and a failed one while its owner has another
-  unresolved one, `{:error, %{unresolved: id}}`.
+  new shared input, `:rows` for per-row corrections or `:staged_files` for
+  files staged again; see `AshBulkDurable.Core.Retry.retry/2`. Refused
+  while the bulk action is queued or running, and a failed one while its
+  owner has another unresolved one, `{:error, %{unresolved: id}}`.
   """
   defdelegate retry(bulk_action, opts), to: Core
 
@@ -112,11 +113,30 @@ defmodule AshBulkDurable do
   Reruns the rows that have not succeeded, with what `corrected_sheet`, an
   `errors_sheet/2` a user edited and `read_sheet/2` read, changes. Its rows
   with nothing changed rerun as they are; a row it leaves out reruns too.
+
+  `:companions`, `%{field => storage_key}`, stages its files again, in
+  place of every file the bulk action held, checked as the sheet verbs
+  check theirs (`AshBulkDurable.Sheet.Companions`): for a bulk action whose
+  files the daily sweep deleted.
   """
   def retry(bulk_action, %Sheet{} = corrected_sheet, opts) do
-    with {:ok, rows} <-
-           ErrorsSheet.corrections(bulk_action, corrected_sheet, Keyword.fetch!(opts, :scope)) do
+    scope = Keyword.fetch!(opts, :scope)
+    {companions, opts} = Keyword.pop(opts, :companions)
+
+    with {:ok, rows} <- ErrorsSheet.corrections(bulk_action, corrected_sheet, scope),
+         {:ok, opts} <- restage(bulk_action, companions, scope, opts) do
       Core.retry(bulk_action, Keyword.put(opts, :rows, rows))
+    end
+  end
+
+  defp restage(_bulk_action, nil, _scope, opts), do: {:ok, opts}
+
+  defp restage(bulk_action, companions, scope, opts) do
+    mapping = Mapping.from_bulk_action(bulk_action)
+
+    with :ok <- Companions.check(mapping, companions, Owner.worker_key(scope)) do
+      staged = Map.new(companions, fn {name, key} -> {to_string(name), key} end)
+      {:ok, Keyword.put(opts, :staged_files, staged)}
     end
   end
 
@@ -134,7 +154,7 @@ defmodule AshBulkDurable do
   defdelegate errors_sheet(bulk_action, opts \\ []), to: ErrorsSheet, as: :build
 
   @doc """
-  Abandons a bulk action that finished with failed rows; see
+  Abandons a bulk action that finished with failed rows, or failed; see
   `AshBulkDurable.Core.abandon/2`.
   """
   defdelegate abandon(bulk_action, opts), to: Core

@@ -11,7 +11,9 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
 
   import ExUnit.CaptureLog
 
-  alias AshBulkDurable.Core.PurgeStaleStaging
+  require Ash.Query
+
+  alias AshBulkDurable.Core.{PurgeStaleStaging, StagedFileError, Worker}
   alias AshBulkDurable.TestStorage
   alias AshBulkDurable.Test.BulkAction
 
@@ -241,6 +243,169 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
 
     test "delete_bulk_action_staging/1 is a no-op for an unknown bulk action" do
       assert :ok = PurgeStaleStaging.delete_bulk_action_staging(Ecto.UUID.generate())
+    end
+  end
+
+  describe "once the sweep has taken a failed bulk action's files" do
+    defmodule StagedNameResolver do
+      @moduledoc "Resolves to the text of the file staged as `logo`."
+      @behaviour AshBulkDurable.Core.Resolver
+
+      @impl true
+      def prepare(_args, context), do: {:ok, Map.fetch(context.staged_files, "logo")}
+
+      @impl true
+      def resolve(_args, {:ok, path}, _context), do: {:ok, File.read!(path)}
+      def resolve(_args, :error, _context), do: {:error, "no logo is staged"}
+
+      @impl true
+      def finish(_state), do: :ok
+    end
+
+    setup %{super_user: user} do
+      code = "S#{System.unique_integer([:positive])}"
+      key = "#{@prefix}#{user.id}/uuid-old/companions/logo.zip"
+
+      bulk_action =
+        Ash.create!(
+          BulkAction,
+          %{
+            user_id: user.id,
+            resource_name: "AshBulkDurable.Test.Region",
+            action_name: :create,
+            action_type: :create,
+            staged_files: %{"logo" => key},
+            total_rows: 1,
+            mode: :per_row,
+            chunk_size: 50,
+            rows: [
+              %{
+                input: %{
+                  code: code,
+                  name: {:resolve, StagedNameResolver, nil},
+                  native_name: "ا #{code}"
+                }
+              }
+            ]
+          },
+          action: :create,
+          authorize?: false
+        )
+
+      # It failed before reaching its row, more than a day ago, and the
+      # sweep took its file.
+      TestStorage.put(key, "Old name", old())
+      failed = finish!(bulk_action, {:failed, %{reason: :setup_error}})
+      finished_ago!(failed, @day_seconds + 60)
+      :ok = PurgeStaleStaging.sweep()
+      refute key in TestStorage.keys()
+
+      %{
+        bulk_action: failed,
+        code: code,
+        key: key,
+        scope: AshBulkDurable.Test.Scope.new(actor: user)
+      }
+    end
+
+    defp region(code) do
+      AshBulkDurable.Test.Region
+      |> Ash.Query.filter(code == ^code)
+      |> Ash.read_one!(authorize?: false)
+    end
+
+    defp reload(bulk_action), do: Ash.get!(BulkAction, bulk_action.id, authorize?: false)
+
+    test "a retry stages its files again, and the row that needs one runs with it", ctx do
+      # As it is, the row has no file to resolve from.
+      capture_log(fn ->
+        assert {:ok, _retried} = AshBulkDurable.retry(ctx.bulk_action, scope: ctx.scope)
+        assert :ok = Worker.run_now(ctx.bulk_action.id)
+      end)
+
+      assert %{status: :completed_with_errors, staged_files: %{"logo" => key}} =
+               parked = reload(ctx.bulk_action)
+
+      assert key == ctx.key
+
+      assert [%{status: :failed, error: [%{error: %StagedFileError{}}]}] =
+               AshBulkDurable.Core.open_rows(parked)
+
+      # Staged again, it runs with the new file, in place of the one swept.
+      new_key = "#{@prefix}#{ctx.super_user.id}/uuid-new/companions/logo.zip"
+      TestStorage.put(new_key, "New name")
+
+      assert {:ok, %{staged_files: %{"logo" => ^new_key}}} =
+               AshBulkDurable.retry(parked, scope: ctx.scope, staged_files: %{"logo" => new_key})
+
+      assert :ok = Worker.run_now(ctx.bulk_action.id)
+
+      assert %{status: :completed, staged_files: %{"logo" => ^new_key}} =
+               reload(ctx.bulk_action)
+
+      assert %{name: "New name"} = region(ctx.code)
+      # Completed, it needs its file no more.
+      refute new_key in TestStorage.keys()
+    end
+
+    test "a retry of one row stages its files again too", ctx do
+      capture_log(fn ->
+        {:ok, _retried} = AshBulkDurable.retry(ctx.bulk_action, scope: ctx.scope)
+        :ok = Worker.run_now(ctx.bulk_action.id)
+      end)
+
+      [row] = AshBulkDurable.Core.open_rows(ctx.bulk_action)
+      new_key = "#{@prefix}#{ctx.super_user.id}/uuid-new/companions/logo.zip"
+      TestStorage.put(new_key, "Row name")
+
+      assert {:ok, %{staged_files: %{"logo" => ^new_key}}} =
+               AshBulkDurable.retry_row(row, scope: ctx.scope, staged_files: %{"logo" => new_key})
+
+      assert :ok = Worker.run_now(ctx.bulk_action.id)
+      assert %{status: :completed} = reload(ctx.bulk_action)
+      assert %{name: "Row name"} = region(ctx.code)
+    end
+
+    test "a refused retry stages nothing", ctx do
+      stranger =
+        AshBulkDurable.Test.RoleTestHelpers.create_user_with_platform_role(
+          ctx.super_user,
+          :platform_admin
+        )
+
+      new_key = "#{@prefix}#{ctx.super_user.id}/uuid-new/companions/logo.zip"
+
+      assert {:error, %Ash.Error.Invalid{}} =
+               AshBulkDurable.retry(ctx.bulk_action,
+                 scope: AshBulkDurable.Test.Scope.new(actor: stranger),
+                 staged_files: %{"logo" => new_key}
+               )
+
+      assert %{status: :failed, staged_files: %{"logo" => key}} = reload(ctx.bulk_action)
+      assert key == ctx.key
+    end
+
+    test "its owner can abandon it instead", ctx do
+      assert {:ok, %{status: :cancelled}} =
+               AshBulkDurable.abandon(ctx.bulk_action, scope: ctx.scope)
+
+      refute region(ctx.code)
+    end
+  end
+
+  describe "abandon/2 of a failed bulk action" do
+    test "cancels it and deletes the files it kept for a retry", %{super_user: user} do
+      {bulk_action, keys} = create_bulk_action!(["a.zip"], user.id)
+      failed = finish!(bulk_action, {:failed, %{reason: :setup_error}})
+      Enum.each(keys, &TestStorage.put/1)
+
+      assert {:ok, %{status: :cancelled}} =
+               AshBulkDurable.abandon(failed,
+                 scope: AshBulkDurable.Test.Scope.new(actor: user)
+               )
+
+      remaining = TestStorage.keys()
+      for key <- keys, do: refute(key in remaining)
     end
   end
 

@@ -25,6 +25,8 @@ defmodule AshBulkDurable.Core.Changes.ApplyMarkFinished do
   `:failed`, `:cancelled`) is rejected as `StaleRecord` rather than
   silently overwriting the verdict: if one run finishes a bulk action and
   an overlapping run then tries to finalize it, the second UPDATE no-ops.
+  Only `:cancelled` also matches a `:failed` bulk action, which its owner
+  can abandon (`AshBulkDurable.Core.abandon/2`) as well as retry.
 
   ## Staged files
 
@@ -42,12 +44,15 @@ defmodule AshBulkDurable.Core.Changes.ApplyMarkFinished do
     {status, result_blob, error} = interpret(arg)
 
     changeset
-    |> Ash.Changeset.filter(Ash.Expr.expr(status in [:queued, :running, :completed_with_errors]))
+    |> Ash.Changeset.filter(Ash.Expr.expr(status in ^from(status)))
     |> Ash.Changeset.force_change_attribute(:status, status)
     |> Ash.Changeset.force_change_attribute(:result, result_blob)
     |> Ash.Changeset.force_change_attribute(:error, error)
     |> Ash.Changeset.force_change_attribute(:finished_at, DateTime.utc_now())
   end
+
+  defp from(:cancelled), do: [:queued, :running, :completed_with_errors, :failed]
+  defp from(_status), do: [:queued, :running, :completed_with_errors]
 
   defp interpret(:completed), do: {:completed, %{outcome: "completed"}, nil}
 

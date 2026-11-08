@@ -21,7 +21,9 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
       24h ago** → KEEP. Its owner can still retry it, and the retry
       downloads the same files. The day counts from `finished_at`, not
       from the upload, so a run that stayed queued or running for a day
-      doesn't lose its files the moment it fails.
+      doesn't lose its files the moment it fails. Once they are gone, a
+      retry can stage them again (`:staged_files` on
+      `AshBulkDurable.Core.Retry.retry/2`), or its owner can abandon it.
     * **Everything else** → delete. That covers true orphans (the
       browser completed a presigned PUT but the submit transaction
       never committed) AND keys belonging to a worker-exited terminal
@@ -38,8 +40,8 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
 
   ## Abandoning (`delete_staging/1`)
 
-  Abandoning flips a `:completed_with_errors` bulk action to `:cancelled`
-  long after the worker exited, so nothing on the worker's code path can
+  Abandoning flips a `:completed_with_errors` or `:failed` bulk action to
+  `:cancelled` long after the worker exited, so nothing on the worker's code path can
   drop its staged files. `AshBulkDurable.Core.abandon/2` calls
   `delete_staging/1` itself once the cancel commits; when it can't (the
   cancel ran inside a caller's transaction, or storage failed), the next

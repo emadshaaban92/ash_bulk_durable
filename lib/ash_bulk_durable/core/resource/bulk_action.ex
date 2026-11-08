@@ -31,7 +31,10 @@ defmodule AshBulkDurable.Core.Resource.BulkAction do
   argument (an integer, which may be nil) and, when it is given, set the
   bulk action's `pass` to it: `AshBulkDurable.Core.Retry` always passes the
   pass it also writes onto the rows it reopens, and a retry through an
-  action without the argument fails.
+  action without the argument fails. A retry given `:staged_files` passes
+  them as a `staged_files` argument (a map), which the action must set as
+  the bulk action's `staged_files` (`AshBulkDurable.Core.Changes.ReopenBulkAction`
+  does both).
   """
   use Spark.Dsl.Extension,
     transformers: [AshBulkDurable.Core.Resource.BulkAction.Transformer]

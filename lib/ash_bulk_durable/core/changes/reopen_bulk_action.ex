@@ -11,7 +11,11 @@ defmodule AshBulkDurable.Core.Changes.ReopenBulkAction do
   next lock instead of carrying on into this pass with the last one's
   settings (see "Passes" in `AshBulkDurable.Core.Worker`). Given a `pass`,
   it takes that one: the one `AshBulkDurable.Core.Retry` wrote on the rows it
-  reopened in the same transaction.
+  reopened in the same transaction. Given `staged_files`, `%{name =>
+  storage_key}`, it holds those in place of the ones it held, so a retry can
+  stage again the files the daily sweep deleted
+  (`AshBulkDurable.Core.PurgeStaleStaging`). A key it no longer holds is the
+  sweep's to delete.
 
   Only a bulk action parked in `:completed_with_errors` or `:failed` matches
   the update. One `:queued` or `:running`, or already `:completed` or
@@ -38,6 +42,7 @@ defmodule AshBulkDurable.Core.Changes.ReopenBulkAction do
     |> Ash.Changeset.force_change_attribute(:isolating_row_id, nil)
     |> put_pass()
     |> put_input()
+    |> put_staged_files()
   end
 
   # `AshBulkDurable.Core.Retry` gives the pass it read under the lock plus
@@ -46,6 +51,13 @@ defmodule AshBulkDurable.Core.Changes.ReopenBulkAction do
     case Ash.Changeset.get_argument(changeset, :pass) do
       nil -> Ash.Changeset.atomic_update(changeset, :pass, Ash.Expr.expr(pass + 1))
       pass -> Ash.Changeset.force_change_attribute(changeset, :pass, pass)
+    end
+  end
+
+  defp put_staged_files(changeset) do
+    case Ash.Changeset.get_argument(changeset, :staged_files) do
+      nil -> changeset
+      staged -> Ash.Changeset.force_change_attribute(changeset, :staged_files, staged)
     end
   end
 
