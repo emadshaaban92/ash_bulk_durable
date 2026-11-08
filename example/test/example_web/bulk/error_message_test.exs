@@ -40,4 +40,43 @@ defmodule ExampleWeb.Bulk.ErrorMessageTest do
     assert ErrorMessage.display_error(error) ==
              "This row hit an unexpected error, so nothing was saved for it."
   end
+
+  test "a target looked up by one key matching more than one record reads on that key" do
+    error = %ManyMatchesError{resource: Example.Accounts.Organization, criteria: %{code: "ACME"}}
+
+    assert ErrorMessage.display_error(error) ==
+             "Code: more than one result in Organization matches Code = \"ACME\""
+  end
+
+  test "a target looked up by several keys matching more than one record reads on each" do
+    error = %ManyMatchesError{
+      resource: Example.Accounts.Organization,
+      criteria: %{code: "ACME", name: "Acme"}
+    }
+
+    assert ErrorMessage.display_error(error) ==
+             "Code, Name: more than one result in Organization matches Code = \"ACME\", Name = \"Acme\""
+  end
+
+  test "a target narrowed through a relationship names the clause, reading on its own keys" do
+    error = %ManyMatchesError{
+      resource: Example.Accounts.Membership,
+      criteria: %{name: "Acme", organization: %{code: "ACME"}}
+    }
+
+    assert ErrorMessage.display_error(error) ==
+             "Name: more than one result in Membership matches " <>
+               "Name = \"Acme\", Organization Code = \"ACME\""
+  end
+
+  test "a clause two relationships deep is labelled through both" do
+    error = %ManyMatchesError{
+      resource: Example.Accounts.Membership,
+      criteria: %{organization: %{code: "ACME"}, user: %{organization: %{code: "HQ"}}}
+    }
+
+    assert ErrorMessage.display_error(error) ==
+             "more than one result in Membership matches " <>
+               "Organization Code = \"ACME\", User Organization Code = \"HQ\""
+  end
 end

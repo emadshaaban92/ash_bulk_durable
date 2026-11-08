@@ -12,6 +12,8 @@ defmodule ExampleWeb.Bulk.ErrorMessage do
   """
   use Gettext, backend: ExampleWeb.Gettext
 
+  import AshBulkDurable.Core.Reference, only: [is_composite: 1]
+
   alias AshBulkDurable.Core.{
     CrashedRowError,
     ManyMatchesError,
@@ -64,6 +66,10 @@ defmodule ExampleWeb.Bulk.ErrorMessage do
   defp word(%StoredError{error: %NoMatchError{field: field} = error}),
     do: [on_field(field, no_match(error))]
 
+  defp word(%StoredError{error: %ManyMatchesError{field: nil, resource: resource} = error})
+       when not is_nil(resource),
+       do: [on_fields(target_keys(error), many_matches(error))]
+
   defp word(%StoredError{error: %ManyMatchesError{field: field} = error}),
     do: [on_field(field, many_matches(error))]
 
@@ -83,6 +89,13 @@ defmodule ExampleWeb.Bulk.ErrorMessage do
     )
   end
 
+  # An update's or destroy's target names no field: it reads on the keys the
+  # row looked it up by, as a target finding nothing does, not on a clause
+  # through a relationship, which only narrows the lookup.
+  defp target_keys(%ManyMatchesError{criteria: criteria}) do
+    for {key, value} <- ManyMatchesError.in_order(criteria), not is_composite(value), do: key
+  end
+
   defp many_matches(%ManyMatchesError{resource: nil}), do: gettext("more than one match found")
 
   defp many_matches(%ManyMatchesError{resource: resource, criteria: criteria}) do
@@ -95,10 +108,28 @@ defmodule ExampleWeb.Bulk.ErrorMessage do
   defp resource_label(resource),
     do: ExampleWeb.Bulk.Utils.humanize(Ash.Resource.Info.short_name(resource))
 
-  defp criteria_label(criteria, resource) do
-    Enum.map_join(criteria, ", ", fn {key, value} ->
-      "#{ExampleWeb.Bulk.Utils.field_label(key, resource)} = \"#{Sheet.FieldHandler.cell(value)}\""
-    end)
+  # A clause through a relationship is labelled by the related resource's
+  # own fields, under the relationship's label, however deep it goes.
+  defp criteria_label(criteria, resource, under \\ nil) do
+    criteria
+    |> ManyMatchesError.in_order()
+    |> Enum.map_join(", ", &criterion_label(&1, resource, under))
+  end
+
+  defp criterion_label({key, nested}, resource, under) when is_composite(nested),
+    do: criteria_label(nested, related(resource, key), label(key, resource, under))
+
+  defp criterion_label({key, value}, resource, under),
+    do: "#{label(key, resource, under)} = \"#{Sheet.FieldHandler.cell(value)}\""
+
+  defp label(key, resource, nil), do: ExampleWeb.Bulk.Utils.field_label(key, resource)
+  defp label(key, resource, under), do: "#{under} #{label(key, resource, nil)}"
+
+  defp related(resource, key) do
+    case Ash.Resource.Info.relationship(resource, key) do
+      %{destination: destination} -> destination
+      nil -> resource
+    end
   end
 
   defp form_errors(error) when is_exception(error) do
@@ -115,6 +146,15 @@ defmodule ExampleWeb.Bulk.ErrorMessage do
   end
 
   defp word_form_error(_said_nothing), do: []
+
+  defp on_fields([], message), do: message
+
+  defp on_fields(fields, message) do
+    gettext("%{field}: %{message}",
+      field: Enum.map_join(fields, ", ", &ExampleWeb.Bulk.Utils.humanize/1),
+      message: message
+    )
+  end
 
   defp on_field(field, message) when field in [nil, :_form], do: message
 

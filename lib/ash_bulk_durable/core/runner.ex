@@ -16,7 +16,10 @@ defmodule AshBulkDurable.Core.Runner do
 
     * `:lookup` — the filter input finding the record, e.g. `%{code: "C1"}`.
       A key may traverse a relationship (`%{code: "C1", owner: %{code:
-      "O1"}}`) to narrow the lookup without naming a tenant.
+      "O1"}}`) to narrow the lookup without naming a tenant. A lookup
+      matching more than one record (by a key that isn't unique, say)
+      fails its row with `AshBulkDurable.Core.ManyMatchesError` rather than
+      acting on one of them.
     * `:tenant` — the tenant the row acts in, a value or a reference;
       without one the row acts in the bulk action's `tenant`.
 
@@ -49,6 +52,7 @@ defmodule AshBulkDurable.Core.Runner do
     UnreadableRowError
   }
 
+  alias Ash.Error.Invalid.MultipleResults
   alias AshBulkDurable.Core.Resolver.Context
 
   require Logger
@@ -496,6 +500,8 @@ defmodule AshBulkDurable.Core.Runner do
 
   defp read_target(settings, _row), do: {:error, not_found(settings, %{})}
 
+  # Reads two, as `Reference.resolve/3` does: `read_one` refuses the second,
+  # and a key that isn't unique doesn't read (or lock) every match.
   defp read_lookup(settings, lookup) do
     read_action = Ash.Resource.Info.primary_action!(settings.resource, :read).name
     opts = [scope: settings.scope, tenant: settings.tenant]
@@ -503,11 +509,20 @@ defmodule AshBulkDurable.Core.Runner do
     case settings.resource
          |> Ash.Query.for_read(read_action, %{}, opts)
          |> Ash.Query.filter_input(lookup)
+         |> Ash.Query.limit(2)
          |> BulkActionLock.pin()
          |> Ash.read_one(opts) do
-      {:ok, %{} = record} -> {:ok, record}
-      {:ok, nil} -> {:error, not_found(settings, lookup)}
-      {:error, error} -> {:error, error}
+      {:ok, %{} = record} ->
+        {:ok, record}
+
+      {:ok, nil} ->
+        {:error, not_found(settings, lookup)}
+
+      {:error, %Ash.Error.Invalid{errors: [%MultipleResults{}]}} ->
+        {:error, many_targets(settings, lookup)}
+
+      {:error, error} ->
+        {:error, error}
     end
   end
 
@@ -538,6 +553,12 @@ defmodule AshBulkDurable.Core.Runner do
       resource: settings.resource
     )
   end
+
+  # A target is no input, so it names no field. Its criteria are the whole
+  # lookup, a clause through a relationship included: the matches all passed
+  # it, so leaving it out would name more records than the row looked up.
+  defp many_targets(settings, lookup),
+    do: %ManyMatchesError{resource: settings.resource, criteria: lookup}
 
   # The mode lets an action whose invariant needs one mode refuse the other.
   # The row index traces a failed changeset surfacing from a bulk error back
