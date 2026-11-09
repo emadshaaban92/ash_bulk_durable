@@ -1,8 +1,12 @@
 # Passing tests run many refusals on purpose; their logs print only with a failure.
-# The stress test runs only when asked for: `mix test --only stress`.
-ExUnit.start(capture_log: true, exclude: [:stress])
+# The stress test runs only when asked for: `mix test --only stress`, and the
+# tests against a real S3 API too: `mix test --only s3` (see
+# test/storage/s3_api_test.exs).
+ExUnit.start(capture_log: true, exclude: [:stress, :s3])
 
-alias AshBulkDurable.Test.{PubSub, ReadRepo, Repo}
+alias AshBulkDurable.Test.{PubSub, ReadRepo, Repo, S3Stub}
+
+:ok = S3Stub.start()
 
 {:ok, _pid} = Repo.start_link()
 {:ok, _pid} = ReadRepo.start_link()

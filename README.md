@@ -110,7 +110,15 @@ config :ash_bulk_durable,
 
   On several nodes without a shared volume, a run can start on a node that
   doesn't hold its files, and the rows that need them fail; use an object
-  store there.
+  store there. `AshBulkDurable.Storage.S3` keeps them in an S3 bucket (or any
+  store speaking the S3 API) through `ExAws`, once the app depends on
+  `:ex_aws`, `:ex_aws_s3`, `:sweet_xml` and an HTTP client such as
+  `:hackney`:
+
+  ```elixir
+  config :ash_bulk_durable, storage: AshBulkDurable.Storage.S3
+  config :ash_bulk_durable, AshBulkDurable.Storage.S3, bucket: "my-app-bulk-files"
+  ```
 
 Add the poller last to each node's supervision tree, after the repo, anything
 that migrates it, and the PubSub and endpoint a run broadcasts through. It then

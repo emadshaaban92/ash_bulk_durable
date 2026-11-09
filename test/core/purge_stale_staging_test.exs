@@ -77,7 +77,25 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
 
   # ── Tests ──────────────────────────────────────────────────────────────
 
+  defmodule UnlistableStorage do
+    @moduledoc false
+    @behaviour AshBulkDurable.Core.Storage
+
+    def fetch_file(_key, _path, _opts), do: {:error, :not_found}
+    def delete_file(_key, _opts), do: raise("the sweep deleted after a failed listing")
+    def list_files(_prefix, _opts), do: {:error, :listing_refused}
+  end
+
   describe "daily sweep" do
+    test "a listing the store fails is logged, and nothing is deleted" do
+      AshBulkDurable.StorageHelpers.put_config(:storage, UnlistableStorage)
+
+      log = capture_log(fn -> assert :ok = PurgeStaleStaging.sweep() end)
+
+      assert log =~ "the staging sweep could not list bulk-staging/"
+      assert log =~ ":listing_refused"
+    end
+
     test "deletes orphan + terminal staging keys, keeps :completed_with_errors keys" do
       key_orphan = "#{@prefix}#{Ecto.UUID.generate()}/uuid-a/companions/logo.zip"
 

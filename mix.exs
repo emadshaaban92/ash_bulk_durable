@@ -56,8 +56,15 @@ defmodule AshBulkDurable.MixProject do
       {:briefly, "~> 0.5"},
       {:telemetry, "~> 1.2"},
 
+      # AshBulkDurable.Storage.S3, for a host that stages files in a bucket.
+      {:ex_aws, "~> 2.7", optional: true},
+      {:ex_aws_s3, "~> 2.5", optional: true},
+      {:sweet_xml, "~> 0.7", optional: true},
+
       # The resources the tests run, whose policies need a solver.
       {:simple_sat, "~> 0.1", only: :test},
+      # The HTTP client the `:s3` tests reach a real S3 API (RustFS in CI) with.
+      {:hackney, "~> 4.0", only: :test},
 
       # Tooling.
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},

@@ -55,6 +55,7 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
 
   require Ash.Expr
   require Ash.Query
+  require Logger
 
   alias AshBulkDurable.Core.{BulkActionLock, Storage}
 
@@ -91,7 +92,8 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
 
   @doc """
   Deletes every staged file older than a day that no unresolved or
-  recently failed bulk action holds.
+  recently failed bulk action holds. A listing the store fails is logged,
+  and nothing is deleted until a later sweep lists.
   """
   def sweep do
     case Storage.list_files(@staging_prefix) do
@@ -103,7 +105,12 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
         |> Enum.map(& &1.key)
         |> purge(cutoff)
 
-      {:error, _term} ->
+      {:error, term} ->
+        Logger.warning(
+          "the staging sweep could not list #{@staging_prefix}, so it deleted nothing: " <>
+            inspect(term)
+        )
+
         :ok
     end
   end

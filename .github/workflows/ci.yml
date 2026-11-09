@@ -134,6 +134,72 @@ jobs:
       - name: Run the stress test
         run: mix test --only stress --warnings-as-errors
 
+  # AshBulkDurable.Storage.S3 against a real S3 API
+  # (test/storage/s3_api_test.exs), so the ETS stub its unit tests use is
+  # checked against a store that is not ours: RustFS, a MinIO-compatible
+  # server, since MinIO no longer publishes its image on Docker Hub.
+  s3:
+    name: S3 store (RustFS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      db:
+        image: postgres:18
+        env:
+          POSTGRES_USER: admin
+          POSTGRES_PASSWORD: admin
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U admin"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Started by hand, not as a service, so the job waits until it answers.
+      - name: Start RustFS
+        run: |
+          docker run -d --name rustfs -p 9000:9000 rustfs/rustfs:1.0.4
+          for _ in $(seq 1 60); do
+            curl -s -o /dev/null http://localhost:9000/ && exit 0
+            sleep 1
+          done
+          docker logs rustfs
+          exit 1
+
+      - name: Set up Elixir / OTP
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20"
+          otp-version: "29"
+
+      - name: Cache deps and _build
+        uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-29-1.20-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-29-1.20-
+
+      - name: Map the "db" host to localhost
+        run: echo "127.0.0.1 db" | sudo tee -a /etc/hosts
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Run the S3 tests
+        run: mix test --only s3 --warnings-as-errors
+
+      - name: RustFS logs
+        if: failure()
+        run: docker logs rustfs
+
   # Version-independent checks, once.
   quality:
     name: Quality (format · credo · audits)
