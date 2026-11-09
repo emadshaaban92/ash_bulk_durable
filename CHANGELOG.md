@@ -215,3 +215,25 @@
   refuses to start when the configured store answers `{:error, message}`,
   so a node without a disk store's `:root` fails at boot rather than at its
   first sweep or fetch.
+- `AshBulkDurable.Storage.S3` is a `Core.Storage` that keeps staged files in
+  an S3 bucket (or any store speaking the S3 API) through `ExAws`, for an
+  app on any number of nodes. It is compiled only when the app depends on
+  `:ex_aws`, `:ex_aws_s3` and `:sweet_xml`, all optional here. It reads a
+  `:bucket` (required) and `:ex_aws` request overrides from config or each
+  call's opts, a call's `:ex_aws` keys merging over the configured ones.
+  `fetch_file/3` fetches in ranges of `:chunk_size` (8 MiB by default)
+  pinned to the object's ETag, so a large file never sits in memory and an
+  object replaced mid-fetch fails the fetch; a missing key, before or during
+  the fetch, is `{:error, :not_found}`. `list_files/2` follows every page of
+  the listing, and a timestamp it cannot read fails it. `put_file/3` sends
+  a file of up to `:part_size` (5 MiB by default) in one `PUT` and a bigger
+  one part by part, aborting an upload that fails. Every request
+  runs in the caller's process, so a slow or failing store answers an error
+  instead of killing it. `check_config/1` fails a node's poller at boot
+  without a `:bucket` or without `ExAws`'s HTTP client. `use
+  AshBulkDurable.Storage.S3` works as `use AshBulkDurable.Storage.Local`
+  does. Its unit tests run against a stub; `mix test --only s3` runs it
+  against a real S3 API (RustFS in CI, or MinIO, or S3 itself).
+- `PurgeStaleStaging.sweep/0` logs a warning when the store fails to list
+  the staging prefix, instead of returning without a word, so a sweep that
+  reclaims nothing says why.

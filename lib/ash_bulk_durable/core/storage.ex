@@ -11,8 +11,8 @@ defmodule AshBulkDurable.Core.Storage do
 
   Putting a file there and handing the browser somewhere to upload it are
   its callers'. The host names the module that implements this behaviour:
-  the disk store the package ships outside the core (see the README), or
-  one of its own,
+  one of the stores the package ships outside the core, for a disk or an
+  S3 bucket (see the README), or one of its own,
 
       config :ash_bulk_durable,
         storage: MyApp.BulkActions.Storage
