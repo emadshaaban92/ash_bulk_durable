@@ -189,3 +189,11 @@
   by hand. A lock timeout on the row's own write arrives from AshPostgres
   as `Ash.Error.Invalid.Unavailable`, and counts too. A host's own raise,
   however it is worded, still fails its row.
+- `example/`: the `/bulk` page refuses a sheet `read_sheet/2` can't read
+  instead of crashing, in the submit form and in the retry zone. It says
+  why in terms the user can fix (which headers repeat, which row has a cell
+  past the last header, the sheet is too large or missing, the file isn't a
+  readable spreadsheet or CSV), and the next file uploads as usual. Any
+  other failure to read the upload is logged, and the user is asked to try
+  again. In the retry zone a refused sheet drops a corrected sheet staged
+  before it, so "Retry failed rows" goes back to disabled.
