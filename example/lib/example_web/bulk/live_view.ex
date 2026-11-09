@@ -52,6 +52,7 @@ defmodule ExampleWeb.Bulk.LiveView do
       allow_upload: 3,
       assign_async: 3,
       cancel_upload: 3,
+      clear_flash: 2,
       connected?: 1,
       consume_uploaded_entries: 3,
       consume_uploaded_entry: 3,
@@ -66,6 +67,7 @@ defmodule ExampleWeb.Bulk.LiveView do
   alias ExampleWeb.Bulk.ViewOptions
 
   require Ash.Query
+  require Logger
 
   # How many failed rows the panel previews inline; the rest live in the
   # downloadable errors sheet.
@@ -454,25 +456,35 @@ defmodule ExampleWeb.Bulk.LiveView do
   @doc false
   def on_progress(:sheet, entry, socket) do
     if entry.done? do
-      uploaded_file =
-        consume_uploaded_entry(socket, entry, fn %{} = meta ->
-          {:ok,
-           %{
-             name: entry.client_name,
-             uuid: entry.uuid,
-             size: entry.client_size,
-             path: meta.path,
-             sheet: read_sheet!(meta.path, entry)
-           }}
-        end)
+      consume_uploaded_entry(socket, entry, fn %{} = meta ->
+        {:ok, {meta.path, read_sheet(meta.path, entry)}}
+      end)
+      |> case do
+        {path, {:ok, sheet}} ->
+          uploaded_file = %{
+            name: entry.client_name,
+            uuid: entry.uuid,
+            size: entry.client_size,
+            path: path,
+            sheet: sheet
+          }
 
-      socket =
-        socket
-        |> assign(uploaded_file: uploaded_file)
-        |> assign_csv_keys()
-        |> auto_fill_field_mappings()
+          # No `clear_flash/2` needed, unlike the retry zone: the patch in
+          # `push_options/2` drops a flash set before this event, such as an
+          # earlier refusal's.
+          socket =
+            socket
+            |> assign(uploaded_file: uploaded_file)
+            |> assign_csv_keys()
+            |> auto_fill_field_mappings()
 
-      {:noreply, push_options(socket, socket.assigns.options)}
+          {:noreply, push_options(socket, socket.assigns.options)}
+
+        # The form hides its file input while a sheet is uploaded, so
+        # there is no earlier sheet to drop.
+        {_path, {:error, reason}} ->
+          {:noreply, refuse_sheet(socket, entry, reason)}
+      end
     else
       {:noreply, socket}
     end
@@ -487,12 +499,22 @@ defmodule ExampleWeb.Bulk.LiveView do
   # retry actually fires.
   def on_retry_progress(:retry_csv, entry, socket) do
     if entry.done? and socket.assigns[:bulk_action] do
-      sheet =
-        consume_uploaded_entry(socket, entry, fn %{} = meta ->
-          {:ok, read_sheet!(meta.path, entry)}
-        end)
+      consume_uploaded_entry(socket, entry, fn %{} = meta ->
+        {:ok, read_sheet(meta.path, entry)}
+      end)
+      |> case do
+        {:ok, sheet} ->
+          {:noreply,
+           socket
+           |> clear_flash(:error)
+           |> assign(retry_sheet: sheet, retry_filename: entry.client_name)}
 
-      {:noreply, assign(socket, retry_sheet: sheet, retry_filename: entry.client_name)}
+        {:error, reason} ->
+          {:noreply,
+           socket
+           |> assign(retry_sheet: nil, retry_filename: nil)
+           |> refuse_sheet(entry, reason)}
+      end
     else
       {:noreply, socket}
     end
@@ -1105,10 +1127,66 @@ defmodule ExampleWeb.Bulk.LiveView do
 
   # An upload's temporary path has no extension; the browser's file name
   # says which type it is.
-  defp read_sheet!(path, entry) do
+  defp read_sheet(path, entry) do
     type = if String.ends_with?(entry.client_name, ".xlsx"), do: :xlsx, else: :csv
-    {:ok, sheet} = AshBulkDurable.read_sheet(path, type: type)
-    sheet
+    AshBulkDurable.read_sheet(path, type: type)
+  end
+
+  # A sheet `read_sheet/2` refuses stays off the page, which says why in
+  # terms the user can fix in the file. Each reason is one whole sentence,
+  # so a translation can order and agree its words as its language needs.
+  defp refuse_sheet(socket, entry, reason) do
+    put_flash(socket, :error, sheet_refusal(reason, entry.client_name))
+  end
+
+  defp sheet_refusal({:duplicate_headers, headers}, name) do
+    ngettext(
+      "Couldn't read %{name}: the header %{headers} is on more than one column. Give each column its own header.",
+      "Couldn't read %{name}: the headers %{headers} are each on more than one column. Give each column its own header.",
+      length(headers),
+      name: name,
+      headers: join_names(headers)
+    )
+  end
+
+  defp sheet_refusal({:extra_cells, row}, name) do
+    gettext(
+      "Couldn't read %{name}: row %{row} has a cell past the last header, often a comma that should be quoted. Quote that cell or name its column.",
+      name: name,
+      row: row
+    )
+  end
+
+  defp sheet_refusal({:too_many_cells, max}, name) do
+    gettext(
+      "Couldn't read %{name}: the sheet is too large, over %{max} cells. Split it into smaller files.",
+      name: name,
+      max: max
+    )
+  end
+
+  # This page reads the first visible sheet, never one by name, so only a
+  # workbook with no visible sheet is refused this way.
+  defp sheet_refusal({:unknown_sheet, 0}, name) do
+    gettext("Couldn't read %{name}: it has no visible sheet to read.", name: name)
+  end
+
+  defp sheet_refusal({:xlsx, _reason}, name), do: unreadable(name)
+  defp sheet_refusal(%NimbleCSV.ParseError{}, name), do: unreadable(name)
+
+  # Anything else, such as the server failing to read its own copy of the
+  # upload, is nothing the user can fix in the file: it is logged, and the
+  # user is asked to try again.
+  defp sheet_refusal(reason, name) do
+    Logger.error("Couldn't read the uploaded sheet #{inspect(name)}: #{inspect(reason)}")
+    gettext("Couldn't read %{name}. Please try again.", name: name)
+  end
+
+  defp unreadable(name) do
+    gettext(
+      "Couldn't read %{name}: it isn't a readable spreadsheet or CSV. Save it as .xlsx or .csv and try again.",
+      name: name
+    )
   end
 
   defp reset_upload(socket) do
