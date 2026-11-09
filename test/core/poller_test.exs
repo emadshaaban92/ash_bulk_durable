@@ -38,6 +38,14 @@ defmodule AshBulkDurable.Core.PollerTest do
     def delete_file(_key, _opts), do: :ok
   end
 
+  defmodule MisconfiguredStorage do
+    @moduledoc "A store that says it lacks its configuration."
+    def check_config(_opts), do: {:error, "no root"}
+    def fetch_file(_key, _path, _opts), do: {:error, :never}
+    def list_files(_prefix, _opts), do: {:ok, []}
+    def delete_file(_key, _opts), do: :ok
+  end
+
   defmodule ExitingResource do
     @moduledoc """
     Stands in for the bulk action resource, exiting as a connection pool's
@@ -106,6 +114,18 @@ defmodule AshBulkDurable.Core.PollerTest do
       assert starts.() == %{fresh.id => 0, stale.id => 1}
       assert %{status: :running, rows_done: 0} = reload(fresh)
       assert %{status: :completed, rows_done: 1} = reload(stale)
+    end
+
+    test "refuses to start when the store says its configuration is wrong" do
+      put_config(:storage, MisconfiguredStorage)
+
+      assert {:error, reason} =
+               start_supervised(
+                 {Poller, poll_interval: :timer.hours(1), staging_sweep_interval: nil}
+               )
+
+      assert inspect(reason) =~ "MisconfiguredStorage"
+      assert inspect(reason) =~ "no root"
     end
 
     test "a :running bulk action never stamped is stale", ctx do

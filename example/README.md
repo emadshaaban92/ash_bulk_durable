@@ -68,9 +68,10 @@ Rename the `ExampleWeb` modules, then:
    all of them working, and `Example.Application` starts the poller.
 
 4. Give `:storage` an adapter that also implements `ExampleWeb.Bulk.Storage`,
-   for presigned uploads and the errors sheet. `LocalStorage` here writes to
-   disk, and `StorageController` honours its signed URLs. Replace both with
-   your object store in production.
+   for presigned uploads and the errors sheet. `LocalStorage` here builds on
+   `AshBulkDurable.Storage.Local` to keep files on disk, and
+   `StorageController` honours its signed URLs. Replace both with your object
+   store on more than one node without a shared volume.
 
 5. Add the `Put` uploader from `assets/js/app.js` to your `LiveSocket`, or use
    your store's own and change the `uploader:` name in `presign_companion/2`.

@@ -197,3 +197,21 @@
   other failure to read the upload is logged, and the user is asked to try
   again. In the retry zone a refused sheet drops a corrected sheet staged
   before it, so "Retry failed rows" goes back to disabled.
+- `AshBulkDurable.Storage.Local` is a `Core.Storage` that keeps staged files
+  on the server's disk under a configured `:root` (or `:root` in each call's
+  opts), for an app on one node or on several sharing a volume. It fetches,
+  deletes and lists, and `put_file/3` stages a file, copied beside its
+  destination and renamed in. Deleting a file removes the directories it
+  leaves empty, up to `:root`, so the sweep's listing doesn't grow with
+  every bulk action staged. A key that could reach outside `:root`
+  (absolute, empty, an empty, `.` or `..` segment, a backslash, a NUL, or
+  invalid UTF-8) is refused with `{:error, :unsafe_key}`, and a missing or
+  empty `:root` raises. `use AshBulkDurable.Storage.Local` delegates the
+  callbacks and `put_file/3`, overridable, for a host module that adds its
+  own functions, and passes the options given to `use` (a `:root`, say) to
+  each of them; the example's `LocalStorage` is one, and its root moves from
+  `config :example, :storage_dir` to the store's `:root`.
+- `Core.Storage` has an optional `check_config/1`, and `Core.Poller`
+  refuses to start when the configured store answers `{:error, message}`,
+  so a node without a disk store's `:root` fails at boot rather than at its
+  first sweep or fetch.

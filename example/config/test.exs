@@ -61,4 +61,5 @@ config :example, :bulk,
     Example.Test.Booking
   ]
 
-config :example, :storage_dir, Path.join(System.tmp_dir!(), "ash_bulk_durable_example_test")
+config :ash_bulk_durable, AshBulkDurable.Storage.Local,
+  root: Path.join(System.tmp_dir!(), "ash_bulk_durable_example_test")

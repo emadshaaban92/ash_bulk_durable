@@ -108,6 +108,13 @@ defmodule AshBulkDurable.Core.Poller do
   wait on the lock anywhere. A bulk action it couldn't mark resumes once its
   hint goes stale, as does one on a node stopped without this shutdown (out
   of memory, `kill -9`), which counts as a crash.
+
+  ## Starting
+
+  It refuses to start when the `:storage` module says its own configuration
+  is wrong (`c:AshBulkDurable.Core.Storage.check_config/1`), so a node
+  without, say, a disk store's `:root` fails at boot rather than at its
+  first sweep.
   """
   use GenServer
 
@@ -115,7 +122,7 @@ defmodule AshBulkDurable.Core.Poller do
   require Logger
 
   alias AshBulkDurable.Core
-  alias AshBulkDurable.Core.{BulkActionLock, Liveness, PurgeStaleStaging, Worker}
+  alias AshBulkDurable.Core.{BulkActionLock, Liveness, PurgeStaleStaging, Storage, Worker}
 
   @poll_interval :timer.seconds(5)
   @max_running 2
@@ -191,6 +198,7 @@ defmodule AshBulkDurable.Core.Poller do
 
   @impl true
   def init(opts) do
+    Storage.check_config!()
     Process.flag(:trap_exit, true)
     {:ok, tasks} = Task.Supervisor.start_link()
 
