@@ -14,27 +14,30 @@ defmodule Example.BulkActions.Owner do
 
   @impl true
   def scope_from_worker_key(user_id, organization_id) when is_binary(user_id) do
-    user = Ash.get!(User, user_id, authorize?: false, load: [:memberships])
-    Scope.new(actor: acting_in(user, organization_id))
+    case Ash.get!(User, user_id, authorize?: false, load: [:memberships], not_found_error?: false) do
+      nil -> {:error, :user_not_found}
+      user -> acting_in(user, organization_id)
+    end
   end
 
   # Policies read the actor's organization and roles, so the tenant alone would
-  # leave them on the organization the user has moved to.
+  # leave them on the organization the user has moved to. One who has left the
+  # organization they submitted from is refused: every row naming no tenant
+  # of its own is written in it whatever the scope says.
   defp acting_in(user, organization_id) do
     memberships = Enum.filter(user.memberships, &(&1.organization_id == organization_id))
 
-    %{
-      user
-      | organization_id: reachable(user, organization_id, memberships),
-        organization_roles: Enum.flat_map(memberships, & &1.roles)
-    }
-  end
-
-  defp reachable(%{platform_roles: roles}, organization_id, memberships) do
-    cond do
-      :super_user in roles -> organization_id
-      memberships == [] -> nil
-      true -> organization_id
+    if is_nil(organization_id) or memberships != [] or :super_user in user.platform_roles do
+      {:ok,
+       Scope.new(
+         actor: %{
+           user
+           | organization_id: organization_id,
+             organization_roles: Enum.flat_map(memberships, & &1.roles)
+         }
+       )}
+    else
+      {:error, :not_a_member}
     end
   end
 end

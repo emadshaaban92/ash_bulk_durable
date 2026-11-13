@@ -82,6 +82,11 @@ defmodule AshBulkDurable.Core.Worker do
     `:mark_finished({:failed, %{reason: :staged_file_download_error, ...}})`.
     Does NOT raise; we want a real terminal state, not a run that fails the
     same way every time it is started.
+  - An owner who can no longer act in the bulk action's tenant
+    (`scope_from_worker_key/2` returned `{:error, reason}`, see
+    `AshBulkDurable.Core.Owner`) → `:mark_finished({:failed, %{reason:
+    :access_revoked, term: inspect(reason)}})` at the start, before any row
+    runs.
   - A resolver's `prepare/2` error for a chunk →
     `:mark_finished({:failed, %{reason: :resolver_prepare_error, ...}})`.
   - All-or-nothing phase 1 failure, or a row its caller already refused →
@@ -620,6 +625,7 @@ defmodule AshBulkDurable.Core.Worker do
   defp drive(bulk_action) do
     case set_up(bulk_action) do
       {:ok, settings, downloaded} -> drive_rows(bulk_action, settings, downloaded)
+      {:access_revoked, reason} -> fail_access_revoked(bulk_action, reason)
       :busy -> :ok
     end
   end
@@ -629,10 +635,16 @@ defmodule AshBulkDurable.Core.Worker do
   # the stall count nor isolation would ever end it: it is counted instead.
   # A kill is not an exception, and is never counted here.
   defp set_up(bulk_action) do
-    settings = Runner.settings(bulk_action, reconstruct_scope(bulk_action), %{})
+    case reconstruct_scope(bulk_action) do
+      {:ok, scope} ->
+        settings = Runner.settings(bulk_action, scope, %{})
 
-    with :ok <- forget_lost_resolutions(bulk_action, settings),
-         do: {:ok, settings, download_staged_files_with_telemetry(bulk_action, settings)}
+        with :ok <- forget_lost_resolutions(bulk_action, settings),
+             do: {:ok, settings, download_staged_files_with_telemetry(bulk_action, settings)}
+
+      {:error, reason} ->
+        {:access_revoked, reason}
+    end
   rescue
     error in RowMovedOnError ->
       reraise error, __STACKTRACE__
@@ -697,6 +709,22 @@ defmodule AshBulkDurable.Core.Worker do
 
   defp failure_detail(%{message: message}), do: ": " <> message
   defp failure_detail(_verdict), do: ""
+
+  # The owner can no longer act in the bulk action's tenant. Every row naming
+  # no tenant of its own writes there whatever the scope says, so no row may
+  # run. Not counted
+  # like `:gone`: the answer comes from the database, not this node's code,
+  # so every node gives it. Its staged files stay, for a retry once the owner
+  # can act there again.
+  defp fail_access_revoked(bulk_action, reason) do
+    Logger.warning(
+      "ash_bulk_durable: bulk action #{bulk_action.id}'s owner can no longer act in its " <>
+        "tenant (#{inspect(reason)}); failing it"
+    )
+
+    finish_locked(bulk_action, {:failed, %{reason: :access_revoked, term: inspect(reason)}})
+    :ok
+  end
 
   defp drive_rows(bulk_action, settings, downloaded) do
     terminal_bulk_action =

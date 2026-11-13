@@ -565,6 +565,12 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
     gettext("The bulk action kept failing before it reached a row, so it was not run again.")
   end
 
+  defp reason_message("access_revoked") do
+    gettext(
+      "You can no longer act in the organization this bulk action was submitted in, so it can't run."
+    )
+  end
+
   defp reason_message("resolver_prepare_error") do
     gettext("The bulk action couldn't be prepared. Please check your data and try again.")
   end

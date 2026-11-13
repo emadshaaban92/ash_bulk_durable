@@ -86,9 +86,11 @@ defmodule ExampleWeb.Bulk.LifecycleTest do
         }
       )
 
+    {:ok, scope} = AshBulkDurable.Core.Owner.scope_from_worker_key(user_id, nil)
+
     {:ok, bulk_action} =
       AshBulkDurable.Sheet.stage(rows, mapping,
-        scope: AshBulkDurable.Core.Owner.scope_from_worker_key(user_id, nil),
+        scope: scope,
         chunk_size: 2
       )
 
