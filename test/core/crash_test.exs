@@ -419,14 +419,95 @@ defmodule AshBulkDurable.Core.CrashTest do
       assert %{status: :running, progress_at_start: 2, setup_failures: 1} = reload(bulk_action)
     end
 
-    test "a kill is never counted, however many", ctx do
+    test "a kill isn't counted, but the stalled starts after it fail it as crashed", ctx do
       bulk_action = submit!(ctx, 2)
       owner(KillingOwner)
 
-      for _start <- 1..5, do: assert(:killed = attempt(bulk_action))
+      # Three stalled starts enter isolation, whose runs die before their
+      # first row too: two more, the attempts a row run alone may take, and
+      # three more, the setup failures allowed, still move none.
+      capture_log(fn ->
+        for stalled <- 0..8 do
+          assert :killed = attempt(bulk_action)
 
-      assert %{status: :running, setup_failures: 0} = reload(bulk_action)
+          assert %{status: :running, stalled_starts: ^stalled, setup_failures: 0} =
+                   reload(bulk_action)
+        end
+      end)
+
+      # The next start fails it, running nothing.
+      log = capture_log(fn -> assert {:ran, :ok} = attempt(bulk_action) end)
+
+      assert log =~
+               "made no progress in its last 9 starts, even running its rows one at a time"
+
+      assert %{
+               status: :failed,
+               stalled_starts: 9,
+               setup_failures: 0,
+               result: %{"reason" => "crashed"}
+             } = failed = reload(bulk_action)
+
       assert statuses(bulk_action) == [:resolved, :resolved]
+      assert attempts(bulk_action) == [0, 0]
+      assert created(ctx) == []
+
+      # A retry, once the cause is fixed, starts the count again.
+      owner(AshBulkDurable.Test.Owner)
+      assert {:ok, _retried} = AshBulkDurable.retry(failed, scope: ctx.scope)
+      assert %{stalled_starts: 0} = reload(bulk_action)
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :completed} = reload(bulk_action)
+    end
+
+    test "the stalled starts it takes follow all three limits", ctx do
+      config(:max_stalled_starts, 1)
+      config(:max_row_attempts, 1)
+      config(:max_setup_failures, 2)
+      bulk_action = submit!(ctx, 2)
+      owner(KillingOwner)
+
+      capture_log(fn ->
+        for _start <- 1..5, do: assert(:killed = attempt(bulk_action))
+        assert %{status: :running, stalled_starts: 4} = reload(bulk_action)
+
+        assert {:ran, :ok} = attempt(bulk_action)
+      end)
+
+      assert %{status: :failed, stalled_starts: 5, result: %{"reason" => "crashed"}} =
+               reload(bulk_action)
+    end
+
+    test "a row that kills its run, with runs dying before any row between, still fails alone",
+         ctx do
+      bulk_action = submit!(ctx, 3, chunk_size: 3)
+      kill_on_row(ctx, 1)
+
+      capture_log(fn ->
+        # Three stalled starts, then isolation: row 1 kills its run, bumped
+        # once.
+        for _start <- 1..4, do: assert(:killed = attempt(bulk_action))
+        assert %{stalled_starts: 3} = reload(bulk_action)
+        assert attempts(bulk_action) == [1, 0, 0]
+
+        # As many runs as may raise in their setup die there instead.
+        owner(KillingOwner)
+        for _start <- 1..3, do: assert(:killed = attempt(bulk_action))
+        owner(AshBulkDurable.Test.Owner)
+
+        # Row 1 kills its run once more...
+        assert :killed = attempt(bulk_action)
+        assert %{status: :running, stalled_starts: 7} = reload(bulk_action)
+        assert attempts(bulk_action) == [2, 0, 0]
+
+        # ...and the next start, the last one the limit allows, fails it
+        # without running it, and runs the rest.
+        assert {:ran, :ok} = attempt(bulk_action)
+      end)
+
+      assert %{stalled_starts: 8} = reload(bulk_action)
+      assert statuses(bulk_action) == [:failed, :succeeded, :succeeded]
+      assert %{status: :completed_with_errors} = reload(bulk_action)
     end
 
     test "one that finds the lock held at its count counts nothing, and still raises", ctx do
@@ -682,6 +763,19 @@ defmodule AshBulkDurable.Core.CrashTest do
   end
 
   defp starts(_bulk_action), do: Process.get(:starts, 0)
+
+  # `key` in the `ash_bulk_durable` config, until the test ends.
+  defp config(key, value) do
+    previous = Application.fetch_env(:ash_bulk_durable, key)
+    Application.put_env(:ash_bulk_durable, key, value)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, previous} -> Application.put_env(:ash_bulk_durable, key, previous)
+        :error -> Application.delete_env(:ash_bulk_durable, key)
+      end
+    end)
+  end
 
   # The owner every run rebuilds its scope with, until the test ends.
   defp owner(module) do

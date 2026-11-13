@@ -118,7 +118,7 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
             <% @bulk_action.status == :failed -> %>
               <div role="alert" class="alert alert-error">
                 <div>
-                  <p>{failure_message(@bulk_action.result)}</p>
+                  <p>{failure_message(@bulk_action)}</p>
                   <p :if={failure_detail(@bulk_action)} class="text-sm opacity-80">
                     {failure_detail(@bulk_action)}
                   </p>
@@ -530,8 +530,16 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
   # Reason-derived copy for a `:failed` bulk action. `result` is JSONB, so its keys
   # are strings (`ApplyMarkFinished` stringifies the `{:failed, %{reason:}}`
   # detail map). `{:failed, term}` bulk actions have no `"reason"` → generic copy.
-  defp failure_message(%{} = result), do: reason_message(result["reason"])
-  defp failure_message(_), do: gettext("The bulk action failed.")
+  # Per row, a bulk action fails as crashed only when its runs keep dying
+  # before they reach a row: the rows it already saved stay.
+  defp failure_message(%{mode: :per_row, result: %{"reason" => "crashed"}}) do
+    gettext(
+      "The bulk action kept stopping before it reached a row, so it was not run again. Rows already saved stay saved."
+    )
+  end
+
+  defp failure_message(%{result: %{} = result}), do: reason_message(result["reason"])
+  defp failure_message(_bulk_action), do: gettext("The bulk action failed.")
 
   defp reason_message("atomic_chunk_rolled_back") do
     gettext(

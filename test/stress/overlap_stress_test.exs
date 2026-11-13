@@ -26,8 +26,8 @@ defmodule AshBulkDurable.OverlapStressTest do
       UPDATE setting `finished_at` records what it finished in that same
       transaction), and an abandon one cancel;
     * no row is left `:pending` or `:resolved` under a verdict, except in an
-      abandoned bulk action and a failed all-or-nothing one, whose rows a
-      rollback leaves as they were;
+      abandoned bulk action and one failed as `:crashed`, whose rows are left
+      as they were;
     * `rows_done` equals the `:succeeded` rows;
     * each row ends as its input says: `:succeeded`, `:failed` with its own
       error, or, for a target that kills its run, `:failed` with
@@ -39,7 +39,10 @@ defmodule AshBulkDurable.OverlapStressTest do
   suspended with their tickers, at least `:max_row_attempts` times while
   each ran it alone (the bulk action's `isolating_row_id` then) may end
   crashed too, and an all-or-nothing bulk action disrupted so
-  `:max_stalled_starts` times in a pass may fail as `:crashed`. The summary
+  `:max_stalled_starts` times in a pass may fail as `:crashed`, as may a
+  per-row one disrupted more than `:max_setup_failures` times, the runs
+  dying before any row that its give-up allows past isolation and the row
+  it kills. The summary
   counts those as excused. A poller's shutdown is no crash, so it excuses
   nothing.
 
@@ -838,6 +841,20 @@ defmodule AshBulkDurable.OverlapStressTest do
     check_outcome(state, ba.mode, record, rows, ba, disruptions)
   end
 
+  # Per row, only chaos can fail it, and only as `:crashed`: enough
+  # stalled starts in a row to give up on it.
+  defp check_outcome(state, :per_row, %{status: :failed} = record, _rows, ba, disruptions) do
+    if record.result["reason"] == "crashed" and disruptions > max_setup_failures(),
+      do: %{state | excused: state.excused + 1},
+      else:
+        violation(
+          state,
+          "a per-row verdict follows its rows",
+          ba,
+          "pass #{record.pass}: failed #{inspect(record.result)} (#{disruptions} disruptions)"
+        )
+  end
+
   defp check_outcome(state, :per_row, record, rows, ba, disruptions) do
     failed? = Enum.any?(rows, &(&1.status == :failed))
     expected = if failed?, do: :completed_with_errors, else: :completed
@@ -1083,6 +1100,9 @@ defmodule AshBulkDurable.OverlapStressTest do
   defp check_open_rows(state, %{status: :cancelled}, _rows, _ba), do: state
   defp check_open_rows(state, %{mode: :all_or_nothing, status: :failed}, _rows, _ba), do: state
 
+  defp check_open_rows(state, %{status: :failed, result: %{"reason" => "crashed"}}, _rows, _ba),
+    do: state
+
   defp check_open_rows(state, record, rows, ba) do
     open = for row <- rows, row.status in [:pending, :resolved], do: "#{row.id} #{row.status}"
 
@@ -1207,6 +1227,7 @@ defmodule AshBulkDurable.OverlapStressTest do
 
   defp max_row_attempts, do: Core.config(:max_row_attempts, 2)
   defp max_stalled_starts, do: Core.config(:max_stalled_starts, 3)
+  defp max_setup_failures, do: Core.config(:max_setup_failures, 3)
 
   defp lockable?(id) do
     {:ok, locked} =
