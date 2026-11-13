@@ -115,6 +115,15 @@
   `reason: :setup_error` and the exception's message. Kills are never
   counted, and progress or a retry clears the count. Before, a per-row one
   was restarted every `:stale_after` forever.
+- A per-row run killed, or exiting, before its first row (out of memory
+  downloading a large staged file, say) no longer restarts forever: a start
+  that brings `stalled_starts` past `:max_stalled_starts` +
+  `:max_row_attempts` + `:max_setup_failures` (8 by default) fails the bulk
+  action with `reason: :crashed`, its rows as they were. Isolation fails a
+  row that keeps killing its run within `:max_row_attempts` starts, so only
+  runs that keep dying before any row get there. Before, kills weren't
+  counted as setup failures and isolation had no row to act on, so it was
+  restarted every `:stale_after` forever.
 - A start that finds its bulk action `:gone` or `:unreadable` counts a setup
   failure too, running nothing, instead of failing it at once, and the
   `:max_setup_failures`th fails it with that reason. Both answers come from

@@ -280,10 +280,22 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanelTest do
     end
 
     test ":failed as crashed says it kept stopping" do
-      html = render_panel(bulk_action(%{status: :failed, result: %{"reason" => "crashed"}}))
+      html =
+        render_panel(
+          bulk_action(%{status: :failed, mode: :all_or_nothing, result: %{"reason" => "crashed"}})
+        )
 
       assert html =~ "kept stopping before it could finish"
+      assert html =~ "No rows were saved"
       assert html =~ "alert-error"
+    end
+
+    test ":failed as crashed per row says it never reached a row, and keeps what it saved" do
+      html = render_panel(bulk_action(%{status: :failed, result: %{"reason" => "crashed"}}))
+
+      assert html =~ "kept stopping before it reached a row"
+      assert html =~ "Rows already saved stay saved"
+      refute html =~ "No rows were saved"
     end
   end
 
