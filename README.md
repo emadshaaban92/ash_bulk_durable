@@ -96,7 +96,11 @@ config :ash_bulk_durable,
 ```
 
 - `AshBulkDurable.Core.Owner` says who a bulk action belongs to, and how the
-  worker acts as them again.
+  worker acts as them again. It refuses (`{:error, reason}`) an owner who can
+  no longer act in the bulk action's tenant, since every row that names no
+  tenant of its own is written there whatever the scope says. It is checked
+  each time a run starts, and fails the bulk action before that run's first
+  row; a run already under way keeps its scope until it ends or restarts.
 - `AshBulkDurable.Core.Storage` fetches, deletes and lists staged files. The
   worker has each staged file written to a temporary file, so a large one is
   never held in memory. `AshBulkDurable.Storage.Local` keeps them on the

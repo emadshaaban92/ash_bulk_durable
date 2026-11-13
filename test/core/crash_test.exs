@@ -76,7 +76,7 @@ defmodule AshBulkDurable.Core.CrashTest do
   end
 
   defmodule RaisingOwner do
-    @moduledoc "The test owner, but its scopes can't be rebuilt: the user is gone."
+    @moduledoc "The test owner, but rebuilding its scopes raises."
     @behaviour AshBulkDurable.Core.Owner
 
     @impl true
@@ -84,6 +84,20 @@ defmodule AshBulkDurable.Core.CrashTest do
 
     @impl true
     def scope_from_worker_key(_key, _tenant), do: raise("the user is gone")
+  end
+
+  defmodule BareScopeOwner do
+    @moduledoc "The test owner, but it returns the scope itself, not `{:ok, scope}`."
+    @behaviour AshBulkDurable.Core.Owner
+
+    @impl true
+    def worker_key(scope), do: AshBulkDurable.Test.Owner.worker_key(scope)
+
+    @impl true
+    def scope_from_worker_key(key, tenant) do
+      {:ok, scope} = AshBulkDurable.Test.Owner.scope_from_worker_key(key, tenant)
+      scope
+    end
   end
 
   defmodule KillingOwner do
@@ -362,7 +376,7 @@ defmodule AshBulkDurable.Core.CrashTest do
   end
 
   describe "a run that raises before its first row" do
-    # The owner's user deleted, a storage that raises: every start raises
+    # The owner's lookup raising, a storage that raises: every start raises
     # again, moving no row, so stalled starts alone would never end it.
     for mode <- [:per_row, :all_or_nothing] do
       test "#{mode}: counted, and failed on the third, the owner free again", ctx do
@@ -417,6 +431,18 @@ defmodule AshBulkDurable.Core.CrashTest do
       capture_log(fn -> assert {%RuntimeError{}, _} = attempt(bulk_action) end)
 
       assert %{status: :running, progress_at_start: 2, setup_failures: 1} = reload(bulk_action)
+    end
+
+    test "an owner returning neither {:ok, _} nor {:error, _} raises, and is counted", ctx do
+      bulk_action = submit!(ctx, 2)
+      owner(BareScopeOwner)
+
+      capture_log(fn ->
+        assert {%ArgumentError{message: message}, _} = attempt(bulk_action)
+        assert message =~ "must return {:ok, scope} or {:error, reason}"
+      end)
+
+      assert %{status: :running, setup_failures: 1} = reload(bulk_action)
     end
 
     test "a kill is never counted, however many", ctx do

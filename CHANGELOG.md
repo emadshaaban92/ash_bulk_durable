@@ -237,3 +237,11 @@
 - `PurgeStaleStaging.sweep/0` logs a warning when the store fails to list
   the staging prefix, instead of returning without a word, so a sweep that
   reclaims nothing says why.
+- Breaking: `Core.Owner.scope_from_worker_key/2` returns `{:ok, scope}` or
+  `{:error, reason}`, and any other return raises, counted as a setup error.
+  `{:error, reason}` refuses an owner who can no longer act in the bulk
+  action's tenant: the run that gets it, at its start, fails the bulk action
+  `{:failed, %{reason: :access_revoked, term: inspect(reason)}}` before any
+  row runs, not counted toward `:max_setup_failures`, its staged files kept
+  for a retry. The check runs each time a run starts, so a run already under
+  way keeps its scope until it ends or restarts.
