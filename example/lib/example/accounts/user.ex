@@ -62,6 +62,7 @@ defmodule Example.Accounts.User do
       primary? true
       require_atomic? false
       accept [:name, :email, :phone, :platform_roles, :organization_id, :organization_roles]
+      validate Example.Accounts.MemberOfOrganization
     end
 
     update :update_profile do
@@ -78,6 +79,7 @@ defmodule Example.Accounts.User do
       require_atomic? false
       argument :organization_id, :uuid, allow_nil?: false
       change set_attribute(:organization_id, arg(:organization_id))
+      validate Example.Accounts.MemberOfOrganization
     end
   end
 

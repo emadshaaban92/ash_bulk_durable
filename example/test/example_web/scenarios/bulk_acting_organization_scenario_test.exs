@@ -106,7 +106,7 @@ defmodule ExampleWeb.Scenarios.BulkActingOrganizationScenarioTest do
              context.elsewhere.name
   end
 
-  test "an owner who has left the organization no longer acts in it",
+  test "an owner who has left the organization fails the bulk action, writing nothing",
        %{conn: conn, super_user: super_user, organization: organization, other: other} = context do
     owner =
       RoleTestHelpers.create_user_with_organization_roles(super_user, [
@@ -126,16 +126,21 @@ defmodule ExampleWeb.Scenarios.BulkActingOrganizationScenarioTest do
 
     assert 1 = Worker.drain()
 
+    assert %{status: :failed, result: %{"reason" => "access_revoked"}} =
+             bulk_action =
+             BulkAction
+             |> Ash.Query.filter(user_id == ^owner.id)
+             |> Ash.read_one!(authorize?: false)
+
     session
-    |> visit(~p"/bulk")
-    |> assert_has("*", text: "0 of 2 rows done", timeout: 2000)
+    |> visit(~p"/bulk?bulk_action=#{bulk_action.id}")
+    |> assert_has("*",
+      text: "You can no longer act in the organization this bulk action was submitted in",
+      timeout: 2000
+    )
 
     assert Ash.reload!(context.here, actor: super_user, authorize?: false).name ==
              context.here.name
-
-    # Refused by the read, not only the write: they no longer see its people.
-    assert errors_sheet(owner) =~
-             ~s(no result in User matches Email = ""#{context.here.email}""",#{context.here.email})
   end
 
   test "a super user acting in no organization keeps reaching every one after switching",

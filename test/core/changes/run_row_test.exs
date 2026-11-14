@@ -52,7 +52,7 @@ defmodule AshBulkDurable.Core.Changes.RunRowTest do
   # Mirrors how the worker builds the bulk action's settings and hands them
   # to the :run action via context.
   defp context_for(bulk_action) do
-    scope =
+    {:ok, scope} =
       AshBulkDurable.Core.Owner.scope_from_worker_key(bulk_action.user_id, bulk_action.tenant)
 
     settings = AshBulkDurable.Core.Runner.settings(bulk_action, scope, %{})
