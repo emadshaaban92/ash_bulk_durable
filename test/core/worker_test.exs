@@ -331,6 +331,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
   defp create_bulk_action!(rows, opts) do
     attrs = %{
       user_id: opts[:user_id],
+      tenant: opts[:tenant],
       resource_name: @region_resource_name,
       action_name: :create,
       action_type: :create,
@@ -1407,6 +1408,92 @@ defmodule AshBulkDurable.Core.WorkerTest do
       # Nothing was resolved, let alone written.
       assert Enum.map(list_rows(bulk_action.id), & &1.status) == [:pending, :pending, :failed]
       assert regions_from(suffix, user) == []
+    end
+  end
+
+  # Every row is written in the bulk action's tenant, whatever scope the owner
+  # rebuilds, so only the owner refusing it keeps out someone who left.
+  describe "an owner who can no longer act in its tenant" do
+    setup do
+      organization = AshBulkDurable.Test.RoleTestHelpers.create_organization(nil)
+
+      admin =
+        nil
+        |> AshBulkDurable.Test.RoleTestHelpers.create_user_with_platform_role(:platform_admin)
+        |> Ash.update!(%{organization_id: organization.id}, authorize?: false)
+
+      join!(admin, organization)
+      %{organization: organization, admin: admin}
+    end
+
+    defp join!(user, organization) do
+      Ash.create!(AshBulkDurable.Test.Membership, %{
+        user_id: user.id,
+        organization_id: organization.id
+      })
+    end
+
+    defp leave!(user, organization) do
+      AshBulkDurable.Test.Repo.query!(
+        "DELETE FROM memberships WHERE user_id = $1 AND organization_id = $2",
+        [Ecto.UUID.dump!(user.id), Ecto.UUID.dump!(organization.id)]
+      )
+    end
+
+    for mode <- [:per_row, :all_or_nothing] do
+      test "#{mode}: fails it at its start, writing nothing; a retry once back runs it", ctx do
+        suffix = System.unique_integer([:positive])
+
+        bulk_action =
+          create_bulk_action!(region_rows(2, suffix),
+            user_id: ctx.admin.id,
+            tenant: ctx.organization.id,
+            chunk_size: 2,
+            mode: unquote(mode)
+          )
+
+        leave!(ctx.admin, ctx.organization)
+
+        assert capture_log(fn -> assert :ok = Worker.run_now(bulk_action.id) end) =~
+                 "can no longer act in its tenant (:not_a_member)"
+
+        assert %{
+                 status: :failed,
+                 setup_failures: 0,
+                 result: %{"reason" => "access_revoked", "term" => ":not_a_member"}
+               } = failed = reload(bulk_action)
+
+        assert Enum.map(list_rows(bulk_action.id), & &1.status) == [:resolved, :resolved]
+        assert regions_from(suffix, ctx.super_user) == []
+
+        join!(ctx.admin, ctx.organization)
+
+        assert {:ok, _retried} =
+                 AshBulkDurable.retry(failed,
+                   scope: AshBulkDurable.Test.Scope.new(actor: ctx.admin)
+                 )
+
+        assert :ok = Worker.run_now(bulk_action.id)
+        assert %{status: :completed} = reload(bulk_action)
+        assert length(regions_from(suffix, ctx.super_user)) == 2
+      end
+    end
+
+    test "a user who no longer exists fails it too", ctx do
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(1, suffix), user_id: Ecto.UUID.generate(), chunk_size: 2)
+
+      capture_log(fn -> assert :ok = Worker.run_now(bulk_action.id) end)
+
+      assert %{
+               status: :failed,
+               result: %{"reason" => "access_revoked", "term" => ":user_not_found"}
+             } =
+               reload(bulk_action)
+
+      assert regions_from(suffix, ctx.super_user) == []
     end
   end
 
