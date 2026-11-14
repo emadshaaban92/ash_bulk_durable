@@ -184,6 +184,17 @@ defmodule AshBulkDurable.Core.Worker do
     not run again: it fails with `AshBulkDurable.Core.CrashedRowError`,
     under the lock and only while it is still in the status it was read in,
     and the rest runs on. The bulk action ends `:completed_with_errors`.
+  - **Giving up on a bulk action.** In isolation, the row a run dies on is
+    the one the next start runs alone first, so the `:max_row_attempts`th
+    start after the one that entered isolation fails that row, and makes
+    progress. Runs that die before reaching any row, killed or exiting in
+    their setup (out of memory downloading a staged file, say), move no row
+    and bump none, so nothing else ends them. A per-row start that brings
+    `stalled_starts` past `:max_stalled_starts` + `:max_row_attempts` +
+    `:max_setup_failures` (8 by default) fails the bulk action, `{:failed,
+    %{reason: :crashed}}`, its rows as they were, as all or nothing does on
+    stalling out. Past isolation and a row's attempts, that allows as many
+    runs to die before their first row as may raise there.
   - **A shutdown is not a crash.** A run the poller kills once its
     `:shutdown_grace` is over gets `shutdown_stopped` set (see
     `AshBulkDurable.Core.Poller`). The next start clears it without counting
@@ -200,9 +211,10 @@ defmodule AshBulkDurable.Core.Worker do
     `:max_setup_failures` fails the bulk action, `{:failed, %{reason:
     :setup_error}}`. Only exceptions count: a run killed in its setup (the
     stress test's chaos, a shutdown, a node lost) adds nothing, and nor
-    does an exit, such as a `GenServer.call` timeout in a storage client.
-    Only a start whose score rose sets it back to 0: one whose setup
-    succeeds but that makes no progress leaves it as it is.
+    does an exit, such as a `GenServer.call` timeout in a storage client:
+    runs that keep dying so are given up on once their stalled starts pass
+    the limit above. Only a start whose score rose sets it back to 0: one
+    whose setup succeeds but that makes no progress leaves it as it is.
   - **Unrunnable here.** A start that finds the bulk action `:gone` or
     `:unreadable` on its node runs nothing and counts a setup failure too,
     without raising, its start's liveness hint left to go stale, so the
@@ -217,7 +229,8 @@ defmodule AshBulkDurable.Core.Worker do
   `[:ash_bulk_durable, :isolation, :start]` (measurements `stalled_starts`;
   metadata `bulk_action_id`, `mode`); failing a row as crashed logs an error
   and emits `[:ash_bulk_durable, :row, :crashed]` (measurements `attempts`;
-  metadata `bulk_action_id`, `row_id`, `row_index`).
+  metadata `bulk_action_id`, `row_id`, `row_index`). Giving up on a per-row
+  bulk action logs an error.
 
   In the `ash_bulk_durable` config:
 
@@ -227,6 +240,9 @@ defmodule AshBulkDurable.Core.Worker do
       as crashed, 2 by default.
     * `:max_setup_failures` - starts that raise before reaching a row, with
       no progress between, before the bulk action fails, 3 by default.
+
+  Together they bound a per-row bulk action's stalled starts: the start
+  that brings them past the sum of all three fails it as crashed.
 
   ## Telemetry
 
@@ -452,6 +468,7 @@ defmodule AshBulkDurable.Core.Worker do
   # with it however it ends.
   defp run_started({:ok, running}) do
     if entered_isolation?(running), do: announce_isolation(running)
+    if running.mode == :per_row and given_up?(running), do: announce_giving_up(running)
 
     cond do
       terminal?(running.status) -> :ok
@@ -501,7 +518,7 @@ defmodule AshBulkDurable.Core.Worker do
         isolating_row_id: nil
       })
 
-    if counted.mode == :all_or_nothing and stalled_out?(counted),
+    if given_up?(counted),
       do: mark_finished(counted, {:failed, %{reason: :crashed}}),
       else: counted
   end
@@ -576,6 +593,24 @@ defmodule AshBulkDurable.Core.Worker do
   # Per row only: all or nothing fails instead.
   defp isolating?(bulk_action), do: bulk_action.mode == :per_row and stalled_out?(bulk_action)
 
+  # All or nothing has no row to run alone, so it fails once it stalls out.
+  # Per row, each run alone that dies on a row brings that row closer to
+  # failing as crashed, which is progress: in isolation, a row that keeps
+  # killing its run is failed by the `:max_row_attempts`th start after the
+  # one that entered it. Runs that die before reaching any row (killed in
+  # their setup, say) bump nothing, so past that the stretch is given up on
+  # after as many of them as `:max_setup_failures` lets raise there.
+  defp given_up?(%{mode: :all_or_nothing} = bulk_action), do: stalled_out?(bulk_action)
+
+  defp given_up?(bulk_action) do
+    limit =
+      AshBulkDurable.Core.config(:max_stalled_starts, 3) +
+        AshBulkDurable.Core.config(:max_row_attempts, 2) +
+        AshBulkDurable.Core.config(:max_setup_failures, 3)
+
+    bulk_action.stalled_starts > limit
+  end
+
   defp announce_isolation(bulk_action) do
     what =
       if bulk_action.mode == :per_row,
@@ -591,6 +626,14 @@ defmodule AshBulkDurable.Core.Worker do
       [:ash_bulk_durable, :isolation, :start],
       %{system_time: System.system_time(), stalled_starts: bulk_action.stalled_starts},
       %{bulk_action_id: bulk_action.id, mode: bulk_action.mode}
+    )
+  end
+
+  defp announce_giving_up(bulk_action) do
+    Logger.error(
+      "ash_bulk_durable: bulk action #{bulk_action.id} made no progress in its last " <>
+        "#{bulk_action.stalled_starts} starts, even running its rows one at a time: its " <>
+        "runs die before reaching a row; failing it"
     )
   end
 
