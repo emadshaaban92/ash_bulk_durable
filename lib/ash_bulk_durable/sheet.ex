@@ -60,6 +60,8 @@ defmodule AshBulkDurable.Sheet do
   defstruct headers: [], rows: []
 
   @max_cells 5_000_000
+  @csv_chunk_bytes 65_536
+  @parse_error_chars 200
 
   @doc """
   Reads the CSV or XLSX at `path`. The type is `path`'s extension unless
@@ -71,11 +73,17 @@ defmodule AshBulkDurable.Sheet do
   (`AshBulkDurable.Sheet.ExcelReader.Calamine` by default), which reads each
   cell as the string a CSV of the same sheet would hold. `:sheet` names the
   sheet to read, by name (hidden or not) or 0-based index among the visible
-  sheets; the first visible sheet by default. `:max_cells` caps the cells
-  the reader builds, #{@max_cells} by default. A sheet over the cap returns
-  `{:error, {:too_many_cells, max_cells}}`, a sheet the file lacks
+  sheets; the first visible sheet by default. A sheet the file lacks returns
   `{:error, {:unknown_sheet, sheet}}`, and a file the reader cannot read
   `{:error, {:xlsx, reason}}`.
+
+  `:max_cells` caps the cells either type reads, #{@max_cells} by default:
+  an XLSX's whole rectangle from A1, a CSV's cells on every line, a blank
+  line being one. A sheet over the cap returns `{:error, {:too_many_cells,
+  max_cells}}`. A CSV is read a chunk at a time and its cells counted row
+  by row, so one over the cap is refused without being read whole. A row is
+  parsed whole before it is counted, and the cap bounds cells, not bytes,
+  so a host still limits the size of an upload.
 
   Either type is refused, rather than read with cells lost, when two
   columns share a header, `{:error, {:duplicate_headers, headers}}` (blank
@@ -89,7 +97,7 @@ defmodule AshBulkDurable.Sheet do
   def read(path, opts \\ []) do
     case Keyword.get_lazy(opts, :type, fn -> type(path) end) do
       :csv ->
-        path |> File.read!() |> strip_bom() |> CSV.parse_string(skip_headers: false) |> build()
+        read_csv(path, Keyword.get(opts, :max_cells, @max_cells))
 
       :xlsx ->
         read_xlsx(path, opts)
@@ -98,7 +106,16 @@ defmodule AshBulkDurable.Sheet do
         {:error, {:unknown_type, other}}
     end
   rescue
-    error in [File.Error, NimbleCSV.ParseError] -> {:error, error}
+    error in File.Error -> {:error, error}
+    error in NimbleCSV.ParseError -> {:error, %{error | message: bounded(error.message)}}
+  end
+
+  # NimbleCSV quotes the row it refuses, which may be most of the file.
+  defp bounded(message) do
+    case String.slice(message, 0, @parse_error_chars) do
+      ^message -> message
+      start -> start <> "…"
+    end
   end
 
   defp type(path) do
@@ -106,6 +123,27 @@ defmodule AshBulkDurable.Sheet do
       ".xlsx" -> :xlsx
       ".csv" -> :csv
       other -> other
+    end
+  end
+
+  # Streamed a chunk at a time and its cells counted row by row as NimbleCSV
+  # parses them, so the file is never read whole, and the rows are refused
+  # once they pass the cap. Halting here leaves the parser between rows.
+  defp read_csv(path, max_cells) do
+    path
+    |> File.stream!(@csv_chunk_bytes)
+    |> Stream.transform(true, fn chunk, first? ->
+      {[if(first?, do: strip_bom(chunk), else: chunk)], false}
+    end)
+    |> CSV.to_line_stream()
+    |> CSV.parse_stream(skip_headers: false)
+    |> Enum.reduce_while({[], 0}, fn row, {rows, cells} ->
+      cells = cells + length(row)
+      if cells > max_cells, do: {:halt, :too_many_cells}, else: {:cont, {[row | rows], cells}}
+    end)
+    |> case do
+      :too_many_cells -> {:error, {:too_many_cells, max_cells}}
+      {rows, _cells} -> rows |> Enum.reverse() |> build()
     end
   end
 
@@ -262,6 +300,7 @@ defmodule AshBulkDurable.Sheet do
     Mapping.identified!(mapping)
 
     with :ok <- Companions.check(mapping, companions, Owner.worker_key(scope)),
+         rows = Core.take_rows(rows),
          {:ok, rows} <- Mapping.rows(mapping, rows, %PrepareContext{scope: scope, tenant: tenant}) do
       Core.create(
         mapping.resource,
