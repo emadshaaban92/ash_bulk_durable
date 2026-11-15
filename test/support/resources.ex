@@ -44,6 +44,18 @@ defmodule AshBulkDurable.Test.Region do
       get? true
       filter expr(code == ^arg(:code))
     end
+
+    # A create with a side effect outside the database, such as an email,
+    # counted by `AshBulkDurable.Test.SideEffects`, which a native name of
+    # "refused" fails.
+    create :create_counted do
+      validate attribute_does_not_equal(:native_name, "refused")
+
+      change after_action(fn _changeset, region, _context ->
+               AshBulkDurable.Test.SideEffects.ran(region.code)
+               {:ok, region}
+             end)
+    end
   end
 
   policies do

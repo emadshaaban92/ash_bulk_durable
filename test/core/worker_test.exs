@@ -149,6 +149,44 @@ defmodule AshBulkDurable.Core.WorkerTest do
     def finish(nil), do: :ok
   end
 
+  defmodule GateResolver do
+    @moduledoc """
+    Resolves a value to itself once `:test_gate` rows are resolving at once,
+    or a second has passed, and keeps the most it saw at once, so a test can
+    tell how many rows phase 1 resolves together. Kept in an ETS table the
+    test owns, since phase 1 resolves in its own tasks.
+    """
+    @behaviour AshBulkDurable.Core.Resolver
+
+    @impl true
+    def prepare(_args, _context), do: {:ok, nil}
+
+    @impl true
+    def resolve(value, nil, _context) do
+      table = Application.fetch_env!(:ash_bulk_durable, :test_gate)
+      at_once = :ets.update_counter(table, :at_once, 1)
+      :ets.select_replace(table, [{{:most, :"$1"}, [{:<, :"$1", at_once}], [{{:most, at_once}}]}])
+      gate = :ets.update_counter(table, :arrived, 1)
+      await(table, gate, System.monotonic_time(:millisecond) + 1000)
+      :ets.update_counter(table, :at_once, -1)
+      {:ok, value}
+    end
+
+    @impl true
+    def finish(nil), do: :ok
+
+    # The first `:width` rows to arrive wait for each other; the rest pass.
+    defp await(table, arrived, deadline) do
+      [{:width, width}] = :ets.lookup(table, :width)
+      [{:arrived, now}] = :ets.lookup(table, :arrived)
+
+      if now < width and arrived <= width and System.monotonic_time(:millisecond) < deadline do
+        Process.sleep(1)
+        await(table, arrived, deadline)
+      end
+    end
+  end
+
   defmodule NoMatchResolver do
     @moduledoc "Finds nothing for any reference, as the callback allows."
     @behaviour AshBulkDurable.Core.Resolver
@@ -166,16 +204,16 @@ defmodule AshBulkDurable.Core.WorkerTest do
   defmodule MovingResolver do
     @moduledoc """
     Resolves a value to itself, and the first time it resolves after
-    `hook/1`, runs the hook first, given the resolver context: a test steps
-    in as another run between this run reading its `:pending` rows and
-    flipping them. Kept in `:persistent_term`, since phase 1 resolves in its
-    own tasks.
+    `hook/2` (the value `only` names, given one), runs the hook first, given
+    the resolver context: a test steps in as another run between this run
+    reading its `:pending` rows and flipping them. Kept in
+    `:persistent_term`, since phase 1 resolves in its own tasks.
     """
     @behaviour AshBulkDurable.Core.Resolver
 
     @key {__MODULE__, :hook}
 
-    def hook(fun), do: :persistent_term.put(@key, fun)
+    def hook(fun, only \\ nil), do: :persistent_term.put(@key, {fun, only})
     def clear, do: :persistent_term.erase(@key)
 
     @impl true
@@ -184,7 +222,8 @@ defmodule AshBulkDurable.Core.WorkerTest do
     @impl true
     def resolve(value, nil, context) do
       # `erase/1` is true for one caller only.
-      with fun when is_function(fun, 1) <- :persistent_term.get(@key, nil),
+      with {fun, only} <- :persistent_term.get(@key, nil),
+           true <- only in [nil, value],
            true <- :persistent_term.erase(@key),
            do: fun.(context)
 
@@ -891,6 +930,30 @@ defmodule AshBulkDurable.Core.WorkerTest do
     end
   end
 
+  describe "phase 1 at its default concurrency" do
+    test "resolves 4 rows at once, each value landing on its own row", %{super_user: user} do
+      put_config(:phase1_concurrency, 4)
+      table = :ets.new(:gate, [:public, :set])
+      :ets.insert(table, [{:width, 4}, {:at_once, 0}, {:most, 0}, {:arrived, 0}])
+      put_config(:test_gate, table)
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(10, suffix, GateResolver),
+          user_id: user.id,
+          chunk_size: 10
+        )
+
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      assert [{:most, 4}] = :ets.lookup(table, :most)
+      assert %{status: :completed, rows_done: 10} = reload(bulk_action)
+
+      assert suffix |> regions_from(user) |> Enum.map(&{&1.name, &1.native_name}) |> Enum.sort() ==
+               Enum.sort(for i <- 1..10, do: {"Region #{i}", "Region AR #{i}"})
+    end
+  end
+
   describe "phase 1 failure (best-effort)" do
     test "row 2's reference can't be resolved → row 2 :failed, rest :succeeded, bulk action :completed_with_errors",
          %{super_user: user} do
@@ -920,6 +983,10 @@ defmodule AshBulkDurable.Core.WorkerTest do
     end
 
     test "atomic-mode phase 1 failure halts before any chunk runs", %{super_user: user} do
+      # One row at a time: the halt kills the rows still resolving, and one
+      # killed mid-write takes the sandbox's shared connection with it. Off
+      # the sandbox, the pool only replaces that connection.
+      put_config(:phase1_concurrency, 1)
       put_poison("Region AR 2")
 
       suffix = System.unique_integer([:positive])
@@ -1790,9 +1857,9 @@ defmodule AshBulkDurable.Core.WorkerTest do
   # are in `AshBulkDurable.Core.WorkerLockTest`: a write that survives the
   # run's rollback needs a connection of its own.
   describe "a row moved on under another run" do
-    defp move_in_resolve(fun) do
+    defp move_in_resolve(fun, only \\ nil) do
       on_exit(&MovingResolver.clear/0)
-      MovingResolver.hook(fun)
+      MovingResolver.hook(fun, only)
     end
 
     # The bulk action as this run's start left it: no verdict.
@@ -1842,9 +1909,11 @@ defmodule AshBulkDurable.Core.WorkerTest do
 
       [row | _] = list_rows(bulk_action.id)
 
-      move_in_resolve(fn _context ->
-        Ash.Seed.update!(row, %{status: :failed, error: "other run"})
-      end)
+      # In row 1's own resolve: phase 1 resolves rows at once, in no order.
+      move_in_resolve(
+        fn _context -> Ash.Seed.update!(row, %{status: :failed, error: "other run"}) end,
+        "Region AR 1"
+      )
 
       assert {:stopped, :row_moved_on} = Worker.run_now(bulk_action.id)
 
@@ -1853,6 +1922,154 @@ defmodule AshBulkDurable.Core.WorkerTest do
       assert [%{message: "other run"}] = r1.error
       assert r2.status in [:pending, :resolved]
       assert_no_verdict(bulk_action)
+      assert regions_from(suffix, user) == []
+    end
+
+    # Another run's phase 1 failed row 1 after this run started, and before
+    # it read its `:pending` rows, so this run never meets row 1.
+    test "phase 1, all or nothing: a row another run failed before this run read it fails it whole",
+         %{super_user: user} do
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(2, suffix, AshBulkDurable.EchoResolver),
+          user_id: user.id,
+          chunk_size: 2,
+          mode: :all_or_nothing
+        )
+
+      [row | _] = list_rows(bulk_action.id)
+      handler = "fail-row-1-#{suffix}"
+
+      :telemetry.attach(
+        handler,
+        [:ash_bulk_durable, :phase1, :start],
+        fn _event, _measurements, _metadata, _config ->
+          :telemetry.detach(handler)
+          Ash.Seed.update!(row, %{status: :failed, error: "other run"})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      assert %{status: :failed, rows_done: 0, result: %{"reason" => "atomic_phase1_failed"}} =
+               reload(bulk_action)
+
+      assert regions_from(suffix, user) == []
+    end
+
+    # Another run's start put row 1 back to `:pending` after this run's phase
+    # 1, as it does with a resolution it lost, and before this run's chunk.
+    test "phase 1, all or nothing: a row another run put back to :pending stops the run before it writes",
+         %{super_user: user} do
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(3, suffix, PoisonResolver),
+          user_id: user.id,
+          chunk_size: 3,
+          mode: :all_or_nothing
+        )
+
+      [row | _] = list_rows(bulk_action.id)
+      handler = "forget-row-1-#{suffix}"
+
+      :telemetry.attach(
+        handler,
+        [:ash_bulk_durable, :phase1, :stop],
+        fn _event, _measurements, _metadata, _config ->
+          :telemetry.detach(handler)
+
+          Row
+          |> Ash.get!(row.id, authorize?: false)
+          |> Ash.update!(%{names: ["native_name"]},
+            action: :forget_resolutions,
+            authorize?: false
+          )
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :running, rows_done: 0} = reload(bulk_action)
+      assert [:pending, :resolved, :resolved] = Enum.map(list_rows(bulk_action.id), & &1.status)
+      assert regions_from(suffix, user) == []
+
+      # Resolved again, row 1 fails, and so does the bulk action, whole.
+      put_poison("Region AR 1")
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      assert %{status: :failed, rows_done: 0, result: %{"reason" => "atomic_phase1_failed"}} =
+               reload(bulk_action)
+
+      assert regions_from(suffix, user) == []
+    end
+
+    # Row 1 is back at `:pending` when this run takes the lock for its chunk,
+    # and another run's phase 1 fails it right after this run's first look
+    # at the rows' statuses under the lock.
+    test "phase 1, all or nothing: a row failed between the chunk's looks under the lock writes nothing",
+         %{super_user: user} do
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(3, suffix, AshBulkDurable.EchoResolver),
+          user_id: user.id,
+          chunk_size: 3,
+          mode: :all_or_nothing
+        )
+
+      [row | _] = list_rows(bulk_action.id)
+      forget = "forget-row-1-#{suffix}"
+      fail = "fail-row-1-#{suffix}"
+
+      fail_row_1 = fn _event, _measurements, %{query: query, params: params}, _config ->
+        if query =~ "LIMIT" and Enum.any?(params, &(&1 in ["pending", "failed"])) do
+          :telemetry.detach(fail)
+
+          Row
+          |> Ash.get!(row.id, authorize?: false)
+          |> Ash.Seed.update!(%{status: :failed, error: "other run"})
+        end
+      end
+
+      :telemetry.attach(
+        forget,
+        [:ash_bulk_durable, :phase1, :stop],
+        fn _event, _measurements, _metadata, _config ->
+          :telemetry.detach(forget)
+
+          Row
+          |> Ash.get!(row.id, authorize?: false)
+          |> Ash.update!(%{names: ["native_name"]},
+            action: :forget_resolutions,
+            authorize?: false
+          )
+
+          :telemetry.attach(fail, [:ash_bulk_durable, :test, :repo, :query], fail_row_1, nil)
+        end,
+        nil
+      )
+
+      on_exit(fn ->
+        :telemetry.detach(forget)
+        :telemetry.detach(fail)
+      end)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :running, rows_done: 0} = reload(bulk_action)
+      assert regions_from(suffix, user) == []
+
+      assert :ok = Worker.run_now(bulk_action.id)
+
+      assert %{status: :failed, rows_done: 0, result: %{"reason" => "atomic_phase1_failed"}} =
+               reload(bulk_action)
+
       assert regions_from(suffix, user) == []
     end
 

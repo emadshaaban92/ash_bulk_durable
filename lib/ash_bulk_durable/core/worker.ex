@@ -94,8 +94,11 @@ defmodule AshBulkDurable.Core.Worker do
     its rows earned. See "Asking the owner again" below.
   - A resolver's `prepare/2` error for a chunk →
     `:mark_finished({:failed, %{reason: :resolver_prepare_error, ...}})`.
-  - All-or-nothing phase 1 failure, or a row its caller already refused →
-    `:mark_finished({:failed, %{reason: :atomic_phase1_failed, ...}})`.
+  - All-or-nothing phase 1 failure, a row its caller already refused, or a
+    row another run's phase 1 failed, found under the lock before the chunk
+    → `:mark_finished({:failed, %{reason: :atomic_phase1_failed, ...}})`.
+    A row another run put back to `:pending`, found there too, stops the
+    run before it writes.
   - All-or-nothing chunk rollback → `:mark_finished({:failed, %{reason:
     :atomic_chunk_rolled_back, ...}})`.
   - Per-row chunk rollback → recovery, halving the chunk's rows (rows
@@ -896,15 +899,18 @@ defmodule AshBulkDurable.Core.Worker do
 
   # A row its caller refused before it was stored fails an all-or-nothing
   # bulk action before anything is resolved or written.
-  defp refused_row(%{mode: :all_or_nothing} = bulk_action) do
+  defp refused_row(bulk_action, pin \\ & &1)
+
+  defp refused_row(%{mode: :all_or_nothing} = bulk_action, pin) do
     row_resource()
     |> Ash.Query.filter(bulk_action_id == ^bulk_action.id and status == :failed)
     |> Ash.Query.sort(row_index: :asc)
     |> Ash.Query.limit(1)
+    |> pin.()
     |> Ash.read_one!(authorize?: false)
   end
 
-  defp refused_row(_bulk_action), do: nil
+  defp refused_row(_bulk_action, _pin), do: nil
 
   # ── Bulk action loading + scope rebuild ─────────────────────────────────────────
 
@@ -1511,7 +1517,33 @@ defmodule AshBulkDurable.Core.Worker do
     end
   end
 
-  defp write_chunk(locked, settings, chunk_index) do
+  # All or nothing writes only when every row is `:resolved`, as this chunk
+  # reads only those and would write them alone. A row another run put back
+  # to `:pending` (`forget_lost_resolutions/2`) stops this run, writing
+  # nothing: that run resolves it and writes the verdict, or the next start
+  # does. Looked for first, under the lock: phase 1 moves a `:pending` row
+  # without it, so until none is `:pending` a row can still fail between two
+  # reads. With none, no row can move: putting one back needs the lock. A
+  # row failed since the start's look (`refused_row/1`), by another run's
+  # phase 1, then fails it whole.
+  defp write_chunk(%{mode: :all_or_nothing} = locked, settings, chunk_index) do
+    cond do
+      pending_row?(locked) ->
+        {:done, nil}
+
+      row = refused_row(locked, &BulkActionLock.pin/1) ->
+        detail = atomic_failure_detail(:atomic_phase1_failed, row.error, row.row_index)
+        {:done, mark_finished(locked, {:failed, detail})}
+
+      true ->
+        write_resolved_chunk(locked, settings, chunk_index)
+    end
+  end
+
+  defp write_chunk(locked, settings, chunk_index),
+    do: write_resolved_chunk(locked, settings, chunk_index)
+
+  defp write_resolved_chunk(locked, settings, chunk_index) do
     case next_resolved_rows(locked, rows_per_chunk(locked)) do
       [] ->
         {:done, unless(rows_left?(locked), do: finalize_bulk_action(locked, 0))}
@@ -1549,6 +1581,13 @@ defmodule AshBulkDurable.Core.Worker do
   defp rows_left?(locked) do
     row_resource()
     |> Ash.Query.filter(bulk_action_id == ^locked.id and status in [:pending, :resolved])
+    |> BulkActionLock.pin()
+    |> Ash.exists?(authorize?: false)
+  end
+
+  defp pending_row?(locked) do
+    row_resource()
+    |> Ash.Query.filter(bulk_action_id == ^locked.id and status == :pending)
     |> BulkActionLock.pin()
     |> Ash.exists?(authorize?: false)
   end

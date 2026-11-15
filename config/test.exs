@@ -11,7 +11,7 @@ config :ash_bulk_durable,
   storage: Test.Storage,
   pubsub_module: Test.PubSub,
   field_handlers: [Test.FilesHandler],
-  phase1_concurrency: 1,
+  phase1_concurrency: 4,
   # Tests run bulk actions with `Worker.run_now/1` and `Worker.drain/0`,
   # or start a poller of their own.
   warn_without_poller: false

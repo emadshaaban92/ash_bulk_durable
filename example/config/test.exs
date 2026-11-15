@@ -43,6 +43,9 @@ config :phoenix,
 # Tests run bulk actions with `Worker.run_now/1` and `Worker.drain/0`.
 config :example, poller?: false
 
+# One row at a time: an all-or-nothing phase 1 that fails kills the rows
+# still resolving, and a task killed mid-write takes the sandbox connection
+# its async test shares with it. The files scenario runs phase 1 at 4.
 config :ash_bulk_durable, phase1_concurrency: 1, warn_without_poller: false
 
 config :ash, warn_on_transaction_hooks?: false

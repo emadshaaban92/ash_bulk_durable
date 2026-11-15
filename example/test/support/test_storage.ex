@@ -105,3 +105,51 @@ defmodule Example.Test.SlowStorage do
   defdelegate presigned_get_url(key, opts), to: TestStorage
   defdelegate upload(key, path, opts), to: TestStorage
 end
+
+defmodule Example.Test.GatedStorage do
+  @moduledoc """
+  `Example.Test.TestStorage`, whose first `width` writes wait for each other,
+  for up to a second, and which keeps the most it saw at once: a test can
+  tell how many rows phase 1 extracts together. `start/1` makes its table, in
+  the calling process.
+  """
+  alias Example.Test.TestStorage
+
+  @table __MODULE__
+
+  def start(width) do
+    :ets.new(@table, [:named_table, :public, :set])
+    :ets.insert(@table, [{:width, width}, {:at_once, 0}, {:most, 0}, {:arrived, 0}])
+  end
+
+  @doc "The most writes seen at once."
+  def most, do: :ets.lookup_element(@table, :most, 2)
+
+  def put_object(key, body) do
+    at_once = :ets.update_counter(@table, :at_once, 1)
+    :ets.select_replace(@table, [{{:most, :"$1"}, [{:<, :"$1", at_once}], [{{:most, at_once}}]}])
+    arrived = :ets.update_counter(@table, :arrived, 1)
+    await(arrived, System.monotonic_time(:millisecond) + 1000)
+    :ets.update_counter(@table, :at_once, -1)
+    TestStorage.put_object(key, body)
+  end
+
+  # The first `width` writes to arrive wait for each other; the rest pass.
+  defp await(arrived, deadline) do
+    width = :ets.lookup_element(@table, :width, 2)
+
+    if arrived <= width and :ets.lookup_element(@table, :arrived, 2) < width and
+         System.monotonic_time(:millisecond) < deadline do
+      Process.sleep(1)
+      await(arrived, deadline)
+    end
+  end
+
+  defdelegate fetch_file(key, path, opts), to: TestStorage
+  defdelegate delete_file(key, opts), to: TestStorage
+  defdelegate list_files(prefix, opts), to: TestStorage
+  defdelegate exists?(key), to: TestStorage
+  defdelegate presigned_put_url(key, opts), to: TestStorage
+  defdelegate presigned_get_url(key, opts), to: TestStorage
+  defdelegate upload(key, path, opts), to: TestStorage
+end
