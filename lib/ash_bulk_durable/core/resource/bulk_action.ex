@@ -19,6 +19,11 @@ defmodule AshBulkDurable.Core.Resource.BulkAction do
         end
       end
 
+  The extension adds a `:read` but no `:destroy`: declare
+  `defaults [:destroy]` to have one, with a policy guarding it. Attributes
+  only the engine reads are `public?: false`. The README's Setup shows the
+  policies that keep a bulk action readable by its owner only.
+
   When `:pubsub_module` is set in the `:ash_bulk_durable` config block (e.g.
   `config :ash_bulk_durable, pubsub_module: MyAppWeb.Endpoint`), the
   extension fills in the `pub_sub` block automatically — every `:update`

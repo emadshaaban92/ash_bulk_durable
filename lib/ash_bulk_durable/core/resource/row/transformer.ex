@@ -17,13 +17,13 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
      dsl_state
      |> add_primary_key()
      |> add_attribute(:row_index, :integer, allow_nil?: false, public?: true)
-     |> add_attribute(:target, AshBulkDurable.Core.StoredTerm, allow_nil?: true, public?: true)
-     |> add_attribute(:input, AshBulkDurable.Core.StoredTerm, allow_nil?: true, public?: true)
+     |> add_attribute(:target, AshBulkDurable.Core.StoredTerm, allow_nil?: true, public?: false)
+     |> add_attribute(:input, AshBulkDurable.Core.StoredTerm, allow_nil?: true, public?: false)
      |> add_attribute(:metadata, :map, allow_nil?: false, public?: true, default: %{})
-     |> add_attribute(:resolved_data, :map, allow_nil?: false, public?: true, default: %{})
+     |> add_attribute(:resolved_data, :map, allow_nil?: false, public?: false, default: %{})
      |> add_attribute(:resolved_tenant, AshBulkDurable.Core.StoredTerm,
        allow_nil?: true,
-       public?: true
+       public?: false
      )
      |> add_attribute(:status, :atom,
        allow_nil?: false,
@@ -34,8 +34,8 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
      |> add_attribute(:error, AshBulkDurable.Core.StoredErrors, allow_nil?: true, public?: true)
      |> add_attribute(:refused, :boolean, allow_nil?: false, public?: true, default: false)
      |> add_attribute(:record_id, :string, allow_nil?: true, public?: true)
-     |> add_attribute(:attempts, :integer, allow_nil?: false, public?: true, default: 0)
-     |> add_attribute(:pass, :integer, allow_nil?: false, public?: true, default: 0)
+     |> add_attribute(:attempts, :integer, allow_nil?: false, public?: false, default: 0)
+     |> add_attribute(:pass, :integer, allow_nil?: false, public?: false, default: 0)
      |> add_create_timestamp(:inserted_at)
      |> add_bulk_action_relationship()
      |> add_default_accept()
@@ -134,6 +134,10 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
     end
   end
 
+  # The default `:read` only. A `:destroy` takes a row away from its bulk
+  # action, whatever state either is in, so its count no longer adds up; a
+  # host that wants one declares `defaults [:destroy]` (or its own) and
+  # guards it with a policy.
   defp add_defaults(dsl_state) do
     existing = Transformer.get_option(dsl_state, [:actions], :defaults) || []
 
@@ -144,23 +148,10 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
         _ -> false
       end)
 
-    has_destroy? =
-      Enum.any?(existing, fn
-        :destroy -> true
-        {:destroy, _} -> true
-        _ -> false
-      end)
-
-    additions =
-      if(has_read?, do: [], else: [:read]) ++
-        if has_destroy?, do: [], else: [:destroy]
-
-    case additions do
-      [] ->
-        dsl_state
-
-      additions ->
-        Transformer.set_option(dsl_state, [:actions], :defaults, existing ++ additions)
+    if has_read? do
+      dsl_state
+    else
+      Transformer.set_option(dsl_state, [:actions], :defaults, existing ++ [:read])
     end
   end
 

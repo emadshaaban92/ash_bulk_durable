@@ -268,7 +268,9 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       {bulk_action, [key]} = create_bulk_action!(["a.zip"])
       TestStorage.put(key)
 
-      Ash.destroy!(bulk_action, authorize?: false)
+      AshBulkDurable.Test.Repo.query!("DELETE FROM bulk_actions WHERE id = $1", [
+        Ecto.UUID.dump!(bulk_action.id)
+      ])
 
       assert :ok = PurgeStaleStaging.delete_staging(bulk_action)
       refute key in TestStorage.keys()

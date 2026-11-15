@@ -18,6 +18,11 @@ defmodule AshBulkDurable.Core.Resource.Row do
         end
       end
 
+  The extension adds a `:read` but no `:destroy`: declare
+  `defaults [:destroy]` to have one, with a policy guarding it. Attributes
+  only the engine reads are `public?: false`. The README's Setup shows the
+  policies that keep a row readable by its owner only.
+
   The `:bulk_action` relationship is resolved through the
   `:bulk_action_resource` config key, so the extension does not need to
   know the host module ahead of time.

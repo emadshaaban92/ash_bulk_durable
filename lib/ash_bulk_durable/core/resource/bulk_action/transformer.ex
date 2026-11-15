@@ -24,9 +24,9 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
        public?: true,
        constraints: [one_of: [:create, :update, :destroy]]
      )
-     |> add_attribute(:tenant, AshBulkDurable.Core.StoredTerm, allow_nil?: true, public?: true)
-     |> add_attribute(:input, AshBulkDurable.Core.StoredTerm, allow_nil?: true, public?: true)
-     |> add_attribute(:staged_files, :map, allow_nil?: false, public?: true, default: %{})
+     |> add_attribute(:tenant, AshBulkDurable.Core.StoredTerm, allow_nil?: true, public?: false)
+     |> add_attribute(:input, AshBulkDurable.Core.StoredTerm, allow_nil?: true, public?: false)
+     |> add_attribute(:staged_files, :map, allow_nil?: false, public?: false, default: %{})
      |> add_attribute(:metadata, :map, allow_nil?: false, public?: true, default: %{})
      |> add_attribute(:status, :atom,
        allow_nil?: false,
@@ -42,22 +42,22 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
        public?: true,
        constraints: [one_of: [:per_row, :all_or_nothing]]
      )
-     |> add_attribute(:chunk_size, :integer, allow_nil?: false, public?: true)
+     |> add_attribute(:chunk_size, :integer, allow_nil?: false, public?: false)
      |> add_attribute(:rows_done, :integer, allow_nil?: false, public?: true, default: 0)
      |> add_attribute(:error, AshBulkDurable.Core.StoredErrors, allow_nil?: true, public?: true)
      |> add_attribute(:result, :map, allow_nil?: true, public?: true)
      |> add_attribute(:started_at, :utc_datetime_usec, allow_nil?: true, public?: true)
      |> add_attribute(:finished_at, :utc_datetime_usec, allow_nil?: true, public?: true)
-     |> add_attribute(:alive_at, :utc_datetime_usec, allow_nil?: true, public?: true)
-     |> add_attribute(:stalled_starts, :integer, allow_nil?: false, public?: true, default: 0)
-     |> add_attribute(:setup_failures, :integer, allow_nil?: false, public?: true, default: 0)
-     |> add_attribute(:progress_at_start, :integer, allow_nil?: true, public?: true)
+     |> add_attribute(:alive_at, :utc_datetime_usec, allow_nil?: true, public?: false)
+     |> add_attribute(:stalled_starts, :integer, allow_nil?: false, public?: false, default: 0)
+     |> add_attribute(:setup_failures, :integer, allow_nil?: false, public?: false, default: 0)
+     |> add_attribute(:progress_at_start, :integer, allow_nil?: true, public?: false)
      |> add_attribute(:shutdown_stopped, :boolean,
        allow_nil?: false,
-       public?: true,
+       public?: false,
        default: false
      )
-     |> add_attribute(:isolating_row_id, :uuid, allow_nil?: true, public?: true)
+     |> add_attribute(:isolating_row_id, :uuid, allow_nil?: true, public?: false)
      |> add_attribute(:pass, :integer, allow_nil?: false, public?: true, default: 0)
      |> add_create_timestamp(:inserted_at)
      |> add_update_timestamp(:updated_at)
@@ -195,6 +195,10 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
     end
   end
 
+  # The default `:read` only. A `:destroy` deletes a bulk action and, through
+  # the foreign key, its rows, whatever state they are in, running included;
+  # a host that wants one declares `defaults [:destroy]` (or its own) and
+  # guards it with a policy.
   defp add_defaults(dsl_state) do
     existing = Transformer.get_option(dsl_state, [:actions], :defaults) || []
 
@@ -205,23 +209,10 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
         _ -> false
       end)
 
-    has_destroy? =
-      Enum.any?(existing, fn
-        :destroy -> true
-        {:destroy, _} -> true
-        _ -> false
-      end)
-
-    additions =
-      if(has_read?, do: [], else: [:read]) ++
-        if has_destroy?, do: [], else: [:destroy]
-
-    case additions do
-      [] ->
-        dsl_state
-
-      additions ->
-        Transformer.set_option(dsl_state, [:actions], :defaults, existing ++ additions)
+    if has_read? do
+      dsl_state
+    else
+      Transformer.set_option(dsl_state, [:actions], :defaults, existing ++ [:read])
     end
   end
 

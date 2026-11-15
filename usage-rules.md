@@ -12,6 +12,13 @@
 - Every target resource must use the bulk action resource's repo. A target
   in another repo writes outside the bulk action's lock, and silently loses
   its protection.
+- A succeeded row's database writes in the bulk action's repo commit exactly
+  once, but a target action's side effects outside it (emails, API calls,
+  messages) may run several times, and for rows that end failed: chunks are
+  rerun to find a bad row, and after a crash. Make them idempotent, or write
+  them to a table in the same repo and send them from there.
+- Keep the README's policies on the bulk action and row resources, and don't
+  add a `:destroy` to them unless a policy guards it.
 - `:per_row` commits rows in chunks and keeps failures to correct.
   `:all_or_nothing` is one transaction, capped by `:atomic_mode_max_rows`.
 - Bulk actions reach your policies with the context

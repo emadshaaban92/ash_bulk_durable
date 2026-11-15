@@ -342,7 +342,10 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
 
       assert length(rows_before) == 2
 
-      Ash.destroy!(bulk_action, authorize?: false)
+      # The extension adds no `:destroy`, so the foreign key is what's tested.
+      AshBulkDurable.Test.Repo.query!("DELETE FROM bulk_actions WHERE id = $1", [
+        Ecto.UUID.dump!(bulk_action.id)
+      ])
 
       rows_after =
         Row
@@ -350,6 +353,79 @@ defmodule AshBulkDurable.Core.Resource.BulkActionTest do
         |> Ash.read!(authorize?: false)
 
       assert rows_after == []
+    end
+  end
+
+  describe "defaults" do
+    test "add a :read and no :destroy" do
+      for resource <- [BulkAction, Row] do
+        assert Ash.Resource.Info.action(resource, :read)
+        refute Ash.Resource.Info.action(resource, :destroy)
+      end
+    end
+
+    test "a host's own :destroy is kept, beside the :read" do
+      assert Ash.Resource.Info.action(AshBulkDurable.Test.DestroyingBulkAction, :destroy)
+      assert Ash.Resource.Info.action(AshBulkDurable.Test.DestroyingBulkAction, :read)
+    end
+
+    test "with the README's policies, a caller reads only their own and runs no engine action" do
+      bulk_action = create_bulk_action!()
+      owner = %{id: bulk_action.user_id}
+      stranger = %{id: Ecto.UUID.generate()}
+
+      assert [%{id: id}] = Ash.read!(BulkAction, actor: owner)
+      assert id == bulk_action.id
+      assert [_, _] = Ash.read!(Row, actor: owner)
+
+      assert [] = Ash.read!(BulkAction, actor: stranger)
+      assert [] = Ash.read!(Row, actor: stranger)
+      assert [] = Ash.read!(BulkAction)
+
+      assert {:error, %Ash.Error.Forbidden{}} =
+               Ash.update(bulk_action, %{n: 1}, action: :bump_rows_done, actor: owner)
+
+      assert %{rows_done: 0} = Ash.get!(BulkAction, bulk_action.id, authorize?: false)
+    end
+
+    test "only what a page shows is public" do
+      public = fn resource ->
+        resource |> Ash.Resource.Info.public_attributes() |> Enum.map(& &1.name) |> Enum.sort()
+      end
+
+      assert public.(BulkAction) ==
+               Enum.sort([
+                 :id,
+                 :user_id,
+                 :resource_name,
+                 :action_name,
+                 :action_type,
+                 :metadata,
+                 :status,
+                 :total_rows,
+                 :mode,
+                 :rows_done,
+                 :error,
+                 :result,
+                 :started_at,
+                 :finished_at,
+                 :pass,
+                 :inserted_at,
+                 :updated_at
+               ])
+
+      assert public.(Row) ==
+               Enum.sort([
+                 :id,
+                 :bulk_action_id,
+                 :row_index,
+                 :metadata,
+                 :status,
+                 :error,
+                 :refused,
+                 :record_id,
+                 :inserted_at
+               ])
     end
   end
 end
