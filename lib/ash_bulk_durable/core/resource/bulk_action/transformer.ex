@@ -241,6 +241,11 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
           allow_nil?: false
         )
 
+      validate_max_rows =
+        Transformer.build_entity!(Dsl, [:actions, :create], :validate,
+          validation: AshBulkDurable.Core.Changes.ValidateMaxRows
+        )
+
       validate_atomic_mode =
         Transformer.build_entity!(Dsl, [:actions, :create], :validate,
           validation: AshBulkDurable.Core.Changes.ValidateAtomicModeLimit
@@ -258,6 +263,7 @@ defmodule AshBulkDurable.Core.Resource.BulkAction.Transformer do
           accept: accept,
           arguments: [rows_argument],
           changes: [
+            validate_max_rows,
             validate_atomic_mode,
             persist_rows
           ]
