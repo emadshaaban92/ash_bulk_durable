@@ -40,7 +40,7 @@ defmodule AshBulkDurable.Core.Retry do
   require Ash.Query
 
   alias AshBulkDurable.Core
-  alias AshBulkDurable.Core.{BulkActionLock, Introspection, Owner, Poller, Runner}
+  alias AshBulkDurable.Core.{BulkActionLock, Introspection, Owner, Poller, Runner, StagedFiles}
 
   @doc """
   Reruns every row of `bulk_action` that has not succeeded. Returns `{:ok,
@@ -64,7 +64,8 @@ defmodule AshBulkDurable.Core.Retry do
       of every file the bulk action held. For one whose files the daily
       sweep deleted (`AshBulkDurable.Core.PurgeStaleStaging`), so a row
       that needs one runs again rather than fails without it. Its old keys
-      are the sweep's to delete.
+      are the sweep's to delete. Every key must be the owner's
+      (`AshBulkDurable.Core.StagedFiles`), or nothing is written.
 
   Raises `ArgumentError` for a `:lookup` or `:tenant` on a row whose target
   is a record selected by its primary key, which stays the record selected.
@@ -150,7 +151,8 @@ defmodule AshBulkDurable.Core.Retry do
   defp reopen(bulk_action, corrections, shared, opts, rows) do
     resources = [Core.config(:bulk_action_resource), Core.config(:row_resource)]
 
-    with {:ok, result} <-
+    with :ok <- staged_files_owned(opts),
+         {:ok, result} <-
            resources
            |> Ash.transaction(fn ->
              under_lock(resources, bulk_action, corrections, shared, opts, rows)
@@ -188,6 +190,16 @@ defmodule AshBulkDurable.Core.Retry do
       {:ok, retried}
     else
       {:error, error} -> Ash.DataLayer.rollback(resources, error)
+    end
+  end
+
+  # Checked against the caller's scope before anything is locked: only the
+  # owner's retry gets past the lock, so a key that is the caller's is the
+  # owner's.
+  defp staged_files_owned(opts) do
+    case Keyword.get(opts, :staged_files) do
+      nil -> :ok
+      staged -> StagedFiles.check(staged, Owner.worker_key(Keyword.fetch!(opts, :scope)))
     end
   end
 

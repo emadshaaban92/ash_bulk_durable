@@ -408,9 +408,10 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
           :platform_admin
         )
 
-      new_key = "#{@prefix}#{ctx.super_user.id}/uuid-new/companions/logo.zip"
+      # Their own key, so the lock is what refuses them.
+      new_key = "#{@prefix}#{stranger.id}/uuid-new/companions/logo.zip"
 
-      assert {:error, %Ash.Error.Invalid{}} =
+      assert {:error, %Ash.Error.Invalid{errors: [%Ash.Error.Changes.StaleRecord{}]}} =
                AshBulkDurable.retry(ctx.bulk_action,
                  scope: AshBulkDurable.Test.Scope.new(actor: stranger),
                  staged_files: %{"logo" => new_key}
@@ -418,6 +419,45 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
 
       assert %{status: :failed, staged_files: %{"logo" => key}} = reload(ctx.bulk_action)
       assert key == ctx.key
+    end
+
+    test "a retry naming another owner's file is refused, nothing written", ctx do
+      other = "#{@prefix}#{Ecto.UUID.generate()}/uuid-new/companions/logo.zip"
+
+      assert {:error, %Ash.Error.Invalid{errors: [%{field: :staged_files}]}} =
+               AshBulkDurable.retry(ctx.bulk_action,
+                 scope: ctx.scope,
+                 staged_files: %{"logo" => other}
+               )
+
+      assert %{status: :failed, pass: pass, staged_files: %{"logo" => key}} =
+               reload(ctx.bulk_action)
+
+      assert key == ctx.key
+      assert pass == ctx.bulk_action.pass
+    end
+
+    test "a retry of one row naming a key that escapes the owner's is refused", ctx do
+      capture_log(fn ->
+        {:ok, _retried} = AshBulkDurable.retry(ctx.bulk_action, scope: ctx.scope)
+        :ok = Worker.run_now(ctx.bulk_action.id)
+      end)
+
+      [row] = AshBulkDurable.Core.open_rows(ctx.bulk_action)
+      parked = reload(ctx.bulk_action)
+      escaping = "#{@prefix}#{ctx.super_user.id}/../#{Ecto.UUID.generate()}/logo.zip"
+
+      assert {:error, %Ash.Error.Invalid{errors: [%{field: :staged_files}]}} =
+               AshBulkDurable.retry_row(row,
+                 scope: ctx.scope,
+                 staged_files: %{"logo" => escaping}
+               )
+
+      assert %{status: :completed_with_errors, staged_files: %{"logo" => key}} =
+               reload(ctx.bulk_action)
+
+      assert key == ctx.key
+      assert reload(ctx.bulk_action).pass == parked.pass
     end
 
     test "its owner can abandon it instead", ctx do
