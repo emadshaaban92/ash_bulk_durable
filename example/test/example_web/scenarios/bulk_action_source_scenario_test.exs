@@ -70,4 +70,34 @@ defmodule ExampleWeb.Scenarios.BulkActionSourceScenarioTest do
       refute :erlang.term_to_binary(stored) =~ to_string(refused.email)
     end
   end
+
+  test "granting a platform role in an :update sheet is refused too", %{
+    super_user: super_user
+  } do
+    organization = RoleTestHelpers.create_organization(super_user)
+
+    [person, other] =
+      Enum.map(1..2, fn _n ->
+        RoleTestHelpers.create_user_with_organization_role(super_user, organization, [:admin])
+      end)
+
+    {:ok, bulk_action} =
+      AshBulkDurable.update_many(
+        [{person, %{platform_roles: [:super_user]}}, {other, %{name: "Renamed"}}],
+        User,
+        :update,
+        scope: Example.Scope.new(actor: super_user)
+      )
+
+    assert 1 = Worker.drain()
+
+    assert [] = Ash.reload!(person, authorize?: false).platform_roles
+    assert %{name: "Renamed"} = Ash.reload!(other, authorize?: false)
+
+    assert [%{error: [%{error: %Ash.Error.Forbidden.Policy{}}]}, %{error: nil}] =
+             Row
+             |> Ash.Query.filter(bulk_action_id == ^bulk_action.id)
+             |> Ash.Query.sort(row_index: :asc)
+             |> Ash.read!(authorize?: false)
+  end
 end

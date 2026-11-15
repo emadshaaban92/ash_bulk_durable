@@ -261,6 +261,15 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanelTest do
       assert html =~ "This bulk action will be permanently abandoned"
     end
 
+    # A per-row run that crashed or couldn't start may have no failed rows:
+    # its retry reruns the ones that never finished too.
+    test ":failed per-row reruns every row that hasn't succeeded" do
+      html = render_panel(bulk_action(%{status: :failed, result: %{"reason" => "crashed"}}))
+
+      assert html =~ "to rerun every row that hasn&#39;t succeeded"
+      refute html =~ "only the failed rows"
+    end
+
     test ":failed renders reason-derived copy" do
       html =
         render_panel(
