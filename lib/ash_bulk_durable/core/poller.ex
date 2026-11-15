@@ -65,15 +65,19 @@ defmodule AshBulkDurable.Core.Poller do
   nodes run bulk actions, or tests, which run them with
   `AshBulkDurable.Core.Worker.run_now/1` and `AshBulkDurable.Core.Worker.drain/0`.
 
-  ## Staged files
+  ## Staged files and retention
 
-  Every `:staging_sweep_interval` it runs the staged-file sweep
-  (`AshBulkDurable.Core.PurgeStaleStaging.sweep/0`) in a task. The first
-  lands at a random time within the first hour, so nodes restarted together
-  don't all sweep at once, and a node restarted more often than the interval
-  still sweeps. Nodes sweeping at once only delete the same keys: the sweep
+  Every `:staging_sweep_interval` it runs, in a task, the retention prune
+  (`AshBulkDurable.Core.Retention.prune/1`), which deletes nothing unless
+  `:retention` is set, then the staged-file sweep
+  (`AshBulkDurable.Core.PurgeStaleStaging.sweep/0`). Either failing is
+  logged and leaves the other to run. The first of these runs lands at a
+  random time within the first hour, so nodes restarted together don't all
+  sweep at once, and a node restarted more often than the interval still
+  sweeps. Nodes sweeping at once only delete the same keys: the sweep
   locks only a bulk action whose keys it deletes, and skips one another
-  transaction holds.
+  transaction holds. Nodes pruning at once split the bulk actions between
+  them.
 
   ## Options
 
@@ -85,8 +89,13 @@ defmodule AshBulkDurable.Core.Poller do
       liveness hint is stale, 2 minutes by default. Keep it well above
       `:alive_interval` (30 seconds by default). Too short only wastes work
       on duplicate runs; too long only delays resuming after a node dies.
-    * `:staging_sweep_interval` — milliseconds between staged-file sweeps, a
-      day by default; `nil` runs none.
+    * `:staging_sweep_interval` — milliseconds between staged-file sweeps
+      and retention prunes, a day by default; `nil` runs neither.
+    * `:retention` — milliseconds a bulk action is kept after it finished
+      `:completed`, `:failed` or `:cancelled`, before the prune deletes it
+      and its rows; `nil`, the default, keeps every one. It refuses to start
+      with any other value than `nil` or a positive integer, and warns when
+      it is set but `:staging_sweep_interval` is `nil`, which runs no prune.
     * `:shutdown_grace` — milliseconds a run still going at shutdown is given
       to finish, `20_000` by default. The child spec's `:shutdown` is set
       above it.
@@ -122,7 +131,15 @@ defmodule AshBulkDurable.Core.Poller do
   require Logger
 
   alias AshBulkDurable.Core
-  alias AshBulkDurable.Core.{BulkActionLock, Liveness, PurgeStaleStaging, Storage, Worker}
+
+  alias AshBulkDurable.Core.{
+    BulkActionLock,
+    Liveness,
+    PurgeStaleStaging,
+    Retention,
+    Storage,
+    Worker
+  }
 
   @poll_interval :timer.seconds(5)
   @max_running 2
@@ -199,6 +216,7 @@ defmodule AshBulkDurable.Core.Poller do
   @impl true
   def init(opts) do
     Storage.check_config!()
+    retention = opts |> option(:retention, nil) |> Retention.validate!()
     Process.flag(:trap_exit, true)
     {:ok, tasks} = Task.Supervisor.start_link()
 
@@ -210,13 +228,25 @@ defmodule AshBulkDurable.Core.Poller do
       max_running: option(opts, :max_running, @max_running),
       stale_after: option(opts, :stale_after, @stale_after),
       sweep_interval: option(opts, :staging_sweep_interval, @staging_sweep_interval),
+      retention: retention,
       shutdown_grace: option(opts, :shutdown_grace, @shutdown_grace),
       poll_timer: nil,
       sweep_timer: nil
     }
 
+    warn_retention_without_sweep(state)
     {:ok, state |> schedule_poll() |> schedule_first_sweep()}
   end
+
+  defp warn_retention_without_sweep(%{retention: retention, sweep_interval: nil})
+       when not is_nil(retention) do
+    Logger.warning(
+      "ash_bulk_durable: :retention is set, but staging_sweep_interval: nil runs no " <>
+        "prune on this node, so it deletes no finished bulk action"
+    )
+  end
+
+  defp warn_retention_without_sweep(_state), do: :ok
 
   defp option(opts, key, default) do
     Keyword.get_lazy(opts, key, fn -> Core.config(key, default) end)
@@ -234,7 +264,8 @@ defmodule AshBulkDurable.Core.Poller do
   def handle_info(:nudge, state), do: {:noreply, fill(state)}
 
   def handle_info(:sweep, state) do
-    Task.Supervisor.start_child(state.tasks, &sweep/0)
+    retention = state.retention
+    Task.Supervisor.start_child(state.tasks, fn -> sweep(retention) end)
     {:noreply, schedule_sweep(state, state.sweep_interval)}
   end
 
@@ -415,7 +446,21 @@ defmodule AshBulkDurable.Core.Poller do
     %{state | running: Map.put(state.running, task.ref, %{id: id, pid: task.pid})}
   end
 
-  defp sweep do
+  defp sweep(retention) do
+    prune(retention)
+    sweep_staging()
+  end
+
+  defp prune(retention) do
+    Retention.prune(retention)
+  rescue
+    exception ->
+      Logger.error(
+        "ash_bulk_durable: pruning finished bulk actions failed: #{Exception.message(exception)}"
+      )
+  end
+
+  defp sweep_staging do
     PurgeStaleStaging.sweep()
   rescue
     exception ->

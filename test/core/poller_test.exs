@@ -392,7 +392,7 @@ defmodule AshBulkDurable.Core.PollerTest do
     end
   end
 
-  describe "the staged-file sweep" do
+  describe "the staged-file sweep and the retention prune" do
     setup do
       put_config(:storage, TestStorage)
       start_supervised!(TestStorage)
@@ -415,6 +415,61 @@ defmodule AshBulkDurable.Core.PollerTest do
       Process.sleep(300)
       assert key in TestStorage.keys()
       assert %{sweep_timer: nil} = :sys.get_state(poller)
+    end
+
+    test "prunes bulk actions finished longer ago than :retention", ctx do
+      pruned = submit!(ctx, 1, user: "pruned")
+      kept = submit!(ctx, 1, user: "kept")
+
+      Repo.query!(
+        "UPDATE bulk_actions SET status = 'completed', " <>
+          "finished_at = (now() AT TIME ZONE 'utc') - interval '2 days' WHERE id = $1",
+        [Ecto.UUID.dump!(pruned.id)]
+      )
+
+      Repo.query!(
+        "UPDATE bulk_actions SET status = 'completed', " <>
+          "finished_at = (now() AT TIME ZONE 'utc') - interval '2 hours' WHERE id = $1",
+        [Ecto.UUID.dump!(kept.id)]
+      )
+
+      start_poller!(staging_sweep_interval: 100, retention: :timer.hours(24))
+
+      assert eventually(fn ->
+               match?({:error, _}, Ash.get(BulkAction, pruned.id, authorize?: false))
+             end)
+
+      assert rows(pruned) == []
+      assert %{status: :completed} = reload(kept)
+    end
+
+    test "prunes nothing without :retention", ctx do
+      old = submit!(ctx, 1)
+
+      Repo.query!(
+        "UPDATE bulk_actions SET status = 'completed', " <>
+          "finished_at = (now() AT TIME ZONE 'utc') - interval '400 days' WHERE id = $1",
+        [Ecto.UUID.dump!(old.id)]
+      )
+
+      start_poller!(staging_sweep_interval: 100)
+
+      # The sweep ran, the bulk action is still there.
+      assert eventually(fn -> ctx.key not in TestStorage.keys() end)
+      assert %{status: :completed} = reload(old)
+    end
+
+    test "warns at start when :retention is set but no sweep runs" do
+      log = capture_log(fn -> start_poller!(staging_sweep_interval: nil, retention: 1_000) end)
+      assert log =~ ":retention is set, but staging_sweep_interval: nil runs no prune"
+
+      stop_supervised!(Poller)
+      refute capture_log(fn -> start_poller!(staging_sweep_interval: nil) end) =~ ":retention"
+    end
+
+    test "refuses to start with a :retention that isn't nil or a positive integer" do
+      assert {:error, reason} = start_supervised({Poller, retention: 0})
+      assert inspect(reason) =~ ":retention must be nil or a positive number"
     end
 
     test "is first scheduled within the first hour of a daily interval" do

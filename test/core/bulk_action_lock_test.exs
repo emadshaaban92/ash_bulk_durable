@@ -1,7 +1,8 @@
 defmodule AshBulkDurable.Core.BulkActionLockTest do
   @moduledoc """
   `BulkActionLock`, `Retry` taking it before any row, `abandon/2` taking
-  it before its write, and the staging sweep taking it before its deletes.
+  it before its write, the staging sweep taking it before its deletes, and
+  the retention prune skipping a bulk action another transaction holds.
   A lock held by another transaction needs a second real connection, so this
   test runs outside the sandbox and deletes what it wrote.
   """
@@ -12,7 +13,7 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
   require Ash.Expr
   require Ash.Query
 
-  alias AshBulkDurable.Core.{BulkActionLock, PurgeStaleStaging}
+  alias AshBulkDurable.Core.{BulkActionLock, PurgeStaleStaging, Retention}
   alias AshBulkDurable.Test.{BulkAction, Region, Repo, Row, Scope, User}
 
   setup do
@@ -435,6 +436,75 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
 
       assert :ok = PurgeStaleStaging.sweep()
       refute "bulk-staging/#{ctx.tag}/a.zip" in AshBulkDurable.TestStorage.keys()
+    end
+  end
+
+  describe "the retention prune" do
+    setup do
+      AshBulkDurable.StorageHelpers.put_config(:storage, AshBulkDurable.TestStorage)
+      start_supervised!(AshBulkDurable.TestStorage)
+      :ok
+    end
+
+    test "skips a long-failed bulk action another transaction holds, and deletes it once " <>
+           "let go",
+         ctx do
+      bulk_action = failed_a_day_ago!(ctx)
+      locker = lock_elsewhere(bulk_action.id)
+
+      Retention.prune(:timer.hours(24))
+      assert %{status: :failed} = Ash.get!(BulkAction, bulk_action.id, authorize?: false)
+      assert length(rows(bulk_action)) == 2
+
+      release(locker)
+
+      Retention.prune(:timer.hours(24))
+      assert {:error, _} = Ash.get(BulkAction, bulk_action.id, authorize?: false)
+      assert rows(bulk_action) == []
+    end
+
+    test "keeps a long-failed bulk action a retry holds, and once it has reopened it", ctx do
+      bulk_action = failed_a_day_ago!(ctx)
+      test_pid = self()
+
+      retry =
+        spawn_link(fn ->
+          :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
+          send(test_pid, {:retried, AshBulkDurable.retry(bulk_action, scope: ctx.scope)})
+        end)
+
+      # The retry stops at its first row write, its lock held.
+      handler = "prune-during-retry-#{ctx.tag}"
+
+      :telemetry.attach(
+        handler,
+        [:ash_bulk_durable, :test, :repo, :query],
+        fn _event, _measurements, %{source: source, query: query}, _config ->
+          if self() == retry and source == "bulk_action_rows" and
+               String.starts_with?(query, "UPDATE") do
+            :telemetry.detach(handler)
+            send(test_pid, :retrying)
+
+            receive do
+              :go -> :ok
+            end
+          end
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+      assert_receive :retrying, 2_000
+
+      Retention.prune(:timer.hours(24))
+      assert {:ok, _} = Ash.get(BulkAction, bulk_action.id, authorize?: false)
+
+      send(retry, :go)
+      assert_receive {:retried, {:ok, %{status: :queued}}}, 2_000
+
+      Retention.prune(:timer.hours(24))
+      assert %{status: :queued} = Ash.get!(BulkAction, bulk_action.id, authorize?: false)
+      assert length(rows(bulk_action)) == 2
     end
   end
 
