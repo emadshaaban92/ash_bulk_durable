@@ -48,14 +48,27 @@ Linux, macOS and Windows targets.
 
 ## Setup
 
-Your app owns two resources, which the library's extensions fill in:
+Your app owns a domain and two resources, which the library's extensions fill
+in. Keep the policies: without them, anything that reaches the domain, such as
+an AshJsonApi or AshGraphql endpoint or an admin screen, reads every user's
+bulk actions and rows, and can call the engine's own actions on them.
 
 ```elixir
+defmodule MyApp.BulkActions do
+  use Ash.Domain
+
+  resources do
+    resource MyApp.BulkActions.BulkAction
+    resource MyApp.BulkActions.Row
+  end
+end
+
 defmodule MyApp.BulkActions.BulkAction do
   use Ash.Resource,
     domain: MyApp.BulkActions,
     data_layer: AshPostgres.DataLayer,
     notifiers: [Ash.Notifier.PubSub],
+    authorizers: [Ash.Policy.Authorizer],
     extensions: [AshBulkDurable.Core.Resource.BulkAction]
 
   postgres do
@@ -65,20 +78,55 @@ defmodule MyApp.BulkActions.BulkAction do
     identity_wheres_to_sql one_unresolved_per_user:
                              "status IN ('queued', 'running', 'completed_with_errors')"
   end
+
+  policies do
+    policy action_type(:read) do
+      authorize_if expr(user_id == ^actor(:id))
+    end
+  end
 end
 
 defmodule MyApp.BulkActions.Row do
   use Ash.Resource,
     domain: MyApp.BulkActions,
     data_layer: AshPostgres.DataLayer,
+    authorizers: [Ash.Policy.Authorizer],
     extensions: [AshBulkDurable.Core.Resource.Row]
 
   postgres do
     table "bulk_action_rows"
     repo MyApp.Repo
   end
+
+  policies do
+    policy action_type(:read) do
+      authorize_if expr(bulk_action.user_id == ^actor(:id))
+    end
+  end
 end
 ```
+
+`user_id` holds what your `AshBulkDurable.Core.Owner` returns as the owner's
+worker key; compare it with whatever in your actor that is. The engine's own
+reads and writes don't go through these policies, so they decide only what
+everyone else may do: here, read their own bulk actions and rows, and nothing
+more. Every other action the extensions add (`:create`, `:mark_finished`,
+`:enqueue_retry` and the rest) is the engine's, and no policy allows it.
+
+The extensions add a `:read` but no `:destroy`, since destroying a bulk action
+takes its rows with it, running or not. Declare `defaults [:destroy]` (or your
+own) in `actions` if you want one, with a policy that allows it only where you
+mean it to.
+
+The attributes a page shows are public: on a bulk action `id`, `user_id`,
+`resource_name`, `action_name`, `action_type`, `status`, `mode`,
+`total_rows`, `rows_done`, `pass`, `error`, `result`, `metadata`,
+`started_at`, `finished_at`, `inserted_at` and `updated_at`; on a row `id`,
+`bulk_action_id`, `row_index`, `status`, `error`, `refused`, `record_id`,
+`metadata` and `inserted_at`. The rest are the engine's and not public, so an
+API layer doesn't serve or filter on them: the stored inputs and targets, the
+tenant, staged-file keys, resolved references, the liveness stamp and the
+crash counters. They are still loaded on every record your code reads.
 
 Every resource a bulk action writes must live in the same repo as these two.
 A chunk's target writes share the transaction that holds the bulk action's
@@ -162,6 +210,56 @@ so the hint only decides when to start one. Each running bulk action takes one
 connection, up to `:phase1_concurrency` more while it resolves references, and
 one more for its ticker's stamp, held briefly each `:alive_interval`: size the
 repo's pool for `:max_running` times `:phase1_concurrency + 2`.
+
+## What is and isn't guaranteed
+
+Guaranteed, for every target resource in the bulk action's repo:
+
+- **A submit is all or nothing.** The bulk action and every one of its rows
+  are written in one transaction, or none are.
+- **A row's database writes commit once, with its status.** A chunk's target
+  writes share the transaction that holds the bulk action's lock and flips
+  its rows to `:succeeded` or `:failed`. A row that succeeds has its writes
+  committed exactly once; a row that fails has none, since they roll back
+  with it. Two runs of one bulk action may overlap, and a run may outlive a
+  retry, without a row being applied twice.
+- **One verdict per pass.** Each run of a bulk action (each pass, a retry
+  starting the next) ends `:completed`, `:completed_with_errors`, `:failed`
+  or `:cancelled` once.
+- **An `:all_or_nothing` bulk action** commits every row or none.
+- **It finishes.** A bulk action survives a restart or a lost node, as
+  another node resumes it. One whose runs keep dying fails as `:crashed`, a
+  row that keeps killing its run fails alone as crashed, and setup that keeps
+  raising fails the bulk action; none restart forever.
+- **The worker acts as the owner.** Rows run with the scope
+  `AshBulkDurable.Core.Owner` rebuilds, so the target's policies apply as
+  they would to the owner, and a bulk action can do nothing its owner
+  couldn't.
+
+Not guaranteed:
+
+- **Side effects outside the database may run more than once, and for rows
+  that end failed.** A per-row chunk with a bad row rolls back and
+  runs its rows again in halves, a run that dies mid-chunk runs the chunk
+  again, and a reference's resolver (`AshBulkDurable.Core.Resolver`) can run
+  again for a row it already resolved. A target action that sends an email,
+  calls an API or publishes a message from a change or hook does so each
+  time. Make that idempotent, or have the action write it to a table in the
+  same repo, which commits with the row or not at all, and send it from
+  there.
+- **Writes to another repo.** A target in another repo writes outside the
+  lock, so none of the above holds for it (see Setup).
+- **Lookups are not re-checked.** References are resolved before the chunk's
+  transaction opens, outside the lock; the row then writes with what they
+  resolved to, even if the record a lookup found has changed since.
+- **Progress hints** are best effort: one may be lost, or arrive late or from
+  an older pass.
+- **When a bulk action starts.** A node starts one submitted there as soon
+  as it has a free slot, and any other within `:poll_interval`; one whose
+  node died waits up to `:stale_after`. Bulk actions start oldest first,
+  with no priority and no fairness between owners.
+- **Stopping one that's running.** `AshBulkDurable.abandon/2` takes only a
+  bulk action that finished with failed rows, or failed outright.
 
 ## Other config
 
