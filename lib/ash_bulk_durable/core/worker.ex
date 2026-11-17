@@ -85,8 +85,13 @@ defmodule AshBulkDurable.Core.Worker do
   - An owner who can no longer act in the bulk action's tenant
     (`scope_from_worker_key/2` returned `{:error, reason}`, see
     `AshBulkDurable.Core.Owner`) → `:mark_finished({:failed, %{reason:
-    :access_revoked, term: inspect(reason)}})` at the start, before any row
-    runs.
+    :access_revoked, term: inspect(reason)}})`, at the run's start or before
+    its next chunk, in phase 1 or phase 2. The owner is asked again before
+    every chunk, so a chunk runs with the roles the owner has then; rows
+    earlier chunks wrote stay written. A per-row bulk action with no row
+    left to write when the owner is refused, at a start too (every row
+    refused before it was stored, say), is not failed: it gets the verdict
+    its rows earned. See "Asking the owner again" below.
   - A resolver's `prepare/2` error for a chunk →
     `:mark_finished({:failed, %{reason: :resolver_prepare_error, ...}})`.
   - All-or-nothing phase 1 failure, or a row its caller already refused →
@@ -248,6 +253,26 @@ defmodule AshBulkDurable.Core.Worker do
 
   Together they bound a per-row bulk action's stalled starts: the start
   that brings them past the sum of all three fails it as crashed.
+
+  ## Asking the owner again
+
+  The owner's scope is rebuilt (`scope_from_worker_key/2`) at each run's
+  start, and again before every chunk: each phase-1 chunk, each phase-2
+  chunk, and each row run alone for isolation in either phase. Asked outside
+  the lock, as phase 1 reads, a chunk then runs, and its recovery recovers,
+  with the scope rebuilt for it. `{:error, reason}` fails the bulk action
+  `:access_revoked` there, under the lock, before that chunk's rows run, and
+  is not counted toward `:max_setup_failures`; nothing earlier chunks
+  committed is undone. A per-row bulk action with no row left to write
+  (the last chunk's recovery settled its rows, phase 1 failed them all, or,
+  at a start, every row was refused before it was stored) gets the verdict
+  its rows earned instead, and its staged files go as for any finished run.
+  All or nothing ends `:completed` or `:failed` only, so it fails. A
+  chunk already asked for runs to its end, its recovery included, even if
+  access is revoked meanwhile, so at most that one chunk's rows land after
+  a revoke. A raise there stops the run as one of the worker's own reads
+  would: the bulk action stays `:running`, and the next start asks again in
+  its setup, which counts it if it raises again.
 
   ## Telemetry
 
@@ -667,9 +692,16 @@ defmodule AshBulkDurable.Core.Worker do
 
   defp drive(bulk_action) do
     case set_up(bulk_action) do
-      {:ok, settings, downloaded} -> drive_rows(bulk_action, settings, downloaded)
-      {:access_revoked, reason} -> fail_access_revoked(bulk_action, reason)
-      :busy -> :ok
+      {:ok, settings, downloaded} ->
+        drive_rows(bulk_action, settings, downloaded)
+
+      {:access_revoked, reason} ->
+        terminal = fail_access_revoked(bulk_action, reason)
+        if terminal, do: maybe_delete_staging(terminal)
+        :ok
+
+      :busy ->
+        :ok
     end
   end
 
@@ -754,18 +786,34 @@ defmodule AshBulkDurable.Core.Worker do
   defp failure_detail(_verdict), do: ""
 
   # The owner can no longer act in the bulk action's tenant. Every row naming
-  # no tenant of its own writes there whatever the scope says, so no row may
-  # run. Not counted like `:gone`: the answer comes from the database, not
-  # this node's code, so every node gives it. Its staged files stay, for a
-  # retry once the owner can act there again.
+  # no tenant of its own writes there whatever the scope says, so no more
+  # rows may run. Not counted like `:gone`: the answer comes from the
+  # database, not this node's code, so every node gives it. Its staged files
+  # stay, for a retry once the owner can act there again. The terminal bulk
+  # action, or nil when the lock was not taken.
   defp fail_access_revoked(bulk_action, reason) do
-    Logger.warning(
-      "ash_bulk_durable: bulk action #{bulk_action.id}'s owner can no longer act in its " <>
-        "tenant (#{inspect(reason)}); failing it"
-    )
+    case in_pass(bulk_action, &revoked_verdict(&1, reason)) do
+      {:ok, terminal} -> terminal
+      :busy -> nil
+    end
+  end
 
-    finish_locked(bulk_action, {:failed, %{reason: :access_revoked, term: inspect(reason)}})
-    :ok
+  # Under the lock. Per row, with no row left to write (the last chunk's
+  # recovery settled them, or phase 1 failed them all), the refusal stops
+  # nothing: the bulk action gets the verdict its rows earned. All or nothing
+  # ends `:completed` or `:failed` only, and one with no row left had them
+  # all refused, so it fails.
+  defp revoked_verdict(locked, reason) do
+    if locked.mode == :all_or_nothing or rows_left?(locked) do
+      Logger.warning(
+        "ash_bulk_durable: bulk action #{locked.id}'s owner can no longer act in its " <>
+          "tenant (#{inspect(reason)}); failing it"
+      )
+
+      mark_finished(locked, {:failed, %{reason: :access_revoked, term: inspect(reason)}})
+    else
+      finalize_bulk_action(locked, 0)
+    end
   end
 
   defp drive_rows(bulk_action, settings, downloaded) do
@@ -838,6 +886,9 @@ defmodule AshBulkDurable.Core.Worker do
           {:failed, %{reason: :resolver_prepare_error, term: inspect(error)}}
         )
 
+      {:access_revoked, reason} ->
+        fail_access_revoked(bulk_action, reason)
+
       :busy ->
         nil
     end
@@ -863,6 +914,15 @@ defmodule AshBulkDurable.Core.Worker do
 
   defp reconstruct_scope(bulk_action),
     do: AshBulkDurable.Core.Owner.scope_from_worker_key(bulk_action.user_id, bulk_action.tenant)
+
+  # Before every chunk (see "Asking the owner again" above): `settings` with
+  # the scope rebuilt now, or `{:access_revoked, reason}`.
+  defp rescoped(bulk_action, settings) do
+    case reconstruct_scope(bulk_action) do
+      {:ok, scope} -> {:ok, %{settings | scope: scope}}
+      {:error, reason} -> {:access_revoked, reason}
+    end
+  end
 
   defp mark_finished(bulk_action, result) do
     Ash.update!(bulk_action, %{result: result}, action: :mark_finished, authorize?: false)
@@ -1118,8 +1178,9 @@ defmodule AshBulkDurable.Core.Worker do
   # ── Phase 1: resolving references ──────────────────────────────────────
 
   # `[:ash_bulk_durable, :phase1, :start | :stop | :exception]`. Span
-  # result is the status (`:ok` or `{:atomic_phase1_failed, err}`); resolved
-  # vs failed counts ride the stop event's measurements.
+  # result is the status (`:ok`, `{:atomic_phase1_failed, err}`,
+  # `{:prepare_failed, error}`, `{:access_revoked, reason}` or `:busy`);
+  # resolved vs failed counts ride the stop event's measurements.
   #
   # Only rows holding a reference are `:pending`; the per-row `:resolve`
   # action runs over each `:pending` chunk via `Task.async_stream`. The
@@ -1170,7 +1231,18 @@ defmodule AshBulkDurable.Core.Worker do
     end
   end
 
+  # Asked before the row's bump, so a refused owner bumps nothing.
   defp resolve_alone(bulk_action, settings, concurrency, atomic?, failed_acc) do
+    case rescoped(bulk_action, settings) do
+      {:ok, settings} ->
+        isolate_and_resolve(bulk_action, settings, concurrency, atomic?, failed_acc)
+
+      revoked ->
+        {revoked, failed_acc}
+    end
+  end
+
+  defp isolate_and_resolve(bulk_action, settings, concurrency, atomic?, failed_acc) do
     case isolate_next(bulk_action, :pending) do
       {:alone, row} ->
         case resolve_chunk([row], settings, 1, atomic?) do
@@ -1208,16 +1280,26 @@ defmodule AshBulkDurable.Core.Worker do
         {:ok, failed_acc}
 
       chunk ->
-        case resolve_chunk(chunk, settings, concurrency, atomic?) do
-          {:ok, failed} ->
-            do_resolve_chunks(bulk_action, settings, concurrency, atomic?, failed_acc + failed)
+        case rescoped(bulk_action, settings) do
+          {:ok, settings} ->
+            resolve_read_chunk(chunk, bulk_action, settings, concurrency, atomic?, failed_acc)
 
-          {:atomic_phase1_failed, err, failed} ->
-            {{:atomic_phase1_failed, err}, failed_acc + failed}
-
-          {:prepare_failed, error} ->
-            {{:prepare_failed, error}, failed_acc}
+          revoked ->
+            {revoked, failed_acc}
         end
+    end
+  end
+
+  defp resolve_read_chunk(chunk, bulk_action, settings, concurrency, atomic?, failed_acc) do
+    case resolve_chunk(chunk, settings, concurrency, atomic?) do
+      {:ok, failed} ->
+        do_resolve_chunks(bulk_action, settings, concurrency, atomic?, failed_acc + failed)
+
+      {:atomic_phase1_failed, err, failed} ->
+        {{:atomic_phase1_failed, err}, failed_acc + failed}
+
+      {:prepare_failed, error} ->
+        {{:prepare_failed, error}, failed_acc}
     end
   end
 
@@ -1377,11 +1459,21 @@ defmodule AshBulkDurable.Core.Worker do
     end
   end
 
+  # The owner is asked first, outside the lock (see "Asking the owner again"
+  # above): the chunk, a row run alone and any recovery run with the scope
+  # rebuilt here.
+  defp run_chunk(bulk_action, settings, chunk_index) do
+    case rescoped(bulk_action, settings) do
+      {:ok, settings} -> run_chunk_as(bulk_action, settings, chunk_index)
+      {:access_revoked, reason} -> {:done, fail_access_revoked(bulk_action, reason)}
+    end
+  end
+
   # A chunk that fails rolls back its transaction and releases the lock, so
   # what follows (recovery, a rollback verdict) runs in transactions of its
   # own. A raise anywhere after the chunk started, its commit and a row that
   # moved on included, closes its telemetry span with `:exception`.
-  defp run_chunk(bulk_action, settings, chunk_index) do
+  defp run_chunk_as(bulk_action, settings, chunk_index) do
     case in_pass(bulk_action, &write_next_chunk(&1, settings, chunk_index)) do
       {:ok, {:done, terminal}} ->
         {:done, terminal}
@@ -2051,6 +2143,7 @@ defmodule AshBulkDurable.Core.Worker do
   defp reason_atom("atomic_chunk_rolled_back"), do: :atomic_chunk_rolled_back
   defp reason_atom("staged_file_download_error"), do: :staged_file_download_error
   defp reason_atom("crashed"), do: :crashed
+  defp reason_atom("access_revoked"), do: :access_revoked
   defp reason_atom(_reason), do: nil
 
   defp pending_row_count(bulk_action) do

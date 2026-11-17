@@ -1433,6 +1433,13 @@ defmodule AshBulkDurable.Core.WorkerTest do
       })
     end
 
+    defp drop_platform_roles!(user) do
+      AshBulkDurable.Test.Repo.query!(
+        "UPDATE users SET platform_roles = '{}' WHERE id = $1",
+        [Ecto.UUID.dump!(user.id)]
+      )
+    end
+
     defp leave!(user, organization) do
       AshBulkDurable.Test.Repo.query!(
         "DELETE FROM memberships WHERE user_id = $1 AND organization_id = $2",
@@ -1477,6 +1484,286 @@ defmodule AshBulkDurable.Core.WorkerTest do
         assert %{status: :completed} = reload(bulk_action)
         assert length(regions_from(suffix, ctx.super_user)) == 2
       end
+    end
+
+    # Runs `fun` once, after the first chunk of phase 2 commits.
+    defp after_first_chunk(fun) do
+      handler = "after-first-chunk-#{System.unique_integer([:positive])}"
+      once = make_ref()
+
+      :telemetry.attach(
+        handler,
+        [:ash_bulk_durable, :chunk, :stop],
+        fn _event, _measurements, _metadata, _config ->
+          unless Process.put(once, true), do: fun.()
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+    end
+
+    test "per row: leaving after a chunk fails it before the next, keeping what was written",
+         ctx do
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(3, suffix),
+          user_id: ctx.admin.id,
+          tenant: ctx.organization.id,
+          chunk_size: 1
+        )
+
+      after_first_chunk(fn -> leave!(ctx.admin, ctx.organization) end)
+
+      test_pid = self()
+      handler = "access-revoked-stop-#{suffix}"
+
+      :telemetry.attach(
+        handler,
+        [:ash_bulk_durable, :bulk_action, :stop],
+        fn _event, _measurements, metadata, _config -> send(test_pid, {:stop, metadata}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      assert capture_log(fn -> assert :ok = Worker.run_now(bulk_action.id) end) =~
+               "can no longer act in its tenant (:not_a_member)"
+
+      assert_received {:stop, %{status: :failed, failure_reason: :access_revoked}}
+
+      assert %{
+               status: :failed,
+               rows_done: 1,
+               setup_failures: 0,
+               result: %{"reason" => "access_revoked", "term" => ":not_a_member"}
+             } = failed = reload(bulk_action)
+
+      assert Enum.map(list_rows(bulk_action.id), & &1.status) ==
+               [:succeeded, :resolved, :resolved]
+
+      assert length(regions_from(suffix, ctx.super_user)) == 1
+
+      join!(ctx.admin, ctx.organization)
+
+      assert {:ok, _retried} =
+               AshBulkDurable.retry(failed,
+                 scope: AshBulkDurable.Test.Scope.new(actor: ctx.admin)
+               )
+
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :completed, rows_done: 3} = reload(bulk_action)
+      assert length(regions_from(suffix, ctx.super_user)) == 3
+    end
+
+    for mode <- [:per_row, :all_or_nothing] do
+      test "#{mode}: leaving in phase 1 fails it before the next chunk, writing nothing",
+           ctx do
+        suffix = System.unique_integer([:positive])
+
+        bulk_action =
+          create_bulk_action!(region_rows(2, suffix, MovingResolver),
+            user_id: ctx.admin.id,
+            tenant: ctx.organization.id,
+            chunk_size: 1,
+            mode: unquote(mode)
+          )
+
+        on_exit(&MovingResolver.clear/0)
+        MovingResolver.hook(fn _context -> leave!(ctx.admin, ctx.organization) end)
+
+        assert capture_log(fn -> assert :ok = Worker.run_now(bulk_action.id) end) =~
+                 "can no longer act in its tenant (:not_a_member)"
+
+        assert %{status: :failed, result: %{"reason" => "access_revoked"}} =
+                 reload(bulk_action)
+
+        # Per row, the second row's chunk is refused before it resolves; all
+        # or nothing resolves both in one chunk, and phase 2's is refused.
+        expected =
+          if unquote(mode) == :per_row, do: [:resolved, :pending], else: [:resolved, :resolved]
+
+        assert Enum.map(list_rows(bulk_action.id), & &1.status) == expected
+        assert regions_from(suffix, ctx.super_user) == []
+      end
+    end
+
+    # Its next start stalls out, so every row runs alone; the owner leaves
+    # once that start's setup has asked them, before phase 1's first row.
+    for {phase, resolver, statuses} <- [
+          {1, MovingResolver, [:pending, :pending]},
+          {2, nil, [:resolved, :resolved]}
+        ] do
+      test "in isolation, phase #{phase}: leaving fails it before a row runs alone, bumping none",
+           ctx do
+        suffix = System.unique_integer([:positive])
+
+        bulk_action =
+          create_bulk_action!(region_rows(2, suffix, unquote(resolver)),
+            user_id: ctx.admin.id,
+            tenant: ctx.organization.id,
+            chunk_size: 2
+          )
+
+        # One start short of `:max_stalled_starts`, at the score it has now.
+        score = if unquote(phase) == 1, do: 0, else: 2
+
+        Ash.update!(bulk_action, %{stalled_starts: 2, progress_at_start: score},
+          action: :count_crashes,
+          authorize?: false
+        )
+
+        handler = "leave-at-phase1-#{suffix}"
+
+        :telemetry.attach(
+          handler,
+          [:ash_bulk_durable, :phase1, :start],
+          fn _event, _measurements, _metadata, _config -> leave!(ctx.admin, ctx.organization) end,
+          nil
+        )
+
+        on_exit(fn -> :telemetry.detach(handler) end)
+
+        assert capture_log(fn -> assert :ok = Worker.run_now(bulk_action.id) end) =~
+                 "can no longer act in its tenant (:not_a_member)"
+
+        assert %{status: :failed, stalled_starts: 3, result: %{"reason" => "access_revoked"}} =
+                 reload(bulk_action)
+
+        rows = list_rows(bulk_action.id)
+        assert Enum.map(rows, & &1.status) == unquote(statuses)
+        assert Enum.map(rows, & &1.attempts) == [0, 0]
+        assert regions_from(suffix, ctx.super_user) == []
+      end
+    end
+
+    # Asked again before a chunk that finds nothing left to write, a refusal
+    # stops nothing: the bulk action ends as its rows did.
+    test "a revoke after the last chunk's recovery leaves no row to write", ctx do
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(1, suffix),
+          user_id: ctx.admin.id,
+          tenant: ctx.organization.id,
+          chunk_size: 1
+        )
+
+      # The row fails as forbidden, so its chunk goes through recovery.
+      drop_platform_roles!(ctx.admin)
+      after_first_chunk(fn -> leave!(ctx.admin, ctx.organization) end)
+
+      capture_log(fn -> assert :ok = Worker.run_now(bulk_action.id) end)
+      assert Enum.map(list_rows(bulk_action.id), & &1.status) == [:failed]
+      assert %{status: :completed_with_errors, rows_done: 0, result: result} = reload(bulk_action)
+      refute Map.has_key?(result, "reason")
+    end
+
+    test "a revoke once phase 1 failed every row leaves no row to write", ctx do
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(1, suffix, NoMatchResolver),
+          user_id: ctx.admin.id,
+          tenant: ctx.organization.id,
+          chunk_size: 1
+        )
+
+      handler = "leave-at-phase1-stop-#{suffix}"
+
+      :telemetry.attach(
+        handler,
+        [:ash_bulk_durable, :phase1, :stop],
+        fn _event, _measurements, _metadata, _config -> leave!(ctx.admin, ctx.organization) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      capture_log(fn -> assert :ok = Worker.run_now(bulk_action.id) end)
+      assert Enum.map(list_rows(bulk_action.id), & &1.status) == [:failed]
+      assert %{status: :completed_with_errors, rows_done: 0, result: result} = reload(bulk_action)
+      refute Map.has_key?(result, "reason")
+    end
+
+    # All or nothing ends `:completed` or `:failed` only: one with every row
+    # refused fails, as it would with the owner still there.
+    for mode <- [:per_row, :all_or_nothing] do
+      test "#{mode}: a start that finds every row refused before it was stored", ctx do
+        suffix = System.unique_integer([:positive])
+        rows = region_rows(2, suffix) |> Enum.map(&refused/1)
+
+        bulk_action =
+          create_bulk_action!(rows,
+            user_id: ctx.admin.id,
+            tenant: ctx.organization.id,
+            chunk_size: 2,
+            mode: unquote(mode)
+          )
+
+        leave!(ctx.admin, ctx.organization)
+
+        capture_log(fn -> assert :ok = Worker.run_now(bulk_action.id) end)
+        assert Enum.map(list_rows(bulk_action.id), & &1.status) == [:failed, :failed]
+        fresh = reload(bulk_action)
+        assert fresh.rows_done == 0
+
+        if unquote(mode) == :per_row do
+          assert %{status: :completed_with_errors} = fresh
+          refute Map.has_key?(fresh.result, "reason")
+        else
+          assert %{status: :failed, result: %{"reason" => "access_revoked"}} = fresh
+        end
+      end
+    end
+
+    # A run that died after the last rows committed but before the verdict.
+    test "a start that finds every row applied completes it, deleting its staged files", ctx do
+      put_config(:storage, AshBulkDurable.TestStorage)
+      start_supervised!(AshBulkDurable.TestStorage)
+      key = "bulk-staging/#{ctx.admin.id}/abc/companions/logo.zip"
+      AshBulkDurable.TestStorage.put(key, "zip")
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(1, suffix),
+          user_id: ctx.admin.id,
+          tenant: ctx.organization.id,
+          chunk_size: 1,
+          staged_files: %{"logo" => key}
+        )
+
+      [row] = list_rows(bulk_action.id)
+      Ash.Seed.update!(row, %{status: :succeeded})
+      Ash.Seed.update!(bulk_action, %{rows_done: 1})
+      leave!(ctx.admin, ctx.organization)
+
+      capture_log(fn -> assert :ok = Worker.run_now(bulk_action.id) end)
+      assert %{status: :completed, rows_done: 1} = reload(bulk_action)
+      refute key in AshBulkDurable.TestStorage.keys()
+    end
+
+    # Regions are written by platform admins only.
+    test "a chunk runs with the roles the owner has when it starts", ctx do
+      suffix = System.unique_integer([:positive])
+
+      bulk_action =
+        create_bulk_action!(region_rows(3, suffix),
+          user_id: ctx.admin.id,
+          tenant: ctx.organization.id,
+          chunk_size: 1
+        )
+
+      after_first_chunk(fn -> drop_platform_roles!(ctx.admin) end)
+
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :completed_with_errors, rows_done: 1} = reload(bulk_action)
+
+      assert Enum.map(list_rows(bulk_action.id), & &1.status) ==
+               [:succeeded, :failed, :failed]
+
+      assert length(regions_from(suffix, ctx.super_user)) == 1
     end
 
     test "a user who no longer exists fails it too", ctx do

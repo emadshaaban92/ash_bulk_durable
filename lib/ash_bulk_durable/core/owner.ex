@@ -30,11 +30,13 @@ defmodule AshBulkDurable.Core.Owner do
   removed from it): the worker writes every row that names no tenant of its
   own in `tenant` whatever the scope says, so a scope can't keep them out,
   only this can. A row that names its own tenant is guarded only by its
-  target's policies. It is asked each time a run starts, and the start that
-  gets `{:error, _}` fails the bulk action, `{:failed, %{reason:
-  :access_revoked, term: inspect(reason)}}`, before that run's first row; a
-  run already under way keeps its scope until it ends or restarts. A retry
-  fails the same way until they can act there again.
+  target's policies. It is asked each time a run starts and again before
+  every chunk, and `{:error, _}` fails the bulk action, `{:failed, %{reason:
+  :access_revoked, term: inspect(reason)}}`, before the next row runs; rows
+  earlier chunks wrote stay written, and one with no row left to write ends
+  as its rows did. Each chunk runs with the scope rebuilt for it, so a
+  change of roles applies from the next chunk on. A retry fails the same
+  way until they can act there again.
 
   Return `{:error, _}` only for a definite refusal: it fails the bulk action
   at once, and only a retry once the owner can act there again reopens it.
