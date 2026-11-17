@@ -189,11 +189,12 @@ children = [
 
 It starts each queued bulk action as soon as it is submitted or retried on its
 node, and every few seconds starts any other node's: one queued, or one whose
-run died with its node. It also runs the daily sweep of staged files. Without
-a poller, bulk actions stay queued and a warning is logged once; set
-`warn_without_poller: false` on nodes that leave the work to others, and in
-tests, which run bulk actions with `AshBulkDurable.Core.Worker.run_now/1` or
-`drain/0`.
+run died with its node. It also runs the daily sweep of staged files, and,
+when `:retention` is set, deletes the bulk actions that finished longer ago
+than that, with their rows. Without a poller, bulk actions stay queued and a
+warning is logged once; set `warn_without_poller: false` on nodes that leave
+the work to others, and in tests, which run bulk actions with
+`AshBulkDurable.Core.Worker.run_now/1` or `drain/0`.
 
 Its options, each also an `:ash_bulk_durable` config key:
 
@@ -202,8 +203,23 @@ Its options, each also an `:ash_bulk_durable` config key:
 | `:poll_interval` | 5 seconds | how often it looks for bulk actions to start |
 | `:max_running` | `2` | bulk actions this node runs at once |
 | `:stale_after` | 2 minutes | how long a running bulk action's liveness hint may go unstamped before another run starts it |
-| `:staging_sweep_interval` | a day | between staged-file sweeps; `nil` for none |
+| `:staging_sweep_interval` | a day | between staged-file sweeps and retention prunes; `nil` for none |
+| `:retention` | `nil`, keep all | how long a bulk action is kept once it finished `:completed`, `:failed` or `:cancelled`; then it is deleted with its rows |
 | `:shutdown_grace` | 20 seconds | how long a run still going at shutdown has to finish before it is killed |
+
+Bulk actions and their rows are kept for good unless you set `:retention`, in
+milliseconds:
+
+```elixir
+config :ash_bulk_durable, retention: :timer.hours(24 * 30)
+```
+
+The prune never deletes a bulk action that is `:completed_with_errors`: that one
+waits for its owner to retry or abandon it. A `:failed` one can be retried only
+until the prune deletes it. It deletes one bulk action per transaction, picked
+at random, with its own query, not through the resource's actions or policies.
+One that a table of yours references without `on_delete: :delete` can't be
+deleted: the prune logs an error, keeps it, and goes on with the others.
 
 A run stamps its bulk action's liveness hint (`alive_at`) as it goes, and at
 least every `:alive_interval` (30 seconds by default). Two runs of one bulk
