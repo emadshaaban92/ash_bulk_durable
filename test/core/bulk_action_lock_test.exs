@@ -240,6 +240,11 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
       retry =
         spawn_link(fn ->
           :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
+
+          receive do
+            :start -> :ok
+          end
+
           send(test_pid, {:retried, AshBulkDurable.retry(bulk_action, scope: ctx.scope)})
         end)
 
@@ -264,6 +269,7 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
       )
 
       on_exit(fn -> :telemetry.detach(handler) end)
+      send(retry, :start)
       assert_receive :retrying, 2_000
 
       abandon =
@@ -321,6 +327,11 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
       retry =
         spawn_link(fn ->
           :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
+
+          receive do
+            :start -> :ok
+          end
+
           send(test_pid, {:retried, AshBulkDurable.retry(bulk_action, scope: ctx.scope)})
         end)
 
@@ -345,6 +356,7 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
       )
 
       on_exit(fn -> :telemetry.detach(handler) end)
+      send(retry, :start)
       assert_receive :retrying, 2_000
 
       assert :ok = PurgeStaleStaging.sweep()
@@ -470,6 +482,11 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
       retry =
         spawn_link(fn ->
           :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
+
+          receive do
+            :start -> :ok
+          end
+
           send(test_pid, {:retried, AshBulkDurable.retry(bulk_action, scope: ctx.scope)})
         end)
 
@@ -494,6 +511,7 @@ defmodule AshBulkDurable.Core.BulkActionLockTest do
       )
 
       on_exit(fn -> :telemetry.detach(handler) end)
+      send(retry, :start)
       assert_receive :retrying, 2_000
 
       Retention.prune(:timer.hours(24))
