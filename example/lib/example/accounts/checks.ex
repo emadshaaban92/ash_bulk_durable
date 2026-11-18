@@ -37,3 +37,23 @@ defmodule Example.Accounts.Checks.ActorHasOrganizationRole do
 
   def match?(_actor, _context, _opts), do: false
 end
+
+defmodule Example.Accounts.Checks.ChangingPlatformRoles do
+  @moduledoc """
+  True when a write would leave a user with platform roles other than the
+  ones they hold. A new user holds none, so creating one with none is no
+  change.
+  """
+  use Ash.Policy.SimpleCheck
+
+  @impl true
+  def describe(_opts), do: "changing platform roles"
+
+  @impl true
+  def match?(_actor, %{changeset: %Ash.Changeset{} = changeset}, _opts) do
+    roles = Ash.Changeset.get_attribute(changeset, :platform_roles) || []
+    Enum.sort(roles) != Enum.sort(changeset.data.platform_roles || [])
+  end
+
+  def match?(_actor, _context, _opts), do: false
+end

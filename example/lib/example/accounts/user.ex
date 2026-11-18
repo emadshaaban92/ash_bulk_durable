@@ -9,7 +9,8 @@ defmodule Example.Accounts.User do
     authorizers: [Ash.Policy.Authorizer]
 
   alias Example.Accounts.Checks.{ActorHasOrganizationRole, ActorHasPlatformRole}
-  alias Example.Accounts.Checks.ActorIsSuperUser
+  alias Example.Accounts.Checks.{ActorIsSuperUser, ChangingPlatformRoles}
+  alias Example.Accounts.MemberOfOrganization
 
   postgres do
     table "users"
@@ -62,7 +63,7 @@ defmodule Example.Accounts.User do
       primary? true
       require_atomic? false
       accept [:name, :email, :phone, :platform_roles, :organization_id, :organization_roles]
-      validate Example.Accounts.MemberOfOrganization
+      validate MemberOfOrganization
     end
 
     update :update_profile do
@@ -79,7 +80,19 @@ defmodule Example.Accounts.User do
       require_atomic? false
       argument :organization_id, :uuid, allow_nil?: false
       change set_attribute(:organization_id, arg(:organization_id))
-      validate Example.Accounts.MemberOfOrganization
+
+      # Acting there with the roles held there, none for a super user.
+      change fn changeset, _context ->
+        roles =
+          MemberOfOrganization.membership_roles(
+            changeset.data.id,
+            Ash.Changeset.get_argument(changeset, :organization_id)
+          )
+
+        Ash.Changeset.force_change_attribute(changeset, :organization_roles, roles || [])
+      end
+
+      validate MemberOfOrganization
     end
   end
 
@@ -95,6 +108,15 @@ defmodule Example.Accounts.User do
     policy action([:create, :update]) do
       authorize_if {ActorHasOrganizationRole, role: :admin}
       authorize_if {ActorHasPlatformRole, role: :platform_admin}
+    end
+
+    # Platform roles reach past every organization, so an organization or
+    # platform admin who could hand them out could make anyone, themselves
+    # included, a super user. Only a super user changes them, by hand, as
+    # with :promote_to_super.
+    policy [action([:create, :update]), ChangingPlatformRoles] do
+      forbid_if context_equals(:action_source, :ash_bulk_durable)
+      authorize_if ActorIsSuperUser
     end
 
     policy action(:update_profile) do

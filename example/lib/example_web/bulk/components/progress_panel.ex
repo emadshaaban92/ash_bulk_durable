@@ -379,7 +379,7 @@ defmodule ExampleWeb.Bulk.Components.ProgressPanel do
 
   defp retry_instructions(_per_row) do
     gettext(
-      "Upload your fixed CSV and click Retry failed rows to run only the failed rows again."
+      "Upload your fixed CSV and click Retry failed rows to rerun every row that hasn't succeeded."
     )
   end
 
