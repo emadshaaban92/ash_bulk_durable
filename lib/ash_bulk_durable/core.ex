@@ -24,7 +24,8 @@ defmodule AshBulkDurable.Core do
     Poller,
     PurgeStaleStaging,
     Retry,
-    Runner
+    Runner,
+    StagedFiles
   }
 
   @doc """
@@ -47,8 +48,11 @@ defmodule AshBulkDurable.Core do
       a row's own replaces it rather than merging into it.
     * `:mode` — `:per_row` (default) or `:all_or_nothing`.
     * `:chunk_size` — rows a per-row bulk action commits per batch.
-    * `:staged_files` — `%{name => storage_key}`: files staged for the
-      resolvers, deleted once the bulk action no longer needs them.
+    * `:staged_files` — `%{name => storage_key}`, or a list of `{name,
+      storage_key}` pairs: files staged for the resolvers, deleted once the
+      bulk action no longer needs them. Every key must be the owner's, under
+      `bulk-staging/<owner>/` (`AshBulkDurable.Core.StagedFiles`), or nothing
+      is written.
     * `:metadata` — a map kept on the bulk action and never read here.
 
   Raises `ArgumentError` when `resource` is not an Ash resource or has no
@@ -58,28 +62,32 @@ defmodule AshBulkDurable.Core do
     action = action!(resource, action)
     rows = Enum.to_list(rows)
     scope = Keyword.fetch!(opts, :scope)
+    owner = Owner.worker_key(scope)
+    staged_files = Keyword.get(opts, :staged_files) || %{}
 
-    Ash.create(
-      config(:bulk_action_resource),
-      %{
-        user_id: Owner.worker_key(scope),
-        resource_name: Introspection.resource_name(resource),
-        action_name: action.name,
-        action_type: action.type,
-        tenant: Keyword.get_lazy(opts, :tenant, fn -> Runner.scope_tenant(scope) end),
-        input: opts |> Keyword.get(:input) |> Runner.stored_input(),
-        staged_files: Keyword.get(opts, :staged_files, %{}),
-        metadata: Keyword.get(opts, :metadata, %{}),
-        total_rows: length(rows),
-        mode: Keyword.get(opts, :mode, :per_row),
-        chunk_size:
-          Keyword.get_lazy(opts, :chunk_size, fn -> config(:default_chunk_size, 50) end),
-        rows: rows
-      },
-      action: :create,
-      authorize?: false
-    )
-    |> Poller.nudge_after()
+    with :ok <- StagedFiles.check(staged_files, owner) do
+      Ash.create(
+        config(:bulk_action_resource),
+        %{
+          user_id: owner,
+          resource_name: Introspection.resource_name(resource),
+          action_name: action.name,
+          action_type: action.type,
+          tenant: Keyword.get_lazy(opts, :tenant, fn -> Runner.scope_tenant(scope) end),
+          input: opts |> Keyword.get(:input) |> Runner.stored_input(),
+          staged_files: Map.new(staged_files),
+          metadata: Keyword.get(opts, :metadata, %{}),
+          total_rows: length(rows),
+          mode: Keyword.get(opts, :mode, :per_row),
+          chunk_size:
+            Keyword.get_lazy(opts, :chunk_size, fn -> config(:default_chunk_size, 50) end),
+          rows: rows
+        },
+        action: :create,
+        authorize?: false
+      )
+      |> Poller.nudge_after()
+    end
   end
 
   defp action!(resource, action) do

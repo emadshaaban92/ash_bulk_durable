@@ -4,9 +4,11 @@ defmodule AshBulkDurable.Sheet.Companions do
   action, whoever stages it.
 
     * **Every key is the owner's.** A key must start with
-      `bulk-staging/<owner>/` and hold no `..` segment. Keys are computed by
-      the server that presigned their upload, never supplied by a browser,
-      so this defends against a forged submit naming another user's staged
+      `bulk-staging/<owner>/` and hold no `..` segment, as the core requires
+      of every bulk action (`AshBulkDurable.Core.StagedFiles`); checked here
+      too so the refusal names the sheet's field. Keys are computed by the
+      server that presigned their upload, never supplied by a browser, so
+      this defends against a forged submit naming another user's staged
       files, or a key such as `bulk-staging/<owner>/../../public/x` that
       starts with the prefix yet escapes it.
     * **Every requirement is met.** A mapped field whose handler has a
@@ -16,14 +18,13 @@ defmodule AshBulkDurable.Sheet.Companions do
       oversized file (the screens' presigned upload signs its length).
   """
 
+  alias AshBulkDurable.Core.StagedFiles
   alias AshBulkDurable.Sheet
   alias AshBulkDurable.Sheet.Mapping
 
   @doc "`:ok`, or `{:error, error}` naming the first companion refused."
   def check(%Mapping{} = mapping, companions, owner) do
-    prefix = "bulk-staging/#{owner}/"
-
-    with :ok <- check_keys(companions, prefix) do
+    with :ok <- check_keys(companions, owner) do
       check_fields(mapping, companions)
     end
   end
@@ -39,15 +40,16 @@ defmodule AshBulkDurable.Sheet.Companions do
     end)
   end
 
-  defp check_keys(companions, prefix) do
-    case Enum.find(companions, fn {_name, key} -> not safe_key?(key, prefix) end) do
+  defp check_keys(companions, owner) do
+    case Enum.find(companions, fn {_name, key} -> not StagedFiles.owned?(key, owner) end) do
       nil ->
         :ok
 
       {name, _key} ->
         refuse(
           name,
-          "every companion key must start with \"#{prefix}\" and contain no \"..\" segment"
+          "every companion key must start with \"#{StagedFiles.prefix(owner)}\" " <>
+            "and contain no \"..\" segment"
         )
     end
   end
@@ -69,12 +71,6 @@ defmodule AshBulkDurable.Sheet.Companions do
       do: :ok,
       else: {:error, "its file must be one of #{Enum.join(accept, ", ")}"}
   end
-
-  defp safe_key?(key, prefix) when is_binary(key) do
-    String.starts_with?(key, prefix) and ".." not in Path.split(key)
-  end
-
-  defp safe_key?(_key, _prefix), do: false
 
   defp refuse(name, message) do
     {:error,

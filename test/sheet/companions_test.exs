@@ -56,7 +56,9 @@ defmodule AshBulkDurable.Sheet.CompanionsTest do
   test "refuses a key under another user's staging prefix", ctx do
     key = key(Ecto.UUID.generate(), "certificates.zip")
 
-    assert {:error, %Ash.Error.Invalid{}} = stage(ctx, %{document: key})
+    assert {:error, %Ash.Error.Invalid{errors: [%{field: :document}]}} =
+             stage(ctx, %{document: key})
+
     assert stored_count(ctx) == 0
   end
 
@@ -64,7 +66,9 @@ defmodule AshBulkDurable.Sheet.CompanionsTest do
     # Starts with `bulk-staging/<user_id>/` yet normalizes into `public/`.
     key = "bulk-staging/#{ctx.super_user.id}/../../public/evil.zip"
 
-    assert {:error, %Ash.Error.Invalid{}} = stage(ctx, %{document: key})
+    assert {:error, %Ash.Error.Invalid{errors: [%{field: :document}]}} =
+             stage(ctx, %{document: key})
+
     assert stored_count(ctx) == 0
   end
 
@@ -123,7 +127,8 @@ defmodule AshBulkDurable.Sheet.CompanionsTest do
             %{document: key(ctx.super_user.id, "certificates.pdf")},
             %{}
           ] do
-        assert {:error, %Ash.Error.Invalid{}} = retry(ctx, companions)
+        assert {:error, %Ash.Error.Invalid{errors: [%{field: :document}]}} =
+                 retry(ctx, companions)
       end
 
       assert %{status: :completed_with_errors, staged_files: %{"document" => key}} = held(ctx)
