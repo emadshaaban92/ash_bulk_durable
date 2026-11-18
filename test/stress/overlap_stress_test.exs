@@ -40,10 +40,12 @@ defmodule AshBulkDurable.OverlapStressTest do
   each ran it alone (the bulk action's `isolating_row_id` then) may end
   crashed too, and an all-or-nothing bulk action disrupted so
   `:max_stalled_starts` times in a pass may fail as `:crashed`, as may a
-  per-row one disrupted more than `:max_setup_failures` times, the runs
-  dying before any row that its give-up allows past isolation and the row
-  it kills. The summary
-  counts those as excused. A poller's shutdown is no crash, so it excuses
+  per-row one disrupted more than its give-up leaves to the runs that die
+  before any row: more than `:max_setup_failures` times while a row that
+  kills its run is open, the rest of the give-up being that row's own deaths
+  in isolation and alone, and more than `:max_stalled_starts` plus
+  `:max_row_attempts` plus `:max_setup_failures` times otherwise. The
+  summary counts those as excused. A poller's shutdown is no crash, so it excuses
   nothing.
 
   The first bulk action of every iteration is always one a run can be held
@@ -62,6 +64,8 @@ defmodule AshBulkDurable.OverlapStressTest do
       default.
     * `STRESS_TIMEOUT` — seconds an iteration may take to bring every bulk
       action to a verdict, 120 by default.
+    * `STRESS_PHASE1_CONCURRENCY` — rows phase 1 resolves at once, 4 by
+      default, as shipped.
 
   The seed fixes the mix and the driver's choices, not the scheduler: two
   runs on one seed differ in timing. A failure prints the seed and each
@@ -112,13 +116,21 @@ defmodule AshBulkDurable.OverlapStressTest do
     )
     """)
 
-    previous = Application.get_env(:ash_bulk_durable, :alive_interval)
-    Application.put_env(:ash_bulk_durable, :alive_interval, @alive_interval)
+    config = [
+      alive_interval: @alive_interval,
+      phase1_concurrency: env_integer("STRESS_PHASE1_CONCURRENCY", 4)
+    ]
+
+    previous =
+      Map.new(config, fn {key, _} -> {key, Application.fetch_env(:ash_bulk_durable, key)} end)
+
+    Application.put_all_env(ash_bulk_durable: config)
 
     on_exit(fn ->
-      if previous,
-        do: Application.put_env(:ash_bulk_durable, :alive_interval, previous),
-        else: Application.delete_env(:ash_bulk_durable, :alive_interval)
+      Enum.each(previous, fn
+        {key, {:ok, value}} -> Application.put_env(:ash_bulk_durable, key, value)
+        {key, :error} -> Application.delete_env(:ash_bulk_durable, key)
+      end)
 
       Repo.query!("DROP TABLE IF EXISTS stress_applied")
       Repo.query!("DROP TABLE IF EXISTS stress_verdicts")
@@ -135,7 +147,11 @@ defmodule AshBulkDurable.OverlapStressTest do
     timeout = :timer.seconds(env_integer("STRESS_TIMEOUT", 120))
 
     for iteration_seed <- seed..(seed + iterations - 1)//1 do
-      IO.puts("\noverlap stress: STRESS_SEED=#{iteration_seed} STRESS_BULK_ACTIONS=#{size}")
+      IO.puts(
+        "\noverlap stress: STRESS_SEED=#{iteration_seed} STRESS_BULK_ACTIONS=#{size} " <>
+          "STRESS_PHASE1_CONCURRENCY=#{Core.config(:phase1_concurrency)}"
+      )
+
       {elapsed, report} = :timer.tc(fn -> iteration(iteration_seed, size, timeout) end)
       IO.puts(summary(report, elapsed))
 
@@ -842,9 +858,19 @@ defmodule AshBulkDurable.OverlapStressTest do
   end
 
   # Per row, only chaos can fail it, and only as `:crashed`: enough
-  # stalled starts in a row to give up on it.
-  defp check_outcome(state, :per_row, %{status: :failed} = record, _rows, ba, disruptions) do
-    if record.result["reason"] == "crashed" and disruptions > max_setup_failures(),
+  # stalled starts in a row to give up on it. A row that kills its run, left
+  # open, dies in isolation and alone as often as the give-up allows them.
+  defp check_outcome(state, :per_row, %{status: :failed} = record, rows, ba, disruptions) do
+    killer? =
+      Enum.any?(
+        rows,
+        &(&1.status in [:pending, :resolved] and class(current(ba, &1.row_index)) == :kill)
+      )
+
+    need =
+      max_setup_failures() + if(killer?, do: 0, else: max_stalled_starts() + max_row_attempts())
+
+    if record.result["reason"] == "crashed" and disruptions > need,
       do: %{state | excused: state.excused + 1},
       else:
         violation(

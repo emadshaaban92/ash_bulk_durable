@@ -716,6 +716,48 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     end
   end
 
+  # An action's side effects outside the database, such as an email from an
+  # `after_action`, aren't rolled back with its chunk: each try of a row's set
+  # runs them again, until the set commits. In a default chunk of 50 whose
+  # first row fails, every other row runs once per try of a set holding it:
+  # rows 26-50 in rows 1-50 and then their own half (2 runs), rows 13-25 in
+  # 1-50, 1-25 and then their quarter (3), rows 7-12 in 1-50, 1-25, 1-12 and
+  # then their own set (4), and rows 2-6 in 1-50, 1-25, 1-12, 1-6 and then
+  # alone (5). Each record is written once.
+  describe "side effects of a halved chunk" do
+    test "run once per try of a row's set, while its record is written once", ctx do
+      AshBulkDurable.Test.SideEffects.start()
+      scope = Scope.new(actor: create_user!("s" <> ctx.tag))
+
+      inputs =
+        Enum.map(1..50, fn i ->
+          %{
+            code: "#{ctx.tag}-s#{i}",
+            name: "#{ctx.tag} sN#{i}",
+            native_name: if(i == 1, do: "refused", else: "sA#{i}")
+          }
+        end)
+
+      {:ok, bulk_action} =
+        AshBulkDurable.bulk_create(inputs, Region, :create_counted, scope: scope)
+
+      assert bulk_action.chunk_size == 50
+      assert :ok = Worker.run_now(bulk_action.id)
+      assert %{status: :completed_with_errors, rows_done: 49} = reload(bulk_action)
+
+      runs = AshBulkDurable.Test.SideEffects.counts()
+
+      # Row 1 fails its validation, before its side effect, in every try.
+      assert Enum.map(1..50, &Map.get(runs, "#{ctx.tag}-s#{&1}", 0)) ==
+               [0] ++
+                 List.duplicate(5, 5) ++
+                 List.duplicate(4, 6) ++ List.duplicate(3, 13) ++ List.duplicate(2, 25)
+
+      assert Enum.sort(created_with(ctx, "s")) ==
+               Enum.sort(for i <- 2..50, do: "#{ctx.tag}-s#{i}")
+    end
+  end
+
   describe "all or nothing, rolled back" do
     test "writes its verdict under the lock: not while another transaction holds it", ctx do
       taken!(ctx, 2)

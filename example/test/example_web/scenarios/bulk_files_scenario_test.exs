@@ -17,7 +17,7 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
 
   alias AshBulkDurable.Core.{PurgeStaleStaging, Worker}
   alias Example.BulkActions.BulkAction
-  alias Example.Test.{SlowStorage, TestStorage}
+  alias Example.Test.{GatedStorage, SlowStorage, TestStorage}
 
   require Ash.Query
 
@@ -115,6 +115,35 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
     assert %{photos: [key]} = product(moved)
     assert stored(key) == "back.pdf"
     refute key == extracted
+  end
+
+  # Phase 1 resolves rows 4 at once by default, and each row's resolve reads
+  # the ZIP through the one descriptor the chunk's resolver opened.
+  test "photos extracted 4 at a time from one ZIP each land on their own product",
+       %{conn: conn, super_user: user} do
+    put_config(:phase1_concurrency, 4)
+    put_storage(GatedStorage)
+    GatedStorage.start(4)
+    files = for i <- 1..10, do: {~c"p#{i}.pdf", "photo #{i}"}
+    skus = for _ <- 1..10, do: sku()
+
+    {:ok, view, _html} = conn |> login_as(user) |> live(~p"/bulk")
+    choose(view, "create")
+
+    rows =
+      skus
+      |> Enum.with_index(1)
+      |> Enum.map_join("\n", fn {sku, i} -> "#{sku},#{i},p#{i}.pdf" end)
+
+    bulk_action = submit(view, user, "sku,stock,photos\n#{rows}\n", %{}, files)
+
+    assert drain_finished(bulk_action).status == :completed
+    assert GatedStorage.most() == 4
+
+    for {sku, i} <- Enum.with_index(skus, 1) do
+      assert %{stock: ^i, photos: [key]} = product(sku)
+      assert stored(key) == "photo #{i}"
+    end
   end
 
   test "a photo too slow to store fails its row alone, on a bulk update, and the row retries",
@@ -512,14 +541,16 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
     end
   end
 
-  defp submit(view, user, csv, form_params \\ %{}) do
+  defp submit(view, user, csv, form_params \\ %{}, files \\ nil) do
+    archive = if files, do: zip(files), else: zip()
+
     view
     |> file_input("#main_form", :sheet, [%{name: "sheet.csv", content: csv, type: "text/csv"}])
     |> render_upload("sheet.csv")
 
     view
     |> file_input("#field__photos", :companion__photos, [
-      %{name: "photos.zip", content: zip(), type: "application/zip"}
+      %{name: "photos.zip", content: archive, type: "application/zip"}
     ])
     |> render_upload("photos.zip")
 
@@ -532,7 +563,7 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
       |> Ash.read_one!(authorize?: false)
 
     # The browser's PUT to the presigned URL.
-    Enum.each(bulk_action.staged_files, fn {_name, key} -> TestStorage.put(key, zip()) end)
+    Enum.each(bulk_action.staged_files, fn {_name, key} -> TestStorage.put(key, archive) end)
     bulk_action
   end
 
