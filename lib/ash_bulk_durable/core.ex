@@ -29,8 +29,11 @@ defmodule AshBulkDurable.Core do
   }
 
   @doc """
-  Creates a bulk action running `action` of `resource` over `rows`, writing
-  the bulk action and its rows in one transaction. A row is
+  Creates a bulk action running `action` of `resource` over `rows`, an
+  enumerable, writing the bulk action and its rows in one transaction. A
+  bulk action holds at most `:max_rows` rows (`100_000` by default): one of
+  more is refused with nothing written, and no more of a stream is read than
+  it takes to go over the cap. A row is
   `%{target:, input:, metadata:, error:}`, every key optional (see
   `AshBulkDurable.Core.Runner`). Returns `{:ok, bulk_action}`, or `{:error,
   error}` with nothing written. The bulk action is `:queued`; this node's
@@ -60,7 +63,7 @@ defmodule AshBulkDurable.Core do
   """
   def create(resource, action, rows, opts) do
     action = action!(resource, action)
-    rows = Enum.to_list(rows)
+    rows = take_rows(rows)
     scope = Keyword.fetch!(opts, :scope)
     owner = Owner.worker_key(scope)
     staged_files = Keyword.get(opts, :staged_files) || %{}
@@ -89,6 +92,15 @@ defmodule AshBulkDurable.Core do
       |> Poller.nudge_after()
     end
   end
+
+  @doc false
+  # The most rows a bulk action holds; `ValidateMaxRows` refuses more.
+  def max_rows, do: config(:max_rows, 100_000)
+
+  @doc false
+  # The first `max_rows/0` + 1 of `rows`: enough for the create to refuse
+  # an enumerable over the cap without reading the rest of it.
+  def take_rows(rows), do: Enum.take(rows, max_rows() + 1)
 
   defp action!(resource, action) do
     unless Ash.Resource.Info.resource?(resource),
