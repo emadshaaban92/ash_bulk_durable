@@ -1455,15 +1455,25 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     on_exit(fn -> :telemetry.detach(handler) end)
   end
 
-  # From the end of the run's `n`th `:run` batch, another connection waits for
-  # the bulk action's lock: it holds it from the moment that batch's
-  # transaction ends, until told.
+  # From the end of the run's `n`th `:run` batch, another connection asks for
+  # the bulk action's lock, and the run's next transaction waits at its
+  # `begin` until it holds it, until told. The batch's transaction has
+  # ended by then, so the lock is free to take, whether it committed or
+  # rolled back.
+  #
+  # Waiting only for the locker to queue for the lock let the run take it
+  # first now and then. A batch that commits has updated the bulk action, so
+  # the woken locker goes on to lock the row's new version, which the run's
+  # next transaction could lock first. A batch that failed let the lock go
+  # as its transaction aborted, before the rollback, so the locker never
+  # queued at all.
   defp lock_after_batch(bulk_action, n) do
     test_pid = self()
 
     after_batch(n, fn ->
-      send(test_pid, {:locker, lock_elsewhere(bulk_action.id, wait?: true)})
-      assert eventually(&waiting_for_lock?/0)
+      locker = lock_elsewhere(bulk_action.id, wait?: true)
+      send(test_pid, {:locker, locker})
+      at_next_begin(fn -> assert_receive {:locked, ^locker}, 2_000 end)
     end)
 
     fn ->
@@ -1513,18 +1523,30 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
     fn -> Map.new(index, fn {kind, i} -> {kind, :counters.get(counters, i)} end) end
   end
 
-  defp waiting_for_lock? do
-    %{rows: [[count]]} =
-      Repo.query!(
-        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' " <>
-          "AND query LIKE '%FOR NO KEY UPDATE%'"
-      )
+  # Runs `fun` once, at the next transaction the test process (the run,
+  # under `Worker.run_now/1`) begins.
+  defp at_next_begin(fun) do
+    test_pid = self()
+    handler = "at-next-begin-#{System.unique_integer([:positive])}"
 
-    count > 0
+    :telemetry.attach(
+      handler,
+      [:ash_bulk_durable, :test, :repo, :query],
+      fn _event, _measurements, %{query: query}, _config ->
+        if self() == test_pid and query == "begin" do
+          :telemetry.detach(handler)
+          fun.()
+        end
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
   end
 
-  # Holds the bulk action's row lock from a connection of its own until told.
-  # With `wait?: true` it waits for the lock rather than for having it.
+  # Holds the bulk action's row lock from a connection of its own until told,
+  # sending `{:locked, pid}` once it has it. With `wait?: true` it doesn't
+  # wait for that.
   defp lock_elsewhere(id, opts \\ []) do
     test_pid = self()
 
@@ -1537,7 +1559,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
             Ecto.UUID.dump!(id)
           ])
 
-          send(test_pid, :locked)
+          send(test_pid, {:locked, self()})
 
           receive do
             :release -> :ok
@@ -1549,7 +1571,7 @@ defmodule AshBulkDurable.Core.WorkerLockTest do
         send(test_pid, :released)
       end)
 
-    unless opts[:wait?], do: assert_receive(:locked, 2_000)
+    unless opts[:wait?], do: assert_receive({:locked, ^pid}, 2_000)
     pid
   end
 
