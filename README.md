@@ -44,7 +44,9 @@ end
 CSV and XLSX need no system packages. An XLSX is read by
 [calamine](https://github.com/tafia/calamine), a Rust library, through
 `spreadsheet`'s precompiled NIF, downloaded at compile time for the common
-Linux, macOS and Windows targets.
+Linux, macOS and Windows targets. `AshBulkDurable.Sheet.ExcelReader.XlsxReader`
+reads it in pure Elixir with [xlsx_reader](https://github.com/xavier/xlsx_reader)
+instead, a few times slower, with the differences its moduledoc lists.
 
 ## Setup
 
