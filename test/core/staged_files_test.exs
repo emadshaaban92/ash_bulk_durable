@@ -31,6 +31,43 @@ defmodule AshBulkDurable.Core.StagedFilesTest do
       refute StagedFiles.owned?("bulk-staging/u1/abc/../../../public/x", "u1")
     end
 
+    # The worker could never fetch these from the local store, so they are
+    # refused at submit rather than failing the bulk action later.
+    test "a key that is not plain is not, though it stays under the prefix" do
+      for key <- [
+            "bulk-staging/u1/",
+            "bulk-staging/u1//logo.zip",
+            "bulk-staging/u1/abc//logo.zip",
+            "bulk-staging/u1/./logo.zip",
+            "bulk-staging/u1/abc/.",
+            "bulk-staging/u1/abc/",
+            "bulk-staging/u1/a\\b.zip",
+            "bulk-staging/u1/a\0b.zip",
+            "bulk-staging/u1/" <> <<0xFF>>
+          ] do
+        refute StagedFiles.owned?(key, "u1"), "#{inspect(key)} passed"
+      end
+    end
+
+    test "agrees with the keys Storage.Local accepts, under the owner's prefix" do
+      for rest <- [
+            "a/b.zip",
+            "a b/é.zip",
+            "a..b",
+            ".hidden/x",
+            "",
+            "/",
+            "a//b",
+            "./a",
+            "a/..",
+            "a\\b"
+          ] do
+        key = "bulk-staging/u1/" <> rest
+        local? = match?({:ok, _path}, AshBulkDurable.Storage.Local.path(key, root: "/srv"))
+        assert StagedFiles.owned?(key, "u1") == local?, "#{inspect(key)}: local? #{local?}"
+      end
+    end
+
     test "a key that is not a string is not" do
       refute StagedFiles.owned?(nil, "u1")
       refute StagedFiles.owned?(:"bulk-staging/u1/logo.zip", "u1")
@@ -66,6 +103,14 @@ defmodule AshBulkDurable.Core.StagedFilesTest do
       assert %Ash.Error.Changes.InvalidArgument{field: :staged_files, message: message} = error
       assert message =~ ~s("photos")
       assert message =~ ~s("bulk-staging/u1/")
+    end
+
+    test "says why a key under the owner's prefix that is not plain is refused" do
+      assert {:error, %Ash.Error.Invalid{errors: [%{field: :staged_files, message: message}]}} =
+               StagedFiles.check(%{"logo" => "bulk-staging/u1//logo.zip"}, "u1")
+
+      assert message =~ ~s("bulk-staging/u1//logo.zip")
+      assert message =~ ~s(no empty, "." or ".." segment)
     end
 
     test "says why an owner whose key is not one plain path segment is refused" do
@@ -154,6 +199,18 @@ defmodule AshBulkDurable.Core.StagedFilesTest do
 
     test "refuses a key that escapes the owner's prefix, writing nothing", ctx do
       key = "bulk-staging/#{ctx.user.id}/../#{Ecto.UUID.generate()}/logo.zip"
+
+      assert {:error, %Ash.Error.Invalid{errors: [%{field: :staged_files}]}} =
+               AshBulkDurable.Core.create(Region, :create, rows(ctx.code),
+                 scope: ctx.scope,
+                 staged_files: %{"logo" => key}
+               )
+
+      assert submitted(ctx.user) == []
+    end
+
+    test "refuses a key under the owner's prefix that is not plain, writing nothing", ctx do
+      key = "bulk-staging/#{ctx.user.id}//abc/logo.zip"
 
       assert {:error, %Ash.Error.Invalid{errors: [%{field: :staged_files}]}} =
                AshBulkDurable.Core.create(Region, :create, rows(ctx.code),

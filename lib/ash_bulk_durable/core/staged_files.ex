@@ -3,7 +3,9 @@ defmodule AshBulkDurable.Core.StagedFiles do
   Whose staged files a bulk action may name. Every key in `:staged_files`
   must start with its owner's staging prefix, `bulk-staging/<owner>/`, where
   `<owner>` is `AshBulkDurable.Core.Owner.worker_key/1` of the submitting
-  scope, and hold no `..` segment. `AshBulkDurable.Core.create/4`,
+  scope, and be a plain key, one every shipped store accepts as it is:
+  valid UTF-8, with no empty, `.` or `..` segment (so no `//` and no
+  trailing `/`), no backslash and no NUL. `AshBulkDurable.Core.create/4`,
   `AshBulkDurable.Core.Retry.retry/2` and `retry_row/2` refuse any other key
   before writing anything, whoever calls them.
 
@@ -12,7 +14,11 @@ defmodule AshBulkDurable.Core.StagedFiles do
   such as `bulk-staging/<owner>/../<other>/x` that starts with the prefix yet
   escapes it, would let one user read or delete what another staged. The
   key is usually computed by the server that presigned its upload; this
-  makes the rule hold for a caller that takes it from a request too.
+  makes the rule hold for a caller that takes it from a request too. A key
+  such as `bulk-staging/<owner>//x` or `bulk-staging/<owner>/./x` stays
+  under the owner's prefix, but the worker could not fetch it from the
+  local store, so it is refused at submit rather than failing the bulk
+  action later.
 
   An owner whose worker key is not one plain path segment (it holds a `/`,
   or is `""`, `.` or `..`) is refused any staged file: its prefix would
@@ -26,8 +32,7 @@ defmodule AshBulkDurable.Core.StagedFiles do
 
   @doc "Whether `key` is a staging key `owner` may name."
   def owned?(key, owner) when is_binary(key) do
-    segment?(owner) and String.starts_with?(key, prefix(owner)) and
-      ".." not in Path.split(key)
+    segment?(owner) and String.starts_with?(key, prefix(owner)) and plain?(key)
   end
 
   def owned?(_key, _owner), do: false
@@ -62,10 +67,22 @@ defmodule AshBulkDurable.Core.StagedFiles do
     if segment?(owner),
       do:
         "the key #{inspect(key)} of #{inspect(name)} must start with " <>
-          "\"#{prefix(owner)}\" and contain no \"..\" segment",
+          "\"#{prefix(owner)}\" and #{plain_rule()}",
       else:
         "the owner's worker key #{inspect(owner)} is not one plain path segment, " <>
           "so it owns no staged file: #{inspect(name)} is refused"
+  end
+
+  # The rule `plain?/1` checks, as the refusals word it.
+  @doc false
+  def plain_rule,
+    do: ~s(have no empty, "." or ".." segment, backslash or NUL)
+
+  # A `/`-separated relative key every shipped store takes as it is: the
+  # local store refuses any other on every read and write.
+  defp plain?(key) do
+    String.valid?(key) and not String.contains?(key, ["\\", <<0>>]) and
+      key |> String.split("/") |> Enum.all?(&(&1 not in ["", ".", ".."]))
   end
 
   # One segment of a path that names a directory of its own.

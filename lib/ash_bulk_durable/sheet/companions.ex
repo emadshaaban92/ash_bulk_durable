@@ -4,7 +4,8 @@ defmodule AshBulkDurable.Sheet.Companions do
   action, whoever stages it.
 
     * **Every key is the owner's.** A key must start with
-      `bulk-staging/<owner>/` and hold no `..` segment, as the core requires
+      `bulk-staging/<owner>/` and be a plain key (no empty, `.` or `..`
+      segment, backslash or NUL), as the core requires
       of every bulk action (`AshBulkDurable.Core.StagedFiles`); checked here
       too so the refusal names the sheet's field. Keys are computed by the
       server that presigned their upload, never supplied by a browser, so
@@ -49,7 +50,7 @@ defmodule AshBulkDurable.Sheet.Companions do
         refuse(
           name,
           "every companion key must start with \"#{StagedFiles.prefix(owner)}\" " <>
-            "and contain no \"..\" segment"
+            "and #{StagedFiles.plain_rule()}"
         )
     end
   end
