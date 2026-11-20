@@ -10,7 +10,12 @@ defmodule AshBulkDurable.Core do
 
       config :ash_bulk_durable,
         bulk_action_resource: MyApp.BulkActions.BulkAction,
-        row_resource: MyApp.BulkActions.Row
+        row_resource: MyApp.BulkActions.Row,
+        owner_module: MyApp.BulkActions.Owner,
+        storage: MyApp.BulkActions.Storage
+
+  `check_config!/0` checks them; the poller's child spec calls it, so a node
+  missing one fails at boot.
   """
 
   require Ash.Expr
@@ -25,7 +30,8 @@ defmodule AshBulkDurable.Core do
     PurgeStaleStaging,
     Retry,
     Runner,
-    StagedFiles
+    StagedFiles,
+    Storage
   }
 
   @doc """
@@ -181,6 +187,82 @@ defmodule AshBulkDurable.Core do
   answers both.
   """
   def action_source, do: :ash_bulk_durable
+
+  @required [
+    bulk_action_resource: {:resource, AshBulkDurable.Core.Resource.BulkAction},
+    row_resource: {:resource, AshBulkDurable.Core.Resource.Row},
+    owner_module: {:behaviour, Owner},
+    storage: {:behaviour, Storage}
+  ]
+
+  @doc """
+  Raises `ArgumentError` unless the config names what the engine needs: a
+  `:bulk_action_resource` and a `:row_resource`, Ash resources using the
+  `AshBulkDurable.Core.Resource.BulkAction` and
+  `AshBulkDurable.Core.Resource.Row` extensions, an `:owner_module`
+  implementing `AshBulkDurable.Core.Owner` and a `:storage` module
+  implementing `AshBulkDurable.Core.Storage`, which must accept its own
+  configuration (`c:AshBulkDurable.Core.Storage.check_config/1`).
+
+  A module counts as implementing a behaviour when it exports its required
+  callbacks, whether or not it declares `@behaviour`.
+  """
+  @spec check_config!() :: :ok
+  def check_config! do
+    Enum.each(@required, fn {key, kind} -> check_config!(key, config(key), kind) end)
+    Storage.check_config!()
+  end
+
+  defp check_config!(key, nil, _kind) do
+    raise ArgumentError,
+          "ash_bulk_durable: the `#{inspect(key)}` config is not set; see " <>
+            "`AshBulkDurable.Core`'s moduledoc:\n\n" <>
+            "    config :ash_bulk_durable, #{key}: MyApp.BulkActions.#{example(key)}\n"
+  end
+
+  defp check_config!(key, module, {:resource, extension}) do
+    unless is_atom(module) and Ash.Resource.Info.resource?(module) and
+             extension in Spark.extensions(module) do
+      raise ArgumentError,
+            "ash_bulk_durable: the `#{inspect(key)}` config names #{inspect(module)}, " <>
+              "which is not an Ash resource using the #{inspect(extension)} extension"
+    end
+  end
+
+  defp check_config!(key, module, {:behaviour, behaviour}) do
+    missing =
+      if is_atom(module) and Code.ensure_loaded?(module) do
+        callbacks = behaviour.behaviour_info(:callbacks)
+        optional = behaviour.behaviour_info(:optional_callbacks)
+
+        Enum.reject(callbacks -- optional, fn {name, arity} ->
+          function_exported?(module, name, arity)
+        end)
+      else
+        :not_loaded
+      end
+
+    case missing do
+      [] ->
+        :ok
+
+      :not_loaded ->
+        raise ArgumentError,
+              "ash_bulk_durable: the `#{inspect(key)}` config names #{inspect(module)}, " <>
+                "which is not a module that could be loaded"
+
+      missing ->
+        raise ArgumentError,
+              "ash_bulk_durable: the `#{inspect(key)}` config names #{inspect(module)}, " <>
+                "which does not implement #{inspect(behaviour)}: it lacks " <>
+                Enum.map_join(missing, ", ", fn {name, arity} -> "#{name}/#{arity}" end)
+    end
+  end
+
+  defp example(:bulk_action_resource), do: "BulkAction"
+  defp example(:row_resource), do: "Row"
+  defp example(:owner_module), do: "Owner"
+  defp example(:storage), do: "Storage"
 
   @doc "Reads one `ash_bulk_durable` config key."
   @spec config(atom(), term()) :: term()

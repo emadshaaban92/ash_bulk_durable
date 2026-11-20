@@ -51,6 +51,29 @@ defmodule AshBulkDurable do
       column naming each row's tenant; see `AshBulkDurable.Sheet.Mapping`.
     * `:companions` — `%{field => storage_key}`, files staged for fields
       that need one.
+
+  ## Supervision
+
+  Add `AshBulkDurable` last to each node's supervision tree, after the repo,
+  anything that migrates it, and the PubSub and endpoint a run broadcasts
+  through. It supervises this node's `AshBulkDurable.Core.Poller`, which then
+  stops first, so the runs it lets finish on shutdown can still write and
+  broadcast:
+
+      children = [
+        MyApp.Repo,
+        MyApp.PubSub,
+        MyAppWeb.Endpoint,
+        AshBulkDurable
+      ]
+
+  It takes one option, `:poller`: `true` (the default), `false` on a node
+  that leaves running bulk actions to others, or the poller's options:
+
+      {AshBulkDurable, poller: [max_running: 4]}
+
+  Its child spec checks the config and the options before anything starts,
+  with or without a poller (`child_spec/1`).
   """
 
   alias AshBulkDurable.{Core, Sheet}
@@ -59,6 +82,43 @@ defmodule AshBulkDurable do
 
   defdelegate action_source(), to: Core
   defdelegate config(key, default \\ nil), to: Core
+
+  @doc """
+  The child spec of `AshBulkDurable` in a supervision tree; see
+  "Supervision" above. It raises `ArgumentError`, so a node fails at boot
+  with a plain message, on an unknown option, and when
+  `AshBulkDurable.Core.check_config!/0` finds the required config missing or
+  wrong. With a poller, also on what `AshBulkDurable.Core.Poller.child_spec/1`
+  refuses: an unknown poller option or a value of the wrong kind.
+  """
+  def child_spec(opts) do
+    opts = Keyword.validate!(opts, poller: true)
+    Core.check_config!()
+
+    children =
+      case opts[:poller] do
+        false ->
+          []
+
+        true ->
+          [Core.Poller.child_spec([])]
+
+        poller_opts when is_list(poller_opts) ->
+          [Core.Poller.child_spec(poller_opts)]
+
+        other ->
+          raise ArgumentError,
+                "ash_bulk_durable: `:poller` must be true, false or a keyword list, got: #{inspect(other)}"
+      end
+
+    %{
+      id: __MODULE__,
+      type: :supervisor,
+      start:
+        {Supervisor, :start_link,
+         [children, [strategy: :one_for_one, name: AshBulkDurable.Supervisor]]}
+    }
+  end
 
   @doc "Reads a CSV or XLSX; see `AshBulkDurable.Sheet.read/2`."
   defdelegate read_sheet(path, opts \\ []), to: Sheet, as: :read

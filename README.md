@@ -174,29 +174,41 @@ config :ash_bulk_durable,
   config :ash_bulk_durable, AshBulkDurable.Storage.S3, bucket: "my-app-bulk-files"
   ```
 
-Add the poller last to each node's supervision tree, after the repo, anything
-that migrates it, and the PubSub and endpoint a run broadcasts through. It then
-stops first, so the runs it lets finish on shutdown can still broadcast:
+Add `AshBulkDurable` last to each node's supervision tree, after the repo,
+anything that migrates it, and the PubSub and endpoint a run broadcasts
+through. It supervises the node's poller, which then stops first, so the runs
+it lets finish on shutdown can still broadcast:
 
 ```elixir
 children = [
   MyApp.Repo,
   {Phoenix.PubSub, name: MyApp.PubSub},
   MyAppWeb.Endpoint,
-  AshBulkDurable.Core.Poller
+  AshBulkDurable
 ]
 ```
 
-It starts each queued bulk action as soon as it is submitted or retried on its
-node, and every few seconds starts any other node's: one queued, or one whose
-run died with its node. It also runs the daily sweep of staged files, and,
+Its child spec checks the config before anything starts: a node whose config
+misses one of the four keys above, names a module that isn't the right kind,
+or whose storage says its own config is wrong (a disk store without a `:root`)
+fails at boot with an `ArgumentError` saying so. So does an option the poller
+doesn't know, or a value of the wrong kind. Give the poller options with
+`{AshBulkDurable, poller: [max_running: 4]}`, or none with `{AshBulkDurable,
+poller: false}` on a node that leaves running bulk actions to others, which
+still checks the config. `AshBulkDurable.Core.Poller` can also go in the tree
+by itself, with the same checks.
+
+The poller starts each queued bulk action as soon as it is submitted or
+retried on its node, and every few seconds starts any other node's: one
+queued, or one whose run died with its node. It also runs the daily sweep of staged files, and,
 when `:retention` is set, deletes the bulk actions that finished longer ago
 than that, with their rows. Without a poller, bulk actions stay queued and a
 warning is logged once; set `warn_without_poller: false` on nodes that leave
 the work to others, and in tests, which run bulk actions with
 `AshBulkDurable.Core.Worker.run_now/1` or `drain/0`.
 
-Its options, each also an `:ash_bulk_durable` config key:
+Its options, each also an `:ash_bulk_durable` config key, which is checked the
+same way:
 
 | Option | Default | |
 |---|---|---|
