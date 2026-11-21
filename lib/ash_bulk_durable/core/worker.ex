@@ -1186,7 +1186,9 @@ defmodule AshBulkDurable.Core.Worker do
   # `[:ash_bulk_durable, :phase1, :start | :stop | :exception]`. Span
   # result is the status (`:ok`, `{:atomic_phase1_failed, err}`,
   # `{:prepare_failed, error}`, `{:access_revoked, reason}` or `:busy`);
-  # resolved vs failed counts ride the stop event's measurements.
+  # resolved vs failed counts ride the stop event's measurements. Both count
+  # only the rows this run took out of `:pending`: a run that stops early
+  # (an all-or-nothing failure, say) leaves the rest `:pending`, in neither.
   #
   # Only rows holding a reference are `:pending`; the per-row `:resolve`
   # action runs over each `:pending` chunk via `Task.async_stream`. The
@@ -1207,9 +1209,9 @@ defmodule AshBulkDurable.Core.Worker do
     if to_resolve > 0, do: Progress.resolving_started(bulk_action, to_resolve)
 
     :telemetry.span([:ash_bulk_durable, :phase1], start_metadata, fn ->
-      {status, failed} = resolve_chunks(bulk_action, settings, concurrency)
+      {status, counts} = resolve_chunks(bulk_action, settings, concurrency)
       Progress.resolving_finished(bulk_action.id)
-      measurements = %{rows_resolved: to_resolve - failed, rows_failed: failed}
+      measurements = %{rows_resolved: counts.resolved, rows_failed: counts.failed}
       {status, measurements, %{bulk_action_id: bulk_action.id}}
     end)
   end
@@ -1217,11 +1219,18 @@ defmodule AshBulkDurable.Core.Worker do
   # Chunk the `:pending` rows the same way phase 2 chunks `:resolved` rows.
   # Each chunk's rows resolve concurrently; a resolved row flips to
   # `:resolved`, leaving `:pending`, so the next read returns the next
-  # slice — state mutation is the pagination. Returns `{status, failed}`.
+  # slice — state mutation is the pagination. Returns `{status, counts}`,
+  # `counts` the rows this run resolved and the rows it failed.
   defp resolve_chunks(bulk_action, settings, concurrency) do
     atomic? = bulk_action.mode == :all_or_nothing
-    do_resolve_chunks(bulk_action, settings, concurrency, atomic?, 0)
+    do_resolve_chunks(bulk_action, settings, concurrency, atomic?, count_rows())
   end
+
+  defp count_rows, do: %{resolved: 0, failed: 0}
+  defp count_row(counts, outcome), do: Map.update!(counts, outcome, &(&1 + 1))
+
+  defp add_counts(counts, more),
+    do: %{resolved: counts.resolved + more.resolved, failed: counts.failed + more.failed}
 
   # An all-or-nothing bulk action is one chunk in one transaction, whatever
   # its `chunk_size`; that only sizes a per-row bulk action's batches.
@@ -1230,48 +1239,49 @@ defmodule AshBulkDurable.Core.Worker do
 
   # A row to run alone goes first, in a chunk of its own (see "Crashes"
   # above). Looked for outside the lock, as phase 1 reads, then taken under it.
-  defp do_resolve_chunks(bulk_action, settings, concurrency, atomic?, failed_acc) do
+  defp do_resolve_chunks(bulk_action, settings, concurrency, atomic?, counts) do
     case next_alone_row(bulk_action, :pending) do
-      nil -> resolve_next_chunk(bulk_action, settings, concurrency, atomic?, failed_acc)
-      _row -> resolve_alone(bulk_action, settings, concurrency, atomic?, failed_acc)
+      nil -> resolve_next_chunk(bulk_action, settings, concurrency, atomic?, counts)
+      _row -> resolve_alone(bulk_action, settings, concurrency, atomic?, counts)
     end
   end
 
   # Asked before the row's bump, so a refused owner bumps nothing.
-  defp resolve_alone(bulk_action, settings, concurrency, atomic?, failed_acc) do
+  defp resolve_alone(bulk_action, settings, concurrency, atomic?, counts) do
     case rescoped(bulk_action, settings) do
       {:ok, settings} ->
-        isolate_and_resolve(bulk_action, settings, concurrency, atomic?, failed_acc)
+        isolate_and_resolve(bulk_action, settings, concurrency, atomic?, counts)
 
       revoked ->
-        {revoked, failed_acc}
+        {revoked, counts}
     end
   end
 
-  defp isolate_and_resolve(bulk_action, settings, concurrency, atomic?, failed_acc) do
+  defp isolate_and_resolve(bulk_action, settings, concurrency, atomic?, counts) do
     case isolate_next(bulk_action, :pending) do
       {:alone, row} ->
         case resolve_chunk([row], settings, 1, atomic?) do
-          {:ok, failed} ->
-            do_resolve_chunks(bulk_action, settings, concurrency, atomic?, failed_acc + failed)
+          {:ok, more} ->
+            counts = add_counts(counts, more)
+            do_resolve_chunks(bulk_action, settings, concurrency, atomic?, counts)
 
-          {:prepare_failed, error} ->
-            {{:prepare_failed, error}, failed_acc}
+          {:prepare_failed, error, more} ->
+            {{:prepare_failed, error}, add_counts(counts, more)}
         end
 
       :crashed ->
         Progress.row_resolved(bulk_action.id)
-        do_resolve_chunks(bulk_action, settings, concurrency, atomic?, failed_acc + 1)
+        do_resolve_chunks(bulk_action, settings, concurrency, atomic?, count_row(counts, :failed))
 
       :none ->
-        resolve_next_chunk(bulk_action, settings, concurrency, atomic?, failed_acc)
+        resolve_next_chunk(bulk_action, settings, concurrency, atomic?, counts)
 
       :busy ->
-        {:busy, failed_acc}
+        {:busy, counts}
     end
   end
 
-  defp resolve_next_chunk(bulk_action, settings, concurrency, atomic?, failed_acc) do
+  defp resolve_next_chunk(bulk_action, settings, concurrency, atomic?, counts) do
     chunk =
       row_resource()
       |> Ash.Query.for_read(:next_pending_chunk, %{
@@ -1283,29 +1293,29 @@ defmodule AshBulkDurable.Core.Worker do
 
     case chunk do
       [] ->
-        {:ok, failed_acc}
+        {:ok, counts}
 
       chunk ->
         case rescoped(bulk_action, settings) do
           {:ok, settings} ->
-            resolve_read_chunk(chunk, bulk_action, settings, concurrency, atomic?, failed_acc)
+            resolve_read_chunk(chunk, bulk_action, settings, concurrency, atomic?, counts)
 
           revoked ->
-            {revoked, failed_acc}
+            {revoked, counts}
         end
     end
   end
 
-  defp resolve_read_chunk(chunk, bulk_action, settings, concurrency, atomic?, failed_acc) do
+  defp resolve_read_chunk(chunk, bulk_action, settings, concurrency, atomic?, counts) do
     case resolve_chunk(chunk, settings, concurrency, atomic?) do
-      {:ok, failed} ->
-        do_resolve_chunks(bulk_action, settings, concurrency, atomic?, failed_acc + failed)
+      {:ok, more} ->
+        do_resolve_chunks(bulk_action, settings, concurrency, atomic?, add_counts(counts, more))
 
-      {:atomic_phase1_failed, err, failed} ->
-        {{:atomic_phase1_failed, err}, failed_acc + failed}
+      {:atomic_phase1_failed, err, more} ->
+        {{:atomic_phase1_failed, err}, add_counts(counts, more)}
 
-      {:prepare_failed, error} ->
-        {{:prepare_failed, error}, failed_acc}
+      {:prepare_failed, error, more} ->
+        {{:prepare_failed, error}, add_counts(counts, more)}
     end
   end
 
@@ -1319,29 +1329,31 @@ defmodule AshBulkDurable.Core.Worker do
           Enum.split_with(tenants, fn {_row, result} -> match?({:ok, _}, result) end)
 
         refused
-        |> Enum.reduce_while({:ok, 0}, fn {row, result}, {status, failed} ->
-          reduce_resolution(result, row, status, failed, settings, atomic?)
+        |> Enum.reduce_while({:ok, count_rows()}, fn {row, result}, {status, counts} ->
+          reduce_resolution(result, row, status, counts, settings, atomic?)
         end)
         |> resolve_tenant_groups(tenanted, settings, concurrency, atomic?)
 
       {:error, error} ->
-        {:prepare_failed, error}
+        {:prepare_failed, error, count_rows()}
     end
   end
 
-  defp resolve_tenant_groups({:ok, failed}, tenanted, settings, concurrency, atomic?) do
+  # A group whose resolvers can't be readied stops the chunk, but the rows
+  # the groups before it took out of `:pending` stay counted.
+  defp resolve_tenant_groups({:ok, counts}, tenanted, settings, concurrency, atomic?) do
     tenanted
     |> Enum.group_by(fn {_row, {:ok, tenant}} -> tenant end, fn {row, _tenant} -> row end)
-    |> Enum.reduce_while({:ok, failed}, fn {tenant, rows}, {:ok, failed} ->
+    |> Enum.reduce_while({:ok, counts}, fn {tenant, rows}, {:ok, counts} ->
       case resolve_group(rows, %{settings | tenant: tenant}, concurrency, atomic?) do
-        {:ok, group_failed} ->
-          {:cont, {:ok, failed + group_failed}}
+        {:ok, group_counts} ->
+          {:cont, {:ok, add_counts(counts, group_counts)}}
 
-        {:atomic_phase1_failed, err, group_failed} ->
-          {:halt, {:atomic_phase1_failed, err, failed + group_failed}}
+        {:atomic_phase1_failed, err, group_counts} ->
+          {:halt, {:atomic_phase1_failed, err, add_counts(counts, group_counts)}}
 
         {:prepare_failed, error} ->
-          {:halt, {:prepare_failed, error}}
+          {:halt, {:prepare_failed, error, counts}}
       end
     end)
   end
@@ -1397,12 +1409,12 @@ defmodule AshBulkDurable.Core.Worker do
         on_timeout: :kill_task,
         zip_input_on_exit: true
       )
-      |> Enum.reduce({:ok, 0}, fn result, acc ->
+      |> Enum.reduce({:ok, count_rows()}, fn result, acc ->
         drain_resolution(result, acc, settings, atomic?, timeout, halted)
       end)
       |> case do
-        {:ok, failed} -> {:ok, failed}
-        {{:atomic_phase1_failed, err}, failed} -> {:atomic_phase1_failed, err, failed}
+        {:ok, counts} -> {:ok, counts}
+        {{:atomic_phase1_failed, err}, counts} -> {:atomic_phase1_failed, err, counts}
       end
     after
       Supervisor.stop(tasks)
@@ -1425,14 +1437,14 @@ defmodule AshBulkDurable.Core.Worker do
 
   # A row that finishes after the halt is still recorded, resolved or
   # failed, but the first failure stays the one reported.
-  defp record_resolution(result, row, {status, failed}, settings, atomic?, halted) do
-    case reduce_resolution(result, row, status, failed, settings, atomic?) do
+  defp record_resolution(result, row, {status, counts}, settings, atomic?, halted) do
+    case reduce_resolution(result, row, status, counts, settings, atomic?) do
       {:cont, acc} ->
         acc
 
-      {:halt, {:atomic_phase1_failed, err, failed}} ->
+      {:halt, {:atomic_phase1_failed, err, counts}} ->
         :atomics.put(halted, 1, 1)
-        {first_failure(status, {:atomic_phase1_failed, err}), failed}
+        {first_failure(status, {:atomic_phase1_failed, err}), counts}
     end
   end
 
@@ -1441,23 +1453,23 @@ defmodule AshBulkDurable.Core.Worker do
 
   # Each row it is handed has been committed, resolved or failed, by the time
   # it is counted for a page (`Progress`).
-  defp reduce_resolution({:ok, _resolved}, row, status, failed, _settings, _atomic?) do
+  defp reduce_resolution({:ok, _resolved}, row, status, counts, _settings, _atomic?) do
     Progress.row_resolved(row.bulk_action_id)
-    {:cont, {status, failed}}
+    {:cont, {status, count_row(counts, :resolved)}}
   end
 
-  defp reduce_resolution({:error, err}, row, _status, failed, settings, true) do
+  defp reduce_resolution({:error, err}, row, _status, counts, settings, true) do
     raise_if_moved_on!(err, row.bulk_action_id)
     mark_row_failed(row, err, settings.pass)
     Progress.row_resolved(row.bulk_action_id)
-    {:halt, {:atomic_phase1_failed, {row.row_index, err}, failed + 1}}
+    {:halt, {:atomic_phase1_failed, {row.row_index, err}, count_row(counts, :failed)}}
   end
 
-  defp reduce_resolution({:error, err}, row, status, failed, settings, false) do
+  defp reduce_resolution({:error, err}, row, status, counts, settings, false) do
     raise_if_moved_on!(err, row.bulk_action_id)
     mark_row_failed(row, err, settings.pass)
     Progress.row_resolved(row.bulk_action_id)
-    {:cont, {status, failed + 1}}
+    {:cont, {status, count_row(counts, :failed)}}
   end
 
   # One row through the `:resolve` action. The resolution happens in the
