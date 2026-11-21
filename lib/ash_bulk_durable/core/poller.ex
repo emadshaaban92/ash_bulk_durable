@@ -120,10 +120,13 @@ defmodule AshBulkDurable.Core.Poller do
 
   ## Starting
 
-  It refuses to start when the `:storage` module says its own configuration
-  is wrong (`c:AshBulkDurable.Core.Storage.check_config/1`), so a node
-  without, say, a disk store's `:root` fails at boot rather than at its
-  first sweep.
+  Its child spec (`child_spec/1`) raises `ArgumentError` on an option it
+  doesn't know or a value of the wrong kind, and when the required config is
+  missing or wrong (`AshBulkDurable.Core.check_config!/0`), including when
+  the `:storage` module says its own configuration is wrong
+  (`c:AshBulkDurable.Core.Storage.check_config/1`). A node without, say, an
+  `:owner_module` or a disk store's `:root` fails at boot, with that
+  message, rather than at its first run or sweep.
   """
   use GenServer
 
@@ -137,7 +140,6 @@ defmodule AshBulkDurable.Core.Poller do
     Liveness,
     PurgeStaleStaging,
     Retention,
-    Storage,
     Worker
   }
 
@@ -148,7 +150,28 @@ defmodule AshBulkDurable.Core.Poller do
   @shutdown_grace :timer.seconds(20)
   @shutdown_lock_wait :timer.seconds(2)
 
+  @options [
+    :name,
+    :poll_interval,
+    :max_running,
+    :stale_after,
+    :staging_sweep_interval,
+    :retention,
+    :shutdown_grace
+  ]
+
+  @doc """
+  The child spec, which checks before anything starts: it raises
+  `ArgumentError` on an option it doesn't know, on an option or config
+  value of the wrong kind, and when `AshBulkDurable.Core.check_config!/0`
+  finds the required config missing or wrong. A typo then fails the boot
+  with a plain message, rather than being ignored.
+  """
   def child_spec(opts) do
+    opts = Keyword.validate!(opts, @options)
+    validate!(opts)
+    Core.check_config!()
+
     grace = option(opts, :shutdown_grace, @shutdown_grace)
     marks = option(opts, :max_running, @max_running) * @shutdown_lock_wait
 
@@ -213,10 +236,45 @@ defmodule AshBulkDurable.Core.Poller do
   @doc "The ids of the bulk actions this poller is running."
   def running(server \\ __MODULE__), do: GenServer.call(server, :running)
 
+  # Each value, given or from config, as `init/1` will read it.
+  defp validate!(opts) do
+    positive? = &(is_integer(&1) and &1 > 0)
+
+    check!(opts, :poll_interval, @poll_interval, positive?, "a positive integer")
+    check!(opts, :max_running, @max_running, positive?, "a positive integer")
+    check!(opts, :stale_after, @stale_after, positive?, "a positive integer")
+
+    check!(
+      opts,
+      :staging_sweep_interval,
+      @staging_sweep_interval,
+      &(is_nil(&1) or positive?.(&1)),
+      "nil or a positive integer"
+    )
+
+    check!(
+      opts,
+      :shutdown_grace,
+      @shutdown_grace,
+      &(is_integer(&1) and &1 >= 0),
+      "a non-negative integer"
+    )
+
+    opts |> option(:retention, nil) |> Retention.validate!()
+  end
+
+  defp check!(opts, key, default, valid?, kind) do
+    value = option(opts, key, default)
+
+    unless valid?.(value) do
+      raise ArgumentError,
+            "ash_bulk_durable: the poller's #{inspect(key)} must be #{kind}, got: #{inspect(value)}"
+    end
+  end
+
   @impl true
   def init(opts) do
-    Storage.check_config!()
-    retention = opts |> option(:retention, nil) |> Retention.validate!()
+    retention = option(opts, :retention, nil)
     Process.flag(:trap_exit, true)
     {:ok, tasks} = Task.Supervisor.start_link()
 

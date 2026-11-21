@@ -116,18 +116,6 @@ defmodule AshBulkDurable.Core.PollerTest do
       assert %{status: :completed, rows_done: 1} = reload(stale)
     end
 
-    test "refuses to start when the store says its configuration is wrong" do
-      put_config(:storage, MisconfiguredStorage)
-
-      assert {:error, reason} =
-               start_supervised(
-                 {Poller, poll_interval: :timer.hours(1), staging_sweep_interval: nil}
-               )
-
-      assert inspect(reason) =~ "MisconfiguredStorage"
-      assert inspect(reason) =~ "no root"
-    end
-
     test "a :running bulk action never stamped is stale", ctx do
       unstamped = submit!(ctx, 1)
       set_running!(unstamped, "NULL")
@@ -468,14 +456,123 @@ defmodule AshBulkDurable.Core.PollerTest do
     end
 
     test "refuses to start with a :retention that isn't nil or a positive integer" do
-      assert {:error, reason} = start_supervised({Poller, retention: 0})
-      assert inspect(reason) =~ ":retention must be nil or a positive number"
+      assert_raise ArgumentError, ~r/:retention must be nil or a positive number/, fn ->
+        Poller.child_spec(retention: 0)
+      end
     end
 
     test "is first scheduled within the first hour of a daily interval" do
       poller = start_poller!(staging_sweep_interval: :timer.hours(24))
       %{sweep_timer: timer} = :sys.get_state(poller)
       assert Process.read_timer(timer) <= :timer.hours(1)
+    end
+  end
+
+  describe "the child spec" do
+    test "raises on an option it doesn't know" do
+      assert_raise ArgumentError, ~r/unknown keys \[:max_runing\]/, fn ->
+        Poller.child_spec(max_runing: 4)
+      end
+    end
+
+    test "raises on an option or config value of the wrong kind" do
+      assert_raise ArgumentError, ~r/:max_running must be a positive integer, got: 0/, fn ->
+        Poller.child_spec(max_running: 0)
+      end
+
+      assert_raise ArgumentError, ~r/:shutdown_grace must be a non-negative integer/, fn ->
+        Poller.child_spec(shutdown_grace: "20s")
+      end
+
+      put_config(:staging_sweep_interval, :daily)
+
+      assert_raise ArgumentError, ~r/:staging_sweep_interval must be nil or a positive/, fn ->
+        Poller.child_spec([])
+      end
+
+      assert %{} = Poller.child_spec(staging_sweep_interval: nil)
+    end
+
+    test "raises when the store says its configuration is wrong" do
+      put_config(:storage, MisconfiguredStorage)
+
+      assert_raise ArgumentError, ~r/MisconfiguredStorage.*no root/, fn ->
+        Poller.child_spec([])
+      end
+    end
+
+    test "raises when required config is missing or names the wrong kind of module" do
+      keys = [:bulk_action_resource, :row_resource, :owner_module, :storage]
+      configured = Map.new(keys, &{&1, Application.fetch_env!(:ash_bulk_durable, &1)})
+      restore_config = &put_config(&1, Map.fetch!(configured, &1))
+
+      for key <- keys do
+        put_config(key, nil)
+
+        assert_raise ArgumentError, ~r/`#{inspect(key)}` config is not set/, fn ->
+          Poller.child_spec([])
+        end
+
+        restore_config.(key)
+      end
+
+      put_config(:row_resource, BulkAction)
+
+      assert_raise ArgumentError, ~r/not an Ash resource using .*Resource.Row extension/, fn ->
+        Poller.child_spec([])
+      end
+
+      restore_config.(:row_resource)
+      put_config(:owner_module, Region)
+
+      assert_raise ArgumentError, ~r/does not implement .*Owner: it lacks worker_key\/1/, fn ->
+        Poller.child_spec([])
+      end
+
+      put_config(:owner_module, NoSuchOwner)
+
+      assert_raise ArgumentError, ~r/NoSuchOwner, which is not a module/, fn ->
+        Poller.child_spec([])
+      end
+    end
+
+    test "AshBulkDurable supervises the poller, with its options" do
+      start_supervised!(
+        {AshBulkDurable, poller: [poll_interval: :timer.hours(1), staging_sweep_interval: nil]}
+      )
+
+      assert [{Poller, pid, :worker, _modules}] =
+               Supervisor.which_children(AshBulkDurable.Supervisor)
+
+      assert pid == Process.whereis(Poller)
+      assert %{poll_interval: 3_600_000} = :sys.get_state(Poller)
+      assert Poller.running() == []
+    end
+
+    test "AshBulkDurable with poller: false starts no poller, but still checks the config" do
+      start_supervised!({AshBulkDurable, poller: false})
+      assert Supervisor.which_children(AshBulkDurable.Supervisor) == []
+      refute Process.whereis(Poller)
+
+      put_config(:owner_module, nil)
+
+      assert_raise ArgumentError, ~r/`:owner_module` config is not set/, fn ->
+        AshBulkDurable.child_spec(poller: false)
+      end
+    end
+
+    test "AshBulkDurable raises on an option it doesn't know, or a poller's" do
+      assert_raise ArgumentError, ~r/unknown keys \[:pollr\]/, fn ->
+        AshBulkDurable.child_spec(pollr: false)
+      end
+
+      assert_raise ArgumentError, ~r/`:poller` must be true, false or a keyword list/, fn ->
+        AshBulkDurable.child_spec(poller: :yes)
+      end
+
+      assert_raise ArgumentError, ~r/unknown keys \[:max_runing\]/, fn ->
+        AshBulkDurable.child_spec(poller: [max_runing: 4])
+      end
     end
   end
 
