@@ -1374,14 +1374,22 @@ defmodule AshBulkDurable.Core.Worker do
   # linked to it crashed, or it was killed) fails its row with the reason,
   # instead of taking the run down with it. Their supervisor is linked to
   # this process, so the tasks still go when the run does.
+  #
+  # An all-or-nothing failure stops new rows starting but lets the rows
+  # already resolving finish, so none is killed mid-call: a resolver storing
+  # a file, say, would leave a partial or orphaned object behind. The stream
+  # asks for its next row only after this process has reduced the last
+  # result, so once the flag is up no row starts; the rest stay `:pending`.
   defp resolve_rows(rows, settings, resolvers, concurrency, atomic?) do
     timeout = AshBulkDurable.Core.config(:row_resolve_timeout, @row_resolve_timeout)
+    halted = :atomics.new(1, [])
+    unhalted = Stream.take_while(rows, fn _row -> :atomics.get(halted, 1) == 0 end)
     {:ok, tasks} = Task.Supervisor.start_link()
 
     try do
       tasks
       |> Task.Supervisor.async_stream_nolink(
-        rows,
+        unhalted,
         fn row -> {row, resolve_one_row(row, settings, resolvers)} end,
         max_concurrency: concurrency,
         ordered: false,
@@ -1389,22 +1397,47 @@ defmodule AshBulkDurable.Core.Worker do
         on_timeout: :kill_task,
         zip_input_on_exit: true
       )
-      |> Enum.reduce_while({:ok, 0}, fn
-        {:ok, {row, result}}, {status, failed} ->
-          reduce_resolution(result, row, status, failed, settings, atomic?)
-
-        {:exit, {row, :timeout}}, {status, failed} ->
-          error = Runner.row_timed_out(timeout, row)
-          reduce_resolution({:error, error}, row, status, failed, settings, atomic?)
-
-        {:exit, {row, reason}}, {status, failed} ->
-          result = Runner.row_exited(:exit, reason, [], row)
-          reduce_resolution(result, row, status, failed, settings, atomic?)
+      |> Enum.reduce({:ok, 0}, fn result, acc ->
+        drain_resolution(result, acc, settings, atomic?, timeout, halted)
       end)
+      |> case do
+        {:ok, failed} -> {:ok, failed}
+        {{:atomic_phase1_failed, err}, failed} -> {:atomic_phase1_failed, err, failed}
+      end
     after
       Supervisor.stop(tasks)
     end
   end
+
+  defp drain_resolution({:ok, {row, result}}, acc, settings, atomic?, _timeout, halted) do
+    record_resolution(result, row, acc, settings, atomic?, halted)
+  end
+
+  defp drain_resolution({:exit, {row, :timeout}}, acc, settings, atomic?, timeout, halted) do
+    error = Runner.row_timed_out(timeout, row)
+    record_resolution({:error, error}, row, acc, settings, atomic?, halted)
+  end
+
+  defp drain_resolution({:exit, {row, reason}}, acc, settings, atomic?, _timeout, halted) do
+    result = Runner.row_exited(:exit, reason, [], row)
+    record_resolution(result, row, acc, settings, atomic?, halted)
+  end
+
+  # A row that finishes after the halt is still recorded, resolved or
+  # failed, but the first failure stays the one reported.
+  defp record_resolution(result, row, {status, failed}, settings, atomic?, halted) do
+    case reduce_resolution(result, row, status, failed, settings, atomic?) do
+      {:cont, acc} ->
+        acc
+
+      {:halt, {:atomic_phase1_failed, err, failed}} ->
+        :atomics.put(halted, 1, 1)
+        {first_failure(status, {:atomic_phase1_failed, err}), failed}
+    end
+  end
+
+  defp first_failure(:ok, failure), do: failure
+  defp first_failure(first, _failure), do: first
 
   # Each row it is handed has been committed, resolved or failed, by the time
   # it is counted for a page (`Progress`).
