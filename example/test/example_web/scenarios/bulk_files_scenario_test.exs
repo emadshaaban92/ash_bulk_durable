@@ -121,7 +121,6 @@ defmodule ExampleWeb.Scenarios.BulkFilesScenarioTest do
   # the ZIP through the one descriptor the chunk's resolver opened.
   test "photos extracted 4 at a time from one ZIP each land on their own product",
        %{conn: conn, super_user: user} do
-    put_config(:phase1_concurrency, 4)
     put_storage(GatedStorage)
     GatedStorage.start(4)
     files = for i <- 1..10, do: {~c"p#{i}.pdf", "photo #{i}"}

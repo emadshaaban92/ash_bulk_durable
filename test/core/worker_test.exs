@@ -187,6 +187,60 @@ defmodule AshBulkDurable.Core.WorkerTest do
     end
   end
 
+  defmodule HaltResolver do
+    @moduledoc """
+    Holds rows in flight across an all-or-nothing halt: the `:test_poison`
+    value fails once `:width` rows have arrived, and the others finish only
+    once the run has marked that row `:failed`, so they are still resolving
+    when phase 1 halts. The `:late_poison` value then fails too. Counts rows
+    arrived and finished in an ETS table the test owns.
+    """
+    @behaviour AshBulkDurable.Core.Resolver
+
+    require Ash.Query
+
+    @impl true
+    def prepare(_args, _context), do: {:ok, nil}
+
+    @impl true
+    def resolve(value, nil, _context) do
+      table = Application.fetch_env!(:ash_bulk_durable, :test_gate)
+      :ets.update_counter(table, :arrived, 1)
+      deadline = System.monotonic_time(:millisecond) + 5000
+
+      if value == Application.get_env(:ash_bulk_durable, :test_poison) do
+        [{:width, width}] = :ets.lookup(table, :width)
+        await(fn -> match?([{_, n}] when n >= width, :ets.lookup(table, :arrived)) end, deadline)
+        {:error, :poison_match}
+      else
+        await(fn -> failed_row?(table) end, deadline)
+        :ets.update_counter(table, :finished, 1)
+
+        if [{:late_poison, value}] == :ets.lookup(table, :late_poison),
+          do: {:error, :late_poison_match},
+          else: {:ok, value}
+      end
+    end
+
+    defp failed_row?(table) do
+      [{:bulk_action_id, id}] = :ets.lookup(table, :bulk_action_id)
+
+      AshBulkDurable.Test.Row
+      |> Ash.Query.filter(bulk_action_id == ^id and status == :failed)
+      |> Ash.exists?(authorize?: false)
+    end
+
+    @impl true
+    def finish(nil), do: :ok
+
+    defp await(ready?, deadline) do
+      if not ready?.() and System.monotonic_time(:millisecond) < deadline do
+        Process.sleep(5)
+        await(ready?, deadline)
+      end
+    end
+  end
+
   defmodule NoMatchResolver do
     @moduledoc "Finds nothing for any reference, as the callback allows."
     @behaviour AshBulkDurable.Core.Resolver
@@ -982,22 +1036,38 @@ defmodule AshBulkDurable.Core.WorkerTest do
       assert r5.status == :succeeded
     end
 
-    test "atomic-mode phase 1 failure halts before any chunk runs", %{super_user: user} do
-      # One row at a time: the halt kills the rows still resolving, and one
-      # killed mid-write takes the sandbox's shared connection with it. Off
-      # the sandbox, the pool only replaces that connection.
-      put_config(:phase1_concurrency, 1)
+    test "atomic-mode phase 1 failure halts before any chunk runs, letting in-flight rows finish",
+         %{super_user: user} do
+      put_config(:phase1_concurrency, 4)
       put_poison("Region AR 2")
+      table = :ets.new(:gate, [:public, :set])
+      :ets.insert(table, [{:width, 4}, {:arrived, 0}, {:finished, 0}])
+      :ets.insert(table, {:late_poison, "Region AR 3"})
+      put_config(:test_gate, table)
+      test_pid = self()
+      handler = "phase1-stop-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:ash_bulk_durable, :phase1, :stop],
+        fn _event, measurements, _metadata, _config ->
+          send(test_pid, {:phase1, measurements})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
 
       suffix = System.unique_integer([:positive])
 
       bulk_action =
-        create_bulk_action!(region_rows(5, suffix, PoisonResolver),
+        create_bulk_action!(region_rows(8, suffix, HaltResolver),
           user_id: user.id,
-          chunk_size: 5,
+          chunk_size: 8,
           mode: :all_or_nothing
         )
 
+      :ets.insert(table, {:bulk_action_id, bulk_action.id})
       assert :ok = Worker.run_now(bulk_action.id)
 
       fresh = reload(bulk_action)
@@ -1005,10 +1075,20 @@ defmodule AshBulkDurable.Core.WorkerTest do
       assert fresh.rows_done == 0
       assert fresh.result["reason"] == "atomic_phase1_failed"
 
-      # The result names the row whose resolve failed ("Region AR 2", index 1)
-      # with a humanized message.
+      # The result names the first row whose resolve failed ("Region AR 2",
+      # index 1) with a humanized message, not row 3, which failed after it.
       assert fresh.result["row_index"] == 1
       assert is_binary(messages(fresh.error)) and messages(fresh.error) != ""
+
+      # Rows 1, 3 and 4 were resolving when row 2 failed: they ran to the end
+      # rather than being killed, and row 3's late failure is still recorded.
+      # No row started after the halt.
+      assert [{:arrived, 4}] = :ets.lookup(table, :arrived)
+      assert [{:finished, 3}] = :ets.lookup(table, :finished)
+      assert_received {:phase1, %{rows_failed: 2}}
+
+      assert bulk_action.id |> list_rows() |> Enum.map(& &1.status) ==
+               [:resolved, :failed, :failed, :resolved, :pending, :pending, :pending, :pending]
 
       assert regions_from(suffix, user) == []
     end
