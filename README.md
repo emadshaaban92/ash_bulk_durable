@@ -41,6 +41,19 @@ def deps do
 end
 ```
 
+With [igniter](https://hexdocs.pm/igniter) in your deps,
+`mix ash_bulk_durable.install` then does the setup below for an app with an
+Ecto repo: a domain with the two resources and their policies, an owner
+module, the config with `AshBulkDurable.Storage.Local`, `AshBulkDurable` last
+in the supervision tree, a SAT solver for the policies if the app has none,
+and a migration through `mix ash.codegen`.
+`--domain`, `--repo` and `--user` change what it names. It is safe to run
+again, and leaves alone what is already there: a `:storage` already set, or
+an `AshBulkDurable.Core.Poller` the tree already starts, which it tells you to
+replace with `AshBulkDurable`. Read the owner it writes before you use it: it
+reads the actor back by a UUID id, and a bulk action submitted in a tenant
+fails when it runs (`:access_revoked`) until you say who may act there.
+
 CSV and XLSX need no system packages. An XLSX is read by
 [calamine](https://github.com/tafia/calamine), a Rust library, through
 `spreadsheet`'s precompiled NIF, downloaded at compile time for the common
