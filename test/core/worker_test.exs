@@ -1082,10 +1082,11 @@ defmodule AshBulkDurable.Core.WorkerTest do
 
       # Rows 1, 3 and 4 were resolving when row 2 failed: they ran to the end
       # rather than being killed, and row 3's late failure is still recorded.
-      # No row started after the halt.
+      # No row started after the halt. Rows 5 to 8 never started and stay
+      # `:pending`, so phase 1's stop event counts them as neither.
       assert [{:arrived, 4}] = :ets.lookup(table, :arrived)
       assert [{:finished, 3}] = :ets.lookup(table, :finished)
-      assert_received {:phase1, %{rows_failed: 2}}
+      assert_received {:phase1, %{rows_resolved: 2, rows_failed: 2}}
 
       assert bulk_action.id |> list_rows() |> Enum.map(& &1.status) ==
                [:resolved, :failed, :failed, :resolved, :pending, :pending, :pending, :pending]

@@ -47,6 +47,20 @@ defmodule AshBulkDurable.Core.TenantTest do
     end
   end
 
+  defmodule UnpreparedResolver do
+    @moduledoc "A resolver that can never be readied."
+    @behaviour AshBulkDurable.Core.Resolver
+
+    @impl true
+    def prepare(_args, _context), do: {:error, "unprepared"}
+
+    @impl true
+    def resolve(value, nil, _context), do: {:ok, value}
+
+    @impl true
+    def finish(nil), do: :ok
+  end
+
   alias AshBulkDurable.Core.{Runner, Worker}
   alias AshBulkDurable.Test.{Gadget, Widget, Workspace}
   alias AshBulkDurable.Test.{BulkAction, Row}
@@ -144,6 +158,40 @@ defmodule AshBulkDurable.Core.TenantTest do
     assert Enum.map_join(lost.error, & &1.message) =~ ~s(no Workspace matches code = "NOPE")
     assert kept.status == :succeeded
     assert Map.keys(widgets(ctx.w1)) == ["kept"]
+  end
+
+  # The refused row fails before any tenant group starts, so phase 1 took it
+  # out of `:pending` even though the next group's resolvers stop the chunk.
+  test "phase 1's stop event counts a refused row when a later group can't be prepared", ctx do
+    test_pid = self()
+    handler = "tenant-phase1-stop-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:ash_bulk_durable, :phase1, :stop],
+      fn _event, measurements, metadata, _config ->
+        send(test_pid, {:phase1_stop, measurements, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    rows = [
+      %{target: %{tenant: workspace_lookup("NOPE")}, input: %{name: "lost"}},
+      %{
+        target: %{tenant: ctx.w1.id},
+        input: %{name: {:resolve, UnpreparedResolver, "unprepared"}}
+      }
+    ]
+
+    {bulk_action, stored} = run!(ctx.user, :create, rows)
+    bulk_action_id = bulk_action.id
+
+    assert Enum.map(stored, & &1.status) == [:failed, :pending]
+
+    assert_received {:phase1_stop, %{rows_resolved: 0, rows_failed: 1},
+                     %{bulk_action_id: ^bulk_action_id}}
   end
 
   test "a chunk's resolvers are prepared once in each tenant, however many rows it has there",
