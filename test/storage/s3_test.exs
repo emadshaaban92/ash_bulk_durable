@@ -326,11 +326,12 @@ defmodule AshBulkDurable.Storage.S3Test do
     assert {:error, message} = S3.check_config(bucket: "", ex_aws: @ex_aws)
     assert message =~ "needs a `:bucket`"
 
-    # The suite has no `:req`.
+    # A client whose library the app lacks. Not `ExAws.Request.Req`: the
+    # suite has `:req`, which igniter brings.
     assert {:error, message} =
-             S3.check_config(bucket: "b", ex_aws: [http_client: ExAws.Request.Req])
+             S3.check_config(bucket: "b", ex_aws: [http_client: AshBulkDurable.NoSuchClient])
 
-    assert message =~ "ExAws.Request.Req is not available; add `:req`"
+    assert message =~ "AshBulkDurable.NoSuchClient is not available; add the client's dependency"
   end
 
   test "a module that uses it gets the callbacks, and can override them",

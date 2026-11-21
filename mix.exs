@@ -61,6 +61,9 @@ defmodule AshBulkDurable.MixProject do
       {:ex_aws_s3, "~> 2.5", optional: true},
       {:sweet_xml, "~> 0.7", optional: true},
 
+      # `mix ash_bulk_durable.install`, for a host that installs with igniter.
+      {:igniter, "~> 0.6 and >= 0.6.29", optional: true},
+
       # The resources the tests run, whose policies need a solver.
       {:simple_sat, "~> 0.1", only: :test},
       # The HTTP client the `:s3` tests reach a real S3 API (RustFS in CI) with.
@@ -68,7 +71,6 @@ defmodule AshBulkDurable.MixProject do
 
       # Tooling.
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},
-      {:sourceror, "~> 1.7", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
   end
