@@ -1392,34 +1392,86 @@ defmodule AshBulkDurable.Core.Worker do
   # a file, say, would leave a partial or orphaned object behind. The stream
   # asks for its next row only after this process has reduced the last
   # result, so once the flag is up no row starts; the rest stay `:pending`.
+  #
+  # A task that dies before it starts on its row has not run it, so the row
+  # neither timed out nor failed: it goes to a new task, here, once the rest
+  # are through. A task waits 5 seconds for this process to send it its row,
+  # and then exits `:timeout`, the reason an overrun is reported with; this
+  # process held up that long (suspended, or starved) is how one gets there.
+  # Each task marks its row started first thing, in `started`. Run again
+  # here, a row run alone keeps the one start `isolate/2` counted for it,
+  # where going back through it would count a second it never had. After an
+  # all-or-nothing halt, they stay `:pending`, as the rows never started do,
+  # and in neither count.
+  defp resolve_rows([], _settings, _resolvers, _concurrency, _atomic?), do: {:ok, count_rows()}
+
   defp resolve_rows(rows, settings, resolvers, concurrency, atomic?) do
+    case run_row_tasks(rows, settings, resolvers, concurrency, atomic?) do
+      {{:ok, counts}, unstarted} ->
+        unstarted
+        |> Enum.reverse()
+        |> resolve_rows(settings, resolvers, concurrency, atomic?)
+        |> add_rerun_counts(counts)
+
+      {{{:atomic_phase1_failed, err}, counts}, _unstarted} ->
+        {:atomic_phase1_failed, err, counts}
+    end
+  end
+
+  defp run_row_tasks(rows, settings, resolvers, concurrency, atomic?) do
     timeout = AshBulkDurable.Core.config(:row_resolve_timeout, @row_resolve_timeout)
     halted = :atomics.new(1, [])
-    unhalted = Stream.take_while(rows, fn _row -> :atomics.get(halted, 1) == 0 end)
+    started = :atomics.new(length(rows), [])
+
+    unhalted =
+      rows
+      |> Enum.with_index(1)
+      |> Stream.take_while(fn _row -> :atomics.get(halted, 1) == 0 end)
+
     {:ok, tasks} = Task.Supervisor.start_link()
 
     try do
       tasks
       |> Task.Supervisor.async_stream_nolink(
         unhalted,
-        fn row -> {row, resolve_one_row(row, settings, resolvers)} end,
+        fn {row, i} ->
+          :atomics.put(started, i, 1)
+          {row, resolve_one_row(row, settings, resolvers)}
+        end,
         max_concurrency: concurrency,
         ordered: false,
         timeout: timeout,
         on_timeout: :kill_task,
         zip_input_on_exit: true
       )
-      |> Enum.reduce({:ok, count_rows()}, fn result, acc ->
-        drain_resolution(result, acc, settings, atomic?, timeout, halted)
+      |> Enum.reduce({{:ok, count_rows()}, []}, fn result, {acc, unstarted} ->
+        case started_or_not(result, started) do
+          {:not_started, row, reason} ->
+            Runner.row_not_started(reason, row)
+            {acc, [row | unstarted]}
+
+          result ->
+            {drain_resolution(result, acc, settings, atomic?, timeout, halted), unstarted}
+        end
       end)
-      |> case do
-        {:ok, counts} -> {:ok, counts}
-        {{:atomic_phase1_failed, err}, counts} -> {:atomic_phase1_failed, err, counts}
-      end
     after
       Supervisor.stop(tasks)
     end
   end
+
+  # An exit names the row it was zipped with, and whether its task started.
+  defp started_or_not({:ok, _resolved} = resolved, _started), do: resolved
+
+  defp started_or_not({:exit, {{row, i}, reason}}, started) do
+    if :atomics.get(started, i) == 0,
+      do: {:not_started, row, reason},
+      else: {:exit, {row, reason}}
+  end
+
+  defp add_rerun_counts({:ok, more}, counts), do: {:ok, add_counts(counts, more)}
+
+  defp add_rerun_counts({:atomic_phase1_failed, err, more}, counts),
+    do: {:atomic_phase1_failed, err, add_counts(counts, more)}
 
   defp drain_resolution({:ok, {row, result}}, acc, settings, atomic?, _timeout, halted) do
     record_resolution(result, row, acc, settings, atomic?, halted)
