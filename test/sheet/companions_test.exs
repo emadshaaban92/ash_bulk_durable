@@ -72,6 +72,19 @@ defmodule AshBulkDurable.Sheet.CompanionsTest do
     assert stored_count(ctx) == 0
   end
 
+  test "refuses a key under the owner's prefix that is not plain", ctx do
+    for key <- [
+          "bulk-staging/#{ctx.super_user.id}//certificates.zip",
+          "bulk-staging/#{ctx.super_user.id}/./certificates.zip",
+          "bulk-staging/#{ctx.super_user.id}/"
+        ] do
+      assert {:error, %Ash.Error.Invalid{errors: [%{field: :document}]}} =
+               stage(ctx, %{document: key})
+    end
+
+    assert stored_count(ctx) == 0
+  end
+
   test "refuses a mapped field whose requirement no staged file meets", ctx do
     assert {:error, %Ash.Error.Invalid{errors: [%{field: :document} = missing]}} =
              stage(ctx, %{})
