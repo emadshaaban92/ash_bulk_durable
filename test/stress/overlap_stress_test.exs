@@ -372,7 +372,7 @@ defmodule AshBulkDurable.OverlapStressTest do
 
   defp stop_pollers(_supervisor), do: stop_supervised!(:stress_pollers)
 
-  # The runs a poller has going, as `{bulk_action_id, pid}`; none while it
+  # The runs a poller has going, as `%{id: bulk_action_id, pid: pid}` maps; none while it
   # is stopping or stopped.
   defp runs(name) do
     case Process.whereis(name) do

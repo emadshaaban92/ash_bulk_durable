@@ -212,6 +212,37 @@ defmodule AshBulkDurable.Core.PollerTest do
       assert %{status: :completed} = reload(crashing)
     end
 
+    test "a run starts while the poller stalls as it starts it, and no crash is logged", ctx do
+      bulk_action = submit!(ctx, 1)
+      poller = start_poller!()
+      tasks = :sys.get_state(poller).tasks
+
+      # Hold the poller between its task supervisor starting the run's process
+      # and getting that reply, for longer than the 5 s a `Task.async_nolink`
+      # task waits there for its owner's go-ahead.
+      :sys.suspend(tasks)
+
+      log =
+        capture_log(fn ->
+          Poller.nudge()
+          assert eventually(fn -> start_child_queued?(tasks, poller) end)
+          :erlang.suspend_process(poller)
+
+          completed? =
+            try do
+              :sys.resume(tasks)
+              eventually(fn -> reload(bulk_action).status == :completed end, 400)
+            after
+              :erlang.resume_process(poller)
+            end
+
+          assert completed?
+          await_idle()
+        end)
+
+      refute log =~ "crashed"
+    end
+
     test "on shutdown clears the hint of a run it kills, so the next poll resumes it", ctx do
       bulk_action = submit!(ctx, 2, chunk_size: 2)
       test_pid = self()
@@ -1109,6 +1140,11 @@ defmodule AshBulkDurable.Core.PollerTest do
       tries == 0 -> false
       true -> Process.sleep(20) && eventually(fun, tries - 1)
     end
+  end
+
+  defp start_child_queued?(supervisor, caller) do
+    {:messages, messages} = Process.info(supervisor, :messages)
+    Enum.any?(messages, &match?({:"$gen_call", {^caller, _tag}, _request}, &1))
   end
 
   defp waiting_for_lock? do

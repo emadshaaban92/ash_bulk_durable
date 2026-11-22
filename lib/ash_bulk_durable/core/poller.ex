@@ -312,7 +312,7 @@ defmodule AshBulkDurable.Core.Poller do
 
   @impl true
   def handle_call(:running, _from, state),
-    do: {:reply, Enum.map(state.running, fn {_ref, %{id: id}} -> id end), state}
+    do: {:reply, Enum.map(state.running, fn {_pid, %{id: id}} -> id end), state}
 
   @impl true
   def handle_info(:poll, state), do: {:noreply, state |> fill() |> schedule_poll()}
@@ -331,15 +331,16 @@ defmodule AshBulkDurable.Core.Poller do
   # locked (`:busy`) leaves it for the next poll: the bulk action still reads
   # as startable, and filling now would start it again at once, as often as
   # its lock holder's chunk takes. A crash leaves it for the next poll too.
-  def handle_info({ref, result}, state) when is_map_key(state.running, ref) do
+  def handle_info({:run_returned, pid, result}, state) when is_map_key(state.running, pid) do
+    {%{ref: ref}, running} = Map.pop(state.running, pid)
     Process.demonitor(ref, [:flush])
-    state = %{state | running: Map.delete(state.running, ref)}
+    state = %{state | running: running}
     {:noreply, if(result == :busy, do: state, else: fill(state))}
   end
 
-  def handle_info({:DOWN, ref, :process, _pid, reason}, state)
-      when is_map_key(state.running, ref) do
-    {%{id: id}, running} = Map.pop(state.running, ref)
+  def handle_info({:DOWN, _ref, :process, pid, reason}, state)
+      when is_map_key(state.running, pid) do
+    {%{id: id}, running} = Map.pop(state.running, pid)
     Logger.error("ash_bulk_durable: bulk action #{id} crashed: #{Exception.format_exit(reason)}")
     {:noreply, %{state | running: running}}
   end
@@ -356,8 +357,8 @@ defmodule AshBulkDurable.Core.Poller do
 
     runs = Map.values(state.running)
 
-    Enum.each(state.running, fn {ref, run} ->
-      Process.demonitor(ref, [:flush])
+    Enum.each(runs, fn run ->
+      Process.demonitor(run.ref, [:flush])
 
       Logger.warning(
         "ash_bulk_durable: bulk action #{run.id} was still running at shutdown; " <>
@@ -442,12 +443,13 @@ defmodule AshBulkDurable.Core.Poller do
     remaining = max(deadline - System.monotonic_time(:millisecond), 0)
 
     receive do
-      {ref, _result} when is_map_key(state.running, ref) ->
+      {:run_returned, pid, _result} when is_map_key(state.running, pid) ->
+        {%{ref: ref}, running} = Map.pop(state.running, pid)
         Process.demonitor(ref, [:flush])
-        await_runs(%{state | running: Map.delete(state.running, ref)}, deadline)
+        await_runs(%{state | running: running}, deadline)
 
-      {:DOWN, ref, :process, _pid, _reason} when is_map_key(state.running, ref) ->
-        await_runs(%{state | running: Map.delete(state.running, ref)}, deadline)
+      {:DOWN, _ref, :process, pid, _reason} when is_map_key(state.running, pid) ->
+        await_runs(%{state | running: Map.delete(state.running, pid)}, deadline)
     after
       remaining -> state
     end
@@ -470,7 +472,7 @@ defmodule AshBulkDurable.Core.Poller do
   # short transaction. A poll that fails is logged and starts nothing; the
   # next one tries again.
   defp candidates(state, free) do
-    running = Enum.map(state.running, fn {_ref, %{id: id}} -> id end)
+    running = Enum.map(state.running, fn {_pid, %{id: id}} -> id end)
     resource = Core.config(:bulk_action_resource)
 
     {:ok, ids} =
@@ -493,15 +495,25 @@ defmodule AshBulkDurable.Core.Poller do
       []
   end
 
+  # Not `Task.Supervisor.async_nolink/2`: its task waits at most 5 s for the
+  # go-ahead the poller sends once the task supervisor replies, and exits
+  # `:timeout` without running if the poller stalls that long in between,
+  # which read as a crash of a run that never started. This task starts the
+  # run at once and sends its result itself. A run that returns before the
+  # poller monitors it is still read as returned: its message comes ahead of
+  # that monitor's `:noproc`. One that crashes that early is logged with
+  # `:noproc` for its reason.
   defp start_run(id, state) do
+    poller = self()
     stale_after = state.stale_after
 
-    task =
-      Task.Supervisor.async_nolink(state.tasks, fn ->
-        Worker.run(id, if_stale_after: stale_after)
+    {:ok, pid} =
+      Task.Supervisor.start_child(state.tasks, fn ->
+        send(poller, {:run_returned, self(), Worker.run(id, if_stale_after: stale_after)})
       end)
 
-    %{state | running: Map.put(state.running, task.ref, %{id: id, pid: task.pid})}
+    ref = Process.monitor(pid)
+    %{state | running: Map.put(state.running, pid, %{id: id, pid: pid, ref: ref})}
   end
 
   defp sweep(retention) do
