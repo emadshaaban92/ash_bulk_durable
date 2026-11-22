@@ -238,11 +238,44 @@
       "unique": false,
       "using": null,
       "where": null
+    },
+    {
+      "all_tenants?": false,
+      "concurrently": false,
+      "error_fields": [
+        "bulk_action_id",
+        "status",
+        "row_index"
+      ],
+      "fields": [
+        {
+          "type": "atom",
+          "value": "bulk_action_id"
+        },
+        {
+          "type": "atom",
+          "value": "status"
+        },
+        {
+          "type": "atom",
+          "value": "row_index"
+        }
+      ],
+      "include": null,
+      "include_base_filter?": true,
+      "message": null,
+      "name": "bulk_action_rows_suspect_index",
+      "nulls_distinct": true,
+      "prefix": null,
+      "table": null,
+      "unique": false,
+      "using": null,
+      "where": "attempts > 0"
     }
   ],
   "custom_statements": [],
   "has_create_action": true,
-  "hash": "45401EB9F20E893A53D3E2323663283FE95C19A486D1D9AFDD06E5D086B83522",
+  "hash": "A6DEF2C824691F07994E07CDE05F825126B0D9E2479F2FE6A768076137EE26CA",
   "identities": [],
   "multitenancy": {
     "attribute": null,

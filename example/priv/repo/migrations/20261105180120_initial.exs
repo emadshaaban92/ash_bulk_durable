@@ -92,6 +92,11 @@ defmodule Example.Repo.Migrations.Initial do
              )
     end
 
+    create index(:bulk_action_rows, [:bulk_action_id, :status, :row_index],
+             name: "bulk_action_rows_suspect_index",
+             where: "attempts > 0"
+           )
+
     alter table(:bulk_actions) do
       add :user_id, :uuid, null: false
       add :resource_name, :text, null: false
@@ -286,6 +291,10 @@ defmodule Example.Repo.Migrations.Initial do
       remove :resource_name
       remove :user_id
     end
+
+    drop_if_exists index(:bulk_action_rows, [:bulk_action_id, :status, :row_index],
+                     name: "bulk_action_rows_suspect_index"
+                   )
 
     drop constraint(:bulk_action_rows, "bulk_action_rows_bulk_action_id_fkey")
 
