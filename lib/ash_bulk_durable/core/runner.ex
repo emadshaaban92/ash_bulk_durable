@@ -362,6 +362,17 @@ defmodule AshBulkDurable.Core.Runner do
     %RowTimeoutError{timeout: timeout}
   end
 
+  @doc """
+  Logs that the task resolving `row` exited with `reason` before it started
+  on the row, which goes to a new task.
+  """
+  def row_not_started(reason, row) do
+    Logger.warning(
+      "bulk action #{row.bulk_action_id} row #{row.row_index}: its resolve task exited " <>
+        "before it started on the row (#{inspect(reason)}); a new task resolves it"
+    )
+  end
+
   # ---- References ----------------------------------------------------------
 
   defp unresolved_references(%Settings{input: shared_input}, row) do
