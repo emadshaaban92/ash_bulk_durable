@@ -31,20 +31,30 @@ defmodule AshBulkDurable.Core.Retention do
 
   ## One at a time
 
-  It deletes one bulk action per transaction, picked at random among those
-  due, with `FOR UPDATE SKIP LOCKED`, until none is left. One bulk action can
-  hold many rows, all deleted with it, so a transaction never holds more
-  than one bulk action's. A bulk action another transaction holds, such as
-  a retry's under the bulk action lock (`AshBulkDurable.Core.BulkActionLock`),
-  is skipped, and its status is read again once locked: a retry committed
-  meanwhile has moved it to `:queued`, and it is kept. Nodes pruning at once
-  split the bulk actions between them.
+  It reads the ids of up to 100 bulk actions due, in random order and
+  without locking them, then deletes each in a transaction of its own: it
+  locks that one by its primary key with `FOR UPDATE SKIP LOCKED`, reading
+  again that it is still due, and deletes it. Then it reads the next batch,
+  until none is due. One bulk action can hold many rows, all deleted with
+  it, so a transaction never holds more than one bulk action's. Each read
+  of the due ones scans them once, so a first prune over a long history
+  scans them once per 100 deleted rather than once per bulk action.
+
+  A bulk action another transaction holds, such as a retry's under the bulk
+  action lock (`AshBulkDurable.Core.BulkActionLock`), is skipped, and its
+  status is read again once locked: a retry committed meanwhile has moved
+  it to `:queued`, and it is kept. Nodes pruning at once split the bulk
+  actions between them.
 
   A delete that fails, such as one a host table's foreign key to
   `bulk_actions` refuses because it doesn't cascade, rolls back that bulk
-  action alone and is logged, and the prune goes on with the others; this
-  prune doesn't pick that one again. Picked at random, such a bulk action
-  never holds up the ones behind it, at this prune or the next.
+  action alone and is logged, and the prune goes on with the others. Its
+  transaction checks deferred constraints at the delete
+  (`SET CONSTRAINTS ALL IMMEDIATE`), so a host's foreign key declared
+  `DEFERRABLE INITIALLY DEFERRED` refuses it there too, rather than at the
+  commit, where it would end the prune. This prune doesn't try a skipped or
+  failed bulk action again, so it always ends, and such a bulk action never
+  holds up the ones behind it.
 
   It deletes with a query of its own, not through an action of the bulk
   action resource, so a host's policies and its own `:destroy` action (if
@@ -60,6 +70,7 @@ defmodule AshBulkDurable.Core.Retention do
   alias AshBulkDurable.Core.BulkActionLock
 
   @finished [:completed, :failed, :cancelled]
+  @batch 100
 
   @doc """
   Deletes every bulk action that finished `retention` milliseconds ago or
@@ -76,7 +87,7 @@ defmodule AshBulkDurable.Core.Retention do
 
   def prune(retention) do
     validate!(retention)
-    prune_each(retention, [], 0)
+    prune_batches(retention, [], 0)
   end
 
   @doc false
@@ -89,59 +100,86 @@ defmodule AshBulkDurable.Core.Retention do
             "got: #{inspect(retention)}"
   end
 
-  # Each turn deletes a bulk action, or adds one to `failed`, which the next
-  # turns never pick: this always ends.
-  defp prune_each(retention, failed, deleted) do
-    case prune_one(retention, failed) do
-      :none -> deleted
-      :deleted -> prune_each(retention, failed, deleted + 1)
-      {:failed, id} -> prune_each(retention, [id | failed], deleted)
+  # Each id of a batch is deleted, or added to `passed`, which later batches
+  # leave out: every batch takes ids no earlier one did, so this always ends.
+  defp prune_batches(retention, passed, deleted) do
+    case due_ids(retention, passed) do
+      [] ->
+        deleted
+
+      ids ->
+        {passed, deleted} = Enum.reduce(ids, {passed, deleted}, &prune_id(retention, &1, &2))
+        prune_batches(retention, passed, deleted)
     end
   end
 
-  defp prune_one(retention, failed) do
+  defp prune_id(retention, id, {passed, deleted}) do
+    case prune_one(retention, id) do
+      :deleted -> {passed, deleted + 1}
+      :passed -> {[id | passed], deleted}
+    end
+  end
+
+  # Unlocked: each id is locked, and read again as due, by `prune_one/2`.
+  defp due_ids(retention, passed) do
+    Core.config(:bulk_action_resource)
+    |> due(retention)
+    |> Ash.Query.filter(id not in ^passed)
+    |> Ash.Query.sort(Ash.Sort.expr_sort(fragment("random()"), :float))
+    |> Ash.Query.limit(@batch)
+    |> Ash.Query.select([:id])
+    |> BulkActionLock.pin()
+    |> Ash.read!(authorize?: false)
+    |> Enum.map(& &1.id)
+  end
+
+  # `:deleted`, or `:passed` when another transaction holds it, it is no
+  # longer due, or its delete failed.
+  defp prune_one(retention, id) do
     resource = Core.config(:bulk_action_resource)
     repo = AshPostgres.DataLayer.Info.repo(resource, :mutate)
 
     repo.transaction(fn ->
-      case pick(resource, retention, failed) do
-        nil -> :none
-        id -> delete(resource, repo, id)
-      end
+      if locked?(resource, retention, id), do: delete(resource, repo, id), else: :passed
     end)
     |> case do
       {:ok, result} -> result
-      {:error, {:failed, _id} = failed} -> failed
+      {:error, :failed} -> :passed
     end
   end
 
-  defp pick(resource, retention, failed) do
+  defp locked?(resource, retention, id) do
     resource
-    |> Ash.Query.filter(
-      status in ^@finished and id not in ^failed and
+    |> due(retention)
+    |> Ash.Query.filter(id == ^id)
+    |> Ash.Query.select([:id])
+    |> Ash.Query.lock("FOR UPDATE SKIP LOCKED")
+    |> BulkActionLock.pin()
+    |> Ash.read_one!(authorize?: false)
+    |> is_struct()
+  end
+
+  defp due(query, retention) do
+    Ash.Query.filter(
+      query,
+      status in ^@finished and
         finished_at <=
           fragment(
             "((now() AT TIME ZONE 'utc') - (? * interval '1 millisecond'))",
             ^retention
           )
     )
-    |> Ash.Query.sort(Ash.Sort.expr_sort(fragment("random()"), :float))
-    |> Ash.Query.limit(1)
-    |> Ash.Query.select([:id])
-    |> Ash.Query.lock("FOR UPDATE SKIP LOCKED")
-    |> BulkActionLock.pin()
-    |> Ash.read_one!(authorize?: false)
-    |> case do
-      nil -> nil
-      bulk_action -> bulk_action.id
-    end
   end
 
   # A failed delete has aborted the transaction: it rolls back, this bulk
-  # action alone, and the prune goes on.
+  # action alone, and the prune goes on. Deferred constraints are checked
+  # here, not at the commit, so a deferred foreign key's refusal lands here
+  # too.
   defp delete(resource, repo, id) do
     table = AshPostgres.DataLayer.Info.table(resource)
     prefix = AshPostgres.DataLayer.Info.schema(resource)
+
+    repo.query!("SET CONSTRAINTS ALL IMMEDIATE")
 
     repo.delete_all(
       from(bulk_action in table, where: bulk_action.id == type(^id, Ecto.UUID)),
@@ -156,6 +194,6 @@ defmodule AshBulkDurable.Core.Retention do
           "so it keeps it: #{Exception.message(exception)}"
       )
 
-      repo.rollback({:failed, id})
+      repo.rollback(:failed)
   end
 end
