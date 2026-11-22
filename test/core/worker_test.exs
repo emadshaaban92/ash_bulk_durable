@@ -487,20 +487,34 @@ defmodule AshBulkDurable.Core.WorkerTest do
   end
 
   # Runs the bulk action `new_bulk_action` makes with its first resolve task
-  # stalled (`stall_first_task_start/0`), and returns what it made and the
+  # stalled (`stall_first_task_start/1`), and returns what it made and the
   # log. On a busy machine the run can start the task before the stall is
   # in place: then it ran as usual, and a new bulk action is tried.
-  defp run_stalled(new_bulk_action, tries \\ 10) do
+  defp run_stalled(new_bulk_action, ending \\ :timeout, tries \\ 10) do
     made = new_bulk_action.()
     %{id: id} = with {bulk_action, _} <- made, do: bulk_action
-    stalled = stall_first_task_start()
+    stalled = stall_first_task_start(ending)
     log = capture_log(fn -> assert :ok = Worker.run_now(id) end)
 
     case stalled.() do
       :stalled -> {made, log}
-      _missed when tries > 1 -> run_stalled(new_bulk_action, tries - 1)
+      _missed when tries > 1 -> run_stalled(new_bulk_action, ending, tries - 1)
       missed -> flunk("the run was never stalled: #{inspect(missed)}")
     end
+  end
+
+  # Rows for `run_stalled/3`, with every unique field suffixed: a try that
+  # ran as usual has made its regions by the time the next one makes its own.
+  defp retry_safe_rows(n, suffix) do
+    Enum.map(1..n, fn i ->
+      %{
+        input: %{
+          name: "Region #{i}-#{suffix}",
+          native_name: {:resolve, EchoResolver, "Region AR #{i}-#{suffix}"},
+          code: "B#{i}-#{suffix}"
+        }
+      }
+    end)
   end
 
   # Holds the run still while it starts its first resolve task, as a run
@@ -508,19 +522,20 @@ defmodule AshBulkDurable.Core.WorkerTest do
   # after the 5 seconds `Task.Supervised` waits for it. The run is this
   # process; tracing its spawns shows its task supervisor, which is
   # suspended until the run asks it for the task. Then the run is suspended
-  # and the supervisor let go to start it. Returns a function that tells
-  # whether that came off. It leans on how `Task.Supervisor` starts and asks
-  # for a task, so an Elixir upgrade may need it changed.
-  defp stall_first_task_start do
+  # and the supervisor let go to start it. With `ending` `:killed`, the task
+  # is killed while it waits instead. Returns a function that tells whether
+  # that came off. It leans on how `Task.Supervisor` starts and asks for a
+  # task, so an Elixir upgrade may need it changed.
+  defp stall_first_task_start(ending) do
     run = self()
 
     helper =
       spawn(fn ->
         # Ahead of the run's own processes, to be in place before it asks.
-        Process.flag(:priority, :max)
+        Process.flag(:priority, :high)
         :erlang.trace(run, true, [:procs])
         send(run, {:tracing, self()})
-        result = catch_missed(fn -> stall(run) end)
+        result = catch_missed(fn -> stall(run, ending) end)
         :erlang.trace(run, false, [:procs])
         send(run, {:stall, self(), result})
       end)
@@ -541,7 +556,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
     end
   end
 
-  defp stall(run) do
+  defp stall(run, ending) do
     receive do
       {:trace, ^run, :spawn, tasks,
        {:proc_lib, :init_p,
@@ -557,9 +572,10 @@ defmodule AshBulkDurable.Core.WorkerTest do
             :sys.resume(tasks)
             task = await_stall(fn -> Enum.find(links(tasks), &(&1 != run)) end)
             ref = Process.monitor(task)
+            if ending == :killed, do: kill_when_watched(task)
 
             receive do
-              {:DOWN, ^ref, :process, ^task, :timeout} -> :stalled
+              {:DOWN, ^ref, :process, ^task, ^ending} -> :stalled
               {:DOWN, ^ref, :process, ^task, other} -> {:missed, other}
             after
               10_000 -> {:missed, :task_kept_waiting}
@@ -574,6 +590,15 @@ defmodule AshBulkDurable.Core.WorkerTest do
     after
       60_000 -> {:missed, :no_task_supervisor}
     end
+  end
+
+  # Killed before the stream watches it, the task would be reported `:noproc`.
+  defp kill_when_watched(task) do
+    await_stall(fn ->
+      match?({:monitored_by, [_, _ | _]}, Process.info(task, :monitored_by))
+    end)
+
+    Process.exit(task, :kill)
   end
 
   defp catch_missed(fun) do
@@ -1012,10 +1037,11 @@ defmodule AshBulkDurable.Core.WorkerTest do
     end
   end
 
-  describe "a resolve task that gives up before it gets its row" do
+  describe "a resolve task that exits before it gets its row" do
     # The task waits 5 seconds for the run to hand it the row, as
     # `Task.Supervised` does, and then exits `:timeout`, as a row that outran
-    # `:row_resolve_timeout` is reported.
+    # `:row_resolve_timeout` is reported. Only that exit sends the row to a
+    # new task.
     for mode <- [:per_row, :all_or_nothing] do
       test "#{mode}: the row is not failed as timed out; a new task resolves it", %{
         super_user: user
@@ -1027,7 +1053,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
             suffix = System.unique_integer([:positive])
 
             bulk_action =
-              create_bulk_action!(region_rows(3, suffix, EchoResolver),
+              create_bulk_action!(retry_safe_rows(3, suffix),
                 user_id: user.id,
                 chunk_size: 3,
                 mode: unquote(mode)
@@ -1045,6 +1071,38 @@ defmodule AshBulkDurable.Core.WorkerTest do
       end
     end
 
+    test "one killed before it gets its row fails the row with the reason", %{
+      super_user: user
+    } do
+      put_config(:phase1_concurrency, 2)
+
+      {{bulk_action, suffix}, log} =
+        run_stalled(
+          fn ->
+            suffix = System.unique_integer([:positive])
+
+            bulk_action =
+              create_bulk_action!(retry_safe_rows(3, suffix),
+                user_id: user.id,
+                chunk_size: 3
+              )
+
+            {bulk_action, suffix}
+          end,
+          :killed
+        )
+
+      refute log =~ "its resolve task exited before"
+      assert log =~ ~r/bulk action #{bulk_action.id} row \d exited/
+
+      assert %{status: :completed_with_errors, rows_done: 2} = reload(bulk_action)
+      rows = list_rows(bulk_action.id)
+      assert [failed] = Enum.filter(rows, &(&1.status == :failed))
+      assert messages(failed.error) == "resolving the row exited: killed"
+      assert Enum.count(rows, &(&1.status == :succeeded)) == 2
+      assert length(regions_from(suffix, user)) == 2
+    end
+
     test "a suspect run alone: it runs alone again on the start already counted", %{
       super_user: user
     } do
@@ -1053,7 +1111,7 @@ defmodule AshBulkDurable.Core.WorkerTest do
           suffix = System.unique_integer([:positive])
 
           bulk_action =
-            create_bulk_action!(region_rows(2, suffix, EchoResolver),
+            create_bulk_action!(retry_safe_rows(2, suffix),
               user_id: user.id,
               chunk_size: 2
             )
