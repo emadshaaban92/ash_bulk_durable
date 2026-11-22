@@ -73,7 +73,14 @@ defmodule AshBulkDurable.OverlapStressTest do
 
   Real connections, not the sandbox: runs, tickers, killed runs and a lock
   held elsewhere each need their own, and the liveness hint is stamped on the
-  database's clock. It deletes what it wrote.
+  database's clock. They come from a plain pool, as in production, which
+  lends a connection for each checkout. The sandbox's `:auto` mode would
+  instead pin one to every process that ever queried, for as long as it
+  lives: pollers, runs, tickers and the driver's helpers would soon hold the
+  whole pool, and a live run left waiting for a connection, with its ticker,
+  would go stale and be started over by another poller, costing stalled
+  starts and row attempts no chaos the driver counts explains. It deletes
+  what it wrote.
   """
   use ExUnit.Case, async: false
 
@@ -101,7 +108,14 @@ defmodule AshBulkDurable.OverlapStressTest do
   @terminal [:completed, :completed_with_errors, :failed, :cancelled]
 
   setup do
-    Ecto.Adapters.SQL.Sandbox.mode(Repo, :auto)
+    restart_repo!(pool: DBConnection.ConnectionPool)
+
+    # Registered first, so it runs last, and on its own: a setup or cleanup
+    # step that raises still leaves later tests the sandbox pool.
+    on_exit(fn ->
+      restart_repo!([])
+      Ecto.Adapters.SQL.Sandbox.mode(Repo, :manual)
+    end)
 
     Repo.query!("""
     CREATE TABLE IF NOT EXISTS stress_applied (
@@ -134,10 +148,18 @@ defmodule AshBulkDurable.OverlapStressTest do
 
       Repo.query!("DROP TABLE IF EXISTS stress_applied")
       Repo.query!("DROP TABLE IF EXISTS stress_verdicts")
-      Ecto.Adapters.SQL.Sandbox.mode(Repo, :manual)
     end)
 
     :ok
+  end
+
+  # The repo again, with `opts` over its config. Every other test shares the
+  # sandbox pool, and gets it back once this one is done. Unlinked, so the
+  # repo outlives the process that started it.
+  defp restart_repo!(opts) do
+    :ok = Repo.stop()
+    {:ok, pid} = Repo.start_link(opts)
+    Process.unlink(pid)
   end
 
   test "overlapping runs under chaos keep every invariant" do
