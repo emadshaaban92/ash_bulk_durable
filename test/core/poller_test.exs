@@ -532,6 +532,21 @@ defmodule AshBulkDurable.Core.PollerTest do
       end
     end
 
+    test "raises on a :staging_prefix that isn't a plain key ending in /" do
+      for bad <- ["", "/", "bulk-staging", "/bulk-staging/", "a//", "a/../b/", "./", ~S(a\b/), :x] do
+        put_config(:staging_prefix, bad)
+
+        assert_raise ArgumentError, ~r/`:staging_prefix` config must be a key ending in/, fn ->
+          Poller.child_spec([])
+        end
+      end
+
+      for good <- ["bulk-files/", "my_app/bulk-staging/"] do
+        put_config(:staging_prefix, good)
+        assert %{} = Poller.child_spec([])
+      end
+    end
+
     test "raises when required config is missing or names the wrong kind of module" do
       keys = [:bulk_action_resource, :row_resource, :owner_module, :storage]
       configured = Map.new(keys, &{&1, Application.fetch_env!(:ash_bulk_durable, &1)})

@@ -62,7 +62,7 @@ defmodule ExampleWeb.Bulk.LiveView do
       start_async: 3
     ]
 
-  alias AshBulkDurable.Core.Owner
+  alias AshBulkDurable.Core.{Owner, StagedFiles}
   alias AshBulkDurable.Sheet.{ErrorsSheet, Mapping}
   alias ExampleWeb.Bulk.ViewOptions
 
@@ -1037,7 +1037,7 @@ defmodule ExampleWeb.Bulk.LiveView do
   # Browser-to-storage presigner for companion uploads. The staging key is
   # namespaced under the user's `worker_key/1` prefix so the `BulkAction`
   # `:create` trust-boundary check can validate that every
-  # persisted companion key starts with `bulk-staging/<user_prefix>/`.
+  # persisted companion key starts with `<staging_prefix><user_prefix>/`.
   # The prefix and `entry.uuid` are server-computed; the trailing filename
   # is browser-supplied, so it is slugified via `safe_filename/1` to strip
   # path components — otherwise a `client_name` like `../../public/x` could
@@ -1045,7 +1045,7 @@ defmodule ExampleWeb.Bulk.LiveView do
   defp presign_companion(entry, socket) do
     user_prefix = socket |> scope() |> Owner.worker_key() |> to_string()
     filename = safe_filename(entry.client_name)
-    key = "bulk-staging/#{user_prefix}/#{entry.uuid}/companions/#{filename}"
+    key = "#{StagedFiles.prefix(user_prefix)}#{entry.uuid}/companions/#{filename}"
 
     url =
       ExampleWeb.Bulk.Storage.presigned_put_url(key,

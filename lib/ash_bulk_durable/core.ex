@@ -14,6 +14,9 @@ defmodule AshBulkDurable.Core do
         owner_module: MyApp.BulkActions.Owner,
         storage: MyApp.BulkActions.Storage
 
+  Staged files live under `:staging_prefix`, `bulk-staging/` by default
+  (`AshBulkDurable.Core.StagedFiles`).
+
   `check_config!/0` checks them; the poller's child spec calls it, so a node
   missing one fails at boot.
   """
@@ -57,8 +60,8 @@ defmodule AshBulkDurable.Core do
     * `:staged_files` — `%{name => storage_key}`, or a list of `{name,
       storage_key}` pairs: files staged for the resolvers, deleted once the
       bulk action no longer needs them. Every key must be the owner's, under
-      `bulk-staging/<owner>/` (`AshBulkDurable.Core.StagedFiles`), or nothing
-      is written.
+      `<staging_prefix><owner>/` (`AshBulkDurable.Core.StagedFiles`), or
+      nothing is written.
     * `:metadata` — a map kept on the bulk action and never read here.
 
   Raises `ArgumentError` when `resource` is not an Ash resource or has no
@@ -202,7 +205,9 @@ defmodule AshBulkDurable.Core do
   `AshBulkDurable.Core.Resource.Row` extensions, an `:owner_module`
   implementing `AshBulkDurable.Core.Owner` and a `:storage` module
   implementing `AshBulkDurable.Core.Storage`, which must accept its own
-  configuration (`c:AshBulkDurable.Core.Storage.check_config/1`).
+  configuration (`c:AshBulkDurable.Core.Storage.check_config/1`). A
+  `:staging_prefix`, when set, must be a plain key ending in `/`
+  (`AshBulkDurable.Core.StagedFiles.root/0`).
 
   A module counts as implementing a behaviour when it exports its required
   callbacks, whether or not it declares `@behaviour`.
@@ -210,6 +215,7 @@ defmodule AshBulkDurable.Core do
   @spec check_config!() :: :ok
   def check_config! do
     Enum.each(@required, fn {key, kind} -> check_config!(key, config(key), kind) end)
+    StagedFiles.root()
     Storage.check_config!()
   end
 

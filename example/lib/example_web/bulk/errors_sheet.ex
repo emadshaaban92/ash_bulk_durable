@@ -8,10 +8,12 @@ defmodule ExampleWeb.Bulk.ErrorsSheet do
   download URL — a browser→storage presigned-download pattern, so there's no
   app-side controller or route.
 
-  The object lives under the bulk action's `bulk-staging/` prefix, so the
+  The object lives under its owner's staging prefix, so the
   `AshBulkDurable.Core.PurgeStaleStaging` orphan sweep reclaims stale sheets after
   24h with no extra cleanup path — they're regenerated on demand anyway.
   """
+
+  alias AshBulkDurable.Core.StagedFiles
 
   # The presigned GET is consumed almost immediately — the LiveView builds it
   # on click and hands the browser a download link. Pin a deliberately short
@@ -53,7 +55,7 @@ defmodule ExampleWeb.Bulk.ErrorsSheet do
 
   @doc "Storage key for a bulk action's errors sheet (under its staging prefix)."
   def object_key(bulk_action),
-    do: "bulk-staging/#{bulk_action.user_id}/#{bulk_action.id}/errors_sheet.csv"
+    do: "#{StagedFiles.prefix(bulk_action.user_id)}#{bulk_action.id}/errors_sheet.csv"
 
   def build(bulk_action) do
     bulk_action

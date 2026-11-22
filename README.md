@@ -249,9 +249,10 @@ children = [
 
 Its child spec checks the config before anything starts: a node whose config
 misses one of the four keys above, names a module that isn't the right kind,
-or whose storage says its own config is wrong (a disk store without a `:root`)
-fails at boot with an `ArgumentError` saying so. So does an option the poller
-doesn't know, or a value of the wrong kind. Give the poller options with
+or whose storage says its own config is wrong (a disk store without a `:root`),
+or whose `:staging_prefix` isn't a plain key ending in `/`, fails at boot with
+an `ArgumentError` saying so. So does an option the poller doesn't know, or a
+value of the wrong kind. Give the poller options with
 `{AshBulkDurable, poller: [max_running: 4]}`, or none with `{AshBulkDurable,
 poller: false}` on a node that leaves running bulk actions to others, which
 still checks the config. `AshBulkDurable.Core.Poller` can also go in the tree
@@ -368,6 +369,7 @@ Not guaranteed:
 | `:excel_reader` | `AshBulkDurable.Sheet.ExcelReader.Calamine` | the `AshBulkDurable.Sheet.ExcelReader` that reads an XLSX |
 | `:pubsub_module` | none | broadcasts each update, and progress hints, on `"bulk_action:<id>"` |
 | `:progress_interval` | 1000 ms | the least time between two progress hints of one kind from a run; `0` sends every one |
+| `:staging_prefix` | `"bulk-staging/"` | where staged files live: every key starts with `<staging_prefix><owner>/`, and the daily sweep lists only this prefix and deletes anything under it over a day old that no bulk action holds, so reserve it for staged files; a plain key ending in `/`, read at runtime |
 
 ## Progress hints
 

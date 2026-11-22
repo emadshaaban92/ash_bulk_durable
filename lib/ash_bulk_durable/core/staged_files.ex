@@ -1,9 +1,10 @@
 defmodule AshBulkDurable.Core.StagedFiles do
   @moduledoc """
   Whose staged files a bulk action may name. Every key in `:staged_files`
-  must start with its owner's staging prefix, `bulk-staging/<owner>/`, where
-  `<owner>` is `AshBulkDurable.Core.Owner.worker_key/1` of the submitting
-  scope, and be a plain key, one every shipped store accepts as it is:
+  must start with its owner's staging prefix, `<staging_prefix><owner>/`
+  (`bulk-staging/<owner>/` by default), where `<owner>` is
+  `AshBulkDurable.Core.Owner.worker_key/1` of the submitting scope, and be a
+  plain key, one every shipped store accepts as it is:
   valid UTF-8, with no empty, `.` or `..` segment (so no `//` and no
   trailing `/`), no backslash and no NUL. `AshBulkDurable.Core.create/4`,
   `AshBulkDurable.Core.Retry.retry/2` and `retry_row/2` refuse any other key
@@ -23,12 +24,48 @@ defmodule AshBulkDurable.Core.StagedFiles do
   An owner whose worker key is not one plain path segment (it holds a `/`,
   or is `""`, `.` or `..`) is refused any staged file: its prefix would
   also cover, or resolve into, another owner's files.
+
+  ## The staging prefix
+
+  Every staged file lives under `:staging_prefix`, `bulk-staging/` unless
+  the config sets another, such as `"my_app/bulk-staging/"` in a bucket
+  other apps also use. It is read when used, so it may be set in
+  `runtime.exs`. It must be a plain key ending in `/`: one or more segments,
+  none empty, `.` or `..`, with no backslash or NUL.
+  `AshBulkDurable.Core.check_config!/0` refuses any other at boot.
+
+  Reserve it for staged files: the daily sweep
+  (`AshBulkDurable.Core.PurgeStaleStaging`) lists only this prefix, and
+  deletes anything under it that is over a day old and that no bulk action
+  holds, whoever wrote it.
+
+  Changing it leaves the files under the old one where they are: bulk
+  actions already holding them still fetch and delete them, but no sweep
+  reclaims what they leave, and a retry can't name them again.
   """
 
-  @root "bulk-staging/"
+  @default_root "bulk-staging/"
 
-  @doc "The staging prefix of `owner`, a worker key: `bulk-staging/<owner>/`."
-  def prefix(owner), do: "#{@root}#{owner}/"
+  @doc """
+  The `:staging_prefix` config, `bulk-staging/` by default. Raises
+  `ArgumentError` when it is not a plain key ending in `/`.
+  """
+  def root, do: AshBulkDurable.Core.config(:staging_prefix, @default_root) |> check_root!()
+
+  @doc "Returns `root` when it is a plain key ending in `/`, else raises `ArgumentError`."
+  def check_root!(root) do
+    if is_binary(root) and String.ends_with?(root, "/") and
+         plain?(binary_part(root, 0, byte_size(root) - 1)) do
+      root
+    else
+      raise ArgumentError,
+            "ash_bulk_durable: the `:staging_prefix` config must be a key ending in \"/\" " <>
+              "that #{plain_rule()}, such as \"bulk-staging/\"; got: #{inspect(root)}"
+    end
+  end
+
+  @doc "The staging prefix of `owner`, a worker key: `<staging_prefix><owner>/`."
+  def prefix(owner), do: "#{root()}#{owner}/"
 
   @doc "Whether `key` is a staging key `owner` may name."
   def owned?(key, owner) when is_binary(key) do

@@ -15,7 +15,7 @@ defmodule AshBulkDurable.Core.Owner do
   @doc """
   A stable identifier for the user behind `scope`: the partial-unique-index
   key on `BulkAction.user_id` and the prefix of their staging keys,
-  `bulk-staging/<worker_key>/` (`AshBulkDurable.Core.StagedFiles`), so it
+  `<staging_prefix><worker_key>/` (`AshBulkDurable.Core.StagedFiles`), so it
   is one plain path segment: no `/`, and not `""`, `.` or `..`. Must
   round-trip through `scope_from_worker_key/2` to `{:ok, scope}` with the
   same effective scope.

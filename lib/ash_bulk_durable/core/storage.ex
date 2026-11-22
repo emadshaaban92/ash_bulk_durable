@@ -40,8 +40,9 @@ defmodule AshBulkDurable.Core.Storage do
   timestamp. Used by `AshBulkDurable.Core.PurgeStaleStaging` to age-gate the
   orphan sweep — the worker can't clean up keys for bulk actions whose submit
   transaction never committed, so the sweep lists the prefix and deletes
-  what's stale. The core passes a prefix ending in `/` (`bulk-staging/`), so
-  a store may read it as a directory or as the start of every key.
+  what's stale. The core passes the `:staging_prefix` config, a prefix
+  ending in `/` (`bulk-staging/` by default), so a store may read it as a
+  directory or as the start of every key.
   """
   @callback list_files(prefix :: String.t(), opts :: keyword()) ::
               {:ok, [%{key: key(), last_modified: DateTime.t()}]} | {:error, term()}
