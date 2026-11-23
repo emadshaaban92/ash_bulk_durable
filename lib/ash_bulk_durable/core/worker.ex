@@ -1393,12 +1393,16 @@ defmodule AshBulkDurable.Core.Worker do
   # asks for its next row only after this process has reduced the last
   # result, so once the flag is up no row starts; the rest stay `:pending`.
   #
-  # A task that dies before it starts on its row has not run it, so the row
-  # neither timed out nor failed: it goes to a new task, here, once the rest
-  # are through. A task waits 5 seconds for this process to send it its row,
-  # and then exits `:timeout`, the reason an overrun is reported with; this
-  # process held up that long (suspended, or starved) is how one gets there.
-  # Each task marks its row started first thing, in `started`. Run again
+  # A task that gives up before it starts on its row has not run it, so the
+  # row neither timed out nor failed: it goes to a new task, here, once the
+  # rest are through. A task waits 5 seconds for this process to send it its
+  # row, and then exits `:timeout`, the reason an overrun is reported with;
+  # this process held up that long (suspended, or starved) is how one gets
+  # there. Each task marks its row started first thing, in `started`. Only
+  # that exit is run again: it costs a 5-second stall each time, so it can't
+  # spin. A task that dies before starting for any other reason (killed, say,
+  # or a linked process crashed) fails its row with that reason, as one that
+  # started does, since nothing says a new task would fare better. Run again
   # here, a row run alone keeps the one start `isolate/2` counted for it,
   # where going back through it would count a second it never had. After an
   # all-or-nothing halt, they stay `:pending`, as the rows never started do,
@@ -1459,14 +1463,17 @@ defmodule AshBulkDurable.Core.Worker do
     end
   end
 
-  # An exit names the row it was zipped with, and whether its task started.
+  # An exit names the row it was zipped with, and whether its task gave up
+  # waiting for it.
   defp started_or_not({:ok, _resolved} = resolved, _started), do: resolved
 
-  defp started_or_not({:exit, {{row, i}, reason}}, started) do
+  defp started_or_not({:exit, {{row, i}, :timeout}}, started) do
     if :atomics.get(started, i) == 0,
-      do: {:not_started, row, reason},
-      else: {:exit, {row, reason}}
+      do: {:not_started, row, :timeout},
+      else: {:exit, {row, :timeout}}
   end
+
+  defp started_or_not({:exit, {{row, _i}, reason}}, _started), do: {:exit, {row, reason}}
 
   defp add_rerun_counts({:ok, more}, counts), do: {:ok, add_counts(counts, more)}
 
