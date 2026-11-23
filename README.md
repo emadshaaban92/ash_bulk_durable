@@ -31,6 +31,41 @@ what needs running.
 [`example/`](example/README.md) is a Phoenix app using it, with a `/bulk` page
 to copy into yours.
 
+## How it works
+
+1. **Submit.** A verb writes the bulk action, `:queued`, and a row for each
+   input in one transaction, and returns. A sheet's columns are mapped to
+   inputs first.
+2. **Start.** The poller of the node it was submitted on starts it at once if
+   it has a free slot, and any node's poller does within `:poll_interval`.
+   The run locks the bulk action's row and sets it `:running`.
+3. **Resolve.** Rows whose input holds a reference
+   (`AshBulkDurable.Core.Reference`: a lookup of a record by an identity, or a
+   resolver's value, such as a staged file) have it resolved, up to
+   `:phase1_concurrency` at once and outside the lock, and each is saved
+   `:resolved`, or `:failed` with its error.
+4. **Write.** The rows then run the target action as the owner, in chunks of
+   `:chunk_size` rows (`:default_chunk_size`, 50, by default). Each chunk is
+   one transaction that locks the bulk action's row first, writes the chunk's
+   rows, marks them `:succeeded` and adds them to `rows_done`. A chunk with a failing row rolls back, and its rows
+   run again in halves until the failing ones are marked `:failed` alone. An
+   `:all_or_nothing` bulk action writes every row in one transaction instead.
+5. **Verdict.** Once no row is left to write, the run sets the bulk action
+   `:completed`, or `:completed_with_errors` when some rows failed. A run that
+   can't go on sets it `:failed` (an owner who lost access, or an
+   all-or-nothing bulk action with a failed row; `AshBulkDurable.Core.Worker`
+   lists every reason). Its owner can then `AshBulkDurable.retry/2` it,
+   which reruns every row that has not succeeded, as it is or corrected, as
+   the next pass, or `AshBulkDurable.abandon/2` it (`:cancelled`).
+
+The rows' statuses are the run's progress, so a run that dies is started
+again from where they stand. A run stamps the bulk action's `alive_at` as it
+goes; once that is older than `:stale_after`, any node's poller starts it
+again. Two runs of one bulk action may overlap, but each chunk takes the lock
+and reads its rows under it, so they take turns and no row is written twice.
+Runs that keep dying are counted, and end in a failed row or bulk action
+rather than restarting forever.
+
 ## Installation
 
 ```elixir
@@ -186,6 +221,17 @@ config :ash_bulk_durable,
   config :ash_bulk_durable, storage: AshBulkDurable.Storage.S3
   config :ash_bulk_durable, AshBulkDurable.Storage.S3, bucket: "my-app-bulk-files"
   ```
+
+Two keys are read when your resources compile, not when the app runs:
+`:bulk_action_resource`, which the row's `bulk_action` relationship points
+at, and `:pubsub_module`, which fills in the bulk action's `pub_sub` block.
+Set them in `config/config.exs` (or a file it imports), not in
+`config/runtime.exs`. Without `:bulk_action_resource` the row resource fails
+to compile; a bulk action resource compiled without `:pubsub_module`
+broadcasts no updates, though the progress hints, read when they are sent,
+still go out. A release keeps what the resources were built with, whatever
+its runtime config says. Every other key is read when it is used, so
+`config/runtime.exs` can set it.
 
 Add `AshBulkDurable` last to each node's supervision tree, after the repo,
 anything that migrates it, and the PubSub and endpoint a run broadcasts
