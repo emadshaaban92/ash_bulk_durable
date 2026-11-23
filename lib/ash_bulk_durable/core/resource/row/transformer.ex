@@ -51,7 +51,8 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
      |> add_bump_attempts_action()
      |> add_reopen_with_corrections_action()
      |> add_postgres_reference()
-     |> add_status_index()}
+     |> add_status_index()
+     |> add_suspect_index()}
   end
 
   # ── Attributes ───────────────────────────────────────────────────────────
@@ -537,7 +538,7 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
     existing =
       dsl_state
       |> Transformer.get_entities([:postgres, :custom_indexes])
-      |> Enum.find(&(&1.fields == fields))
+      |> Enum.find(&(&1.fields == fields and is_nil(&1.where)))
 
     if existing do
       dsl_state
@@ -545,6 +546,37 @@ defmodule AshBulkDurable.Core.Resource.Row.Transformer do
       {:ok, index} =
         Transformer.build_entity(AshPostgres.DataLayer, [:postgres, :custom_indexes], :index,
           fields: fields
+        )
+
+      Transformer.add_entity(dsl_state, [:postgres, :custom_indexes], index, type: :append)
+    end
+  end
+
+  # The suspect-row read: before each chunk, outside isolation, the worker
+  # looks for the first row of a status with `attempts > 0`, one a run died
+  # on while running it alone. Such rows are few, so this index holds only
+  # them, and the read finds one, or none, without walking the status
+  # index over every row still to run. Its own name, since its fields match
+  # the status index's.
+  defp add_suspect_index(dsl_state) do
+    fields = [:bulk_action_id, :status, :row_index]
+    where = "attempts > 0"
+
+    existing =
+      dsl_state
+      |> Transformer.get_entities([:postgres, :custom_indexes])
+      |> Enum.any?(&(&1.fields == fields and &1.where == where))
+
+    if existing do
+      dsl_state
+    else
+      table = AshPostgres.DataLayer.Info.table(dsl_state)
+
+      {:ok, index} =
+        Transformer.build_entity(AshPostgres.DataLayer, [:postgres, :custom_indexes], :index,
+          fields: fields,
+          where: where,
+          name: "#{table}_suspect_index"
         )
 
       Transformer.add_entity(dsl_state, [:postgres, :custom_indexes], index, type: :append)

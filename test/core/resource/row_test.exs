@@ -8,6 +8,7 @@ defmodule AshBulkDurable.Core.Resource.RowTest do
 
   require Ash.Query
 
+  alias AshBulkDurable.Core.Worker
   alias AshBulkDurable.Test.{BulkAction, Row}
 
   defp create_bulk_action!(rows, shared_input \\ nil) do
@@ -97,6 +98,89 @@ defmodule AshBulkDurable.Core.Resource.RowTest do
 
       assert message =~ "unreadable"
     end
+  end
+
+  describe "the suspect-row read" do
+    # The worker's look for a row to run alone outside isolation: the first
+    # of a status with `attempts > 0`. Rows a run died on are few, so the
+    # read must not walk every row still to run. Planned generic, as a
+    # cached prepared statement may be, so a bind parameter in place of the
+    # 0 would leave the index unused.
+    test "the worker's read is served by an index holding only rows with attempts > 0" do
+      bulk_action = create_bulk_action!(Enum.map(0..499, &resolved/1))
+      repo = AshBulkDurable.Test.Repo
+
+      repo.query!(
+        "UPDATE bulk_action_rows SET attempts = 1 WHERE bulk_action_id = $1 AND row_index = 250",
+        [Ecto.UUID.dump!(bulk_action.id)]
+      )
+
+      repo.query!("ANALYZE bulk_action_rows")
+
+      {sql, params} = worker_sql(bulk_action, :resolved)
+      repo.query!("SET LOCAL plan_cache_mode = force_generic_plan")
+      repo.query!("PREPARE suspect_read AS " <> sql)
+      args = Enum.map_join(params, ", ", &literal/1)
+      %{rows: plan} = repo.query!("EXPLAIN EXECUTE suspect_read(#{args})")
+      repo.query!("DEALLOCATE suspect_read")
+
+      assert Enum.join(List.flatten(plan), "\n") =~ "bulk_action_rows_suspect_index"
+
+      %{rows: [[definition]]} =
+        repo.query!(
+          "SELECT indexdef FROM pg_indexes WHERE indexname = 'bulk_action_rows_suspect_index'"
+        )
+
+      assert definition =~ "(bulk_action_id, status, row_index) WHERE (attempts > 0)"
+    end
+
+    test "the worker's read finds the first suspect row, or none" do
+      bulk_action = create_bulk_action!(Enum.map(0..4, &resolved/1))
+
+      read = fn ->
+        Worker.next_alone_query(bulk_action, :resolved) |> Ash.read_one!(authorize?: false)
+      end
+
+      assert read.() == nil
+
+      AshBulkDurable.Test.Repo.query!(
+        "UPDATE bulk_action_rows SET attempts = 1 WHERE bulk_action_id = $1 AND row_index IN (1, 3)",
+        [Ecto.UUID.dump!(bulk_action.id)]
+      )
+
+      assert %{row_index: 1} = read.()
+    end
+  end
+
+  # EXECUTE takes no bind parameters, so the read's go in as literals.
+  defp literal(value) when is_integer(value), do: Integer.to_string(value)
+  defp literal(<<_::128>> = uuid), do: "'#{Ecto.UUID.load!(uuid)}'"
+  defp literal(value) when is_binary(value), do: "'#{String.replace(value, "'", "''")}'"
+
+  # The SQL and parameters the worker's suspect-row read sends.
+  defp worker_sql(bulk_action, status) do
+    test_pid = self()
+    handler = "suspect-read-#{System.unique_integer()}"
+
+    :telemetry.attach(
+      handler,
+      [:ash_bulk_durable, :test, :repo, :query],
+      fn _event, _measurements, %{query: query, params: params}, _config ->
+        # Only this test's own read: other tests run their queries meanwhile.
+        if self() == test_pid and String.starts_with?(query, "SELECT"),
+          do: send(test_pid, {:sql, query, params})
+      end,
+      nil
+    )
+
+    try do
+      Worker.next_alone_query(bulk_action, status) |> Ash.read_one!(authorize?: false)
+    after
+      :telemetry.detach(handler)
+    end
+
+    assert_received {:sql, sql, params}
+    {sql, params}
   end
 
   describe ":next_resolved_chunk" do

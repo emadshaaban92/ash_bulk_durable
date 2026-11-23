@@ -2156,17 +2156,30 @@ defmodule AshBulkDurable.Core.Worker do
   defp next_alone_row(%{mode: :all_or_nothing}, _in_status), do: nil
 
   defp next_alone_row(bulk_action, in_status) do
+    bulk_action
+    |> next_alone_query(in_status)
+    |> Ash.read_one!(authorize?: false)
+  end
+
+  # Outside isolation, `attempts > 0` is a literal in the SQL, not a bind
+  # parameter: the suspect index's `WHERE attempts > 0` can serve only a
+  # read Postgres can prove implies it, and a generic plan can't prove
+  # that of `attempts > $1`. Public for the test that plans it.
+  @doc false
+  def next_alone_query(bulk_action, in_status) do
     query =
       Ash.Query.filter(
         row_resource(),
         bulk_action_id == ^bulk_action.id and status == ^in_status
       )
 
-    if(isolating?(bulk_action), do: query, else: Ash.Query.filter(query, attempts > 0))
+    if(isolating?(bulk_action),
+      do: query,
+      else: Ash.Query.filter(query, fragment("? > 0", attempts))
+    )
     |> Ash.Query.sort(row_index: :asc)
     |> Ash.Query.limit(1)
     |> BulkActionLock.pin()
-    |> Ash.read_one!(authorize?: false)
   end
 
   # The chunks leave out a row to run alone. Belt and braces: each chunk is
