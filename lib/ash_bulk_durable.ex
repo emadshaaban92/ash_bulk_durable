@@ -250,9 +250,9 @@ defmodule AshBulkDurable do
   defp own_resource([%{__struct__: resource} | _selected]), do: resource
   defp own_resource(_selection), do: nil
 
-  # Only what a row keeps of a record is read, so a large selection stays light.
-  # A stream, as a list's read action requires pagination and `page: false`
-  # would be refused.
+  # Only what a row keeps of a record is read, so a large selection stays light,
+  # and no more records than it takes to go over `:max_rows`. A stream, as a
+  # list's read action requires pagination and `page: false` would be refused.
   defp selected(%Ash.Query{} = query, resource, opts) do
     tenant_attribute = Ash.Resource.Info.multitenancy_attribute(resource)
 
@@ -260,7 +260,7 @@ defmodule AshBulkDurable do
       query
       |> Ash.Query.select(List.wrap(tenant_attribute))
       |> Ash.stream!(Keyword.take(opts, [:scope, :tenant]))
-      |> Enum.to_list()
+      |> Core.take_rows()
 
     {:ok, selected}
   rescue

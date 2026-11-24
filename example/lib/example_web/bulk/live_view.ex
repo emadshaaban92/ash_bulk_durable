@@ -1127,9 +1127,16 @@ defmodule ExampleWeb.Bulk.LiveView do
 
   # An upload's temporary path has no extension; the browser's file name
   # says which type it is.
+  # A sheet of more rows than a bulk action holds is refused here, where the
+  # page can say so, rather than at submit, after its columns are mapped.
   defp read_sheet(path, entry) do
     type = if String.ends_with?(entry.client_name, ".xlsx"), do: :xlsx, else: :csv
-    AshBulkDurable.read_sheet(path, type: type)
+    max_rows = AshBulkDurable.config(:max_rows, 100_000)
+
+    case AshBulkDurable.read_sheet(path, type: type) do
+      {:ok, %{rows: rows}} when length(rows) > max_rows -> {:error, {:too_many_rows, max_rows}}
+      result -> result
+    end
   end
 
   # A sheet `read_sheet/2` refuses stays off the page, which says why in
@@ -1162,6 +1169,15 @@ defmodule ExampleWeb.Bulk.LiveView do
       "Couldn't read %{name}: the sheet is too large, over %{max} cells. Split it into smaller files.",
       name: name,
       max: max
+    )
+  end
+
+  defp sheet_refusal({:too_many_rows, max}, name) do
+    ngettext(
+      "Couldn't read %{name}: it has more than %{count} row. Split it into smaller files.",
+      "Couldn't read %{name}: it has more than %{count} rows. Split it into smaller files.",
+      max,
+      name: name
     )
   end
 

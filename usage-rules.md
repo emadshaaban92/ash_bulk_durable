@@ -22,6 +22,7 @@
   add a `:destroy` to them unless a policy guards it.
 - `:per_row` commits rows in chunks and keeps failures to correct.
   `:all_or_nothing` is one transaction, capped by `:atomic_mode_max_rows`.
+  Either mode is capped by `:max_rows`; split a larger job into several.
 - Bulk actions reach your policies with the context
   `action_source: AshBulkDurable.action_source()`. A filter check denies under
   a record-less `Ash.can?`, so allow that source and hold the rule in a
