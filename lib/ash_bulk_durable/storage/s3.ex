@@ -15,10 +15,10 @@ if Code.ensure_loaded?(ExAws.S3) and Code.ensure_loaded?(SweetXml) do
     supports: `:hackney`, its default, or `:req` with
     `config :ex_aws, http_client: ExAws.Request.Req`.
 
-        {:ex_aws, "~> 2.7"},
-        {:ex_aws_s3, "~> 2.5"},
+        {:ex_aws, "~> 2.8"},
+        {:ex_aws_s3, "~> 2.6"},
         {:sweet_xml, "~> 0.7"},
-        # The version ex_aws 2.7 asks for.
+        # The version ex_aws 2.8 asks for.
         {:hackney, "~> 4.0"}
 
     Then:

@@ -57,8 +57,8 @@ defmodule AshBulkDurable.MixProject do
       {:telemetry, "~> 1.2"},
 
       # AshBulkDurable.Storage.S3, for a host that stages files in a bucket.
-      {:ex_aws, "~> 2.7", optional: true},
-      {:ex_aws_s3, "~> 2.5", optional: true},
+      {:ex_aws, "~> 2.8", optional: true},
+      {:ex_aws_s3, "~> 2.6", optional: true},
       {:sweet_xml, "~> 0.7", optional: true},
 
       # `mix ash_bulk_durable.install`, for a host that installs with igniter.
