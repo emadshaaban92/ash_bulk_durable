@@ -288,10 +288,11 @@ config :ash_bulk_durable, retention: :timer.hours(24 * 30)
 
 The prune never deletes a bulk action that is `:completed_with_errors`: that one
 waits for its owner to retry or abandon it. A `:failed` one can be retried only
-until the prune deletes it. It deletes one bulk action per transaction, picked
-at random, with its own query, not through the resource's actions or policies.
-One that a table of yours references without `on_delete: :delete` can't be
-deleted: the prune logs an error, keeps it, and goes on with the others.
+until the prune deletes it. It reads the bulk actions due 100 at a time and
+deletes each in a transaction of its own, with its own query, not through the
+resource's actions or policies. One that a table of yours references without
+`on_delete: :delete` can't be deleted, deferred foreign key or not: the prune
+logs an error, keeps it, and goes on with the others.
 
 A run stamps its bulk action's liveness hint (`alive_at`) as it goes, and at
 least every `:alive_interval` (30 seconds by default). Two runs of one bulk

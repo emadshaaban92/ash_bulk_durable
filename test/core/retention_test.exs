@@ -140,6 +140,76 @@ defmodule AshBulkDurable.Core.RetentionTest do
     refute Enum.any?(others, &kept?/1)
   end
 
+  test "keeps one a deferred foreign key refuses, logs it, and deletes the others" do
+    [pinned | others] = for _ <- 1..4, do: finished!(:completed, 2 * @day)
+
+    # Checked at commit, unless the prune checks it at the delete.
+    Repo.query!(
+      "CREATE TABLE retention_test_pins (bulk_action_id uuid REFERENCES bulk_actions (id) " <>
+        "DEFERRABLE INITIALLY DEFERRED)"
+    )
+
+    Repo.query!("INSERT INTO retention_test_pins VALUES ($1)", [Ecto.UUID.dump!(pinned.id)])
+
+    log = capture_log(fn -> assert Retention.prune(@day) == 3 end)
+
+    assert log =~ "could not delete bulk action #{pinned.id}"
+    assert kept?(pinned) and row_count(pinned) == 2
+    refute Enum.any?(others, &kept?/1)
+  end
+
+  test "reads the bulk actions due a batch of 100 at a time, not once per bulk action" do
+    old = for _ <- 1..250, do: finished!(:completed, 2 * @day)
+    test_pid = self()
+    handler = "retention-reads-#{System.unique_integer()}"
+
+    :telemetry.attach(
+      handler,
+      [:ash_bulk_durable, :test, :repo, :query],
+      fn _event, _measurements, %{query: query}, _config ->
+        if query =~ "random()", do: send(test_pid, :due_read)
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    assert Retention.prune(@day) == 250
+    :telemetry.detach(handler)
+
+    # 100, 100, 50, then the read that finds none left.
+    for _ <- 1..4, do: assert_received(:due_read)
+    refute_received :due_read
+    refute Enum.any?(old, &kept?/1)
+  end
+
+  test "keeps one a retry reopened after the prune read it as due" do
+    bulk_action = finished!({:failed, %{reason: :worker_lost}}, 2 * @day)
+    handler = "retention-retry-#{System.unique_integer()}"
+
+    # Once the due ids are read, before any is locked: as a retry committed
+    # in between would leave it.
+    :telemetry.attach(
+      handler,
+      [:ash_bulk_durable, :test, :repo, :query],
+      fn _event, _measurements, %{query: query}, _config ->
+        if query =~ "random()" do
+          :telemetry.detach(handler)
+
+          Repo.query!("UPDATE bulk_actions SET status = 'queued' WHERE id = $1", [
+            Ecto.UUID.dump!(bulk_action.id)
+          ])
+        end
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    assert Retention.prune(@day) == 0
+    assert kept?(bulk_action) and row_count(bulk_action) == 2
+  end
+
   # `finished_at` holds UTC without a zone; the database's own clock is
   # compared in UTC whatever the session's time zone.
   test "reads finished_at as UTC, whatever the session's time zone" do
