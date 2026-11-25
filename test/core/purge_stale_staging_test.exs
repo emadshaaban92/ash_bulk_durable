@@ -117,6 +117,34 @@ defmodule AshBulkDurable.Core.PurgeStaleStagingTest do
       assert key_with_errors in remaining
     end
 
+    test "lists only the configured :staging_prefix" do
+      AshBulkDurable.StorageHelpers.put_config(:staging_prefix, "my_app/staging/")
+      orphan = "my_app/staging/#{Ecto.UUID.generate()}/uuid-a/logo.zip"
+      elsewhere = "#{@prefix}#{Ecto.UUID.generate()}/uuid-a/logo.zip"
+
+      TestStorage.put(orphan, "x", old())
+      TestStorage.put(elsewhere, "x", old())
+
+      assert :ok = PurgeStaleStaging.sweep()
+
+      refute orphan in TestStorage.keys()
+      assert elsewhere in TestStorage.keys()
+    end
+
+    # Here, not in `StagedFilesTest`, which is async.
+    test "the owner's staged files are those under the configured :staging_prefix" do
+      AshBulkDurable.StorageHelpers.put_config(:staging_prefix, "my_app/staging/")
+
+      assert AshBulkDurable.Core.StagedFiles.prefix("u1") == "my_app/staging/u1/"
+      assert AshBulkDurable.Core.StagedFiles.owned?("my_app/staging/u1/a/logo.zip", "u1")
+      refute AshBulkDurable.Core.StagedFiles.owned?("#{@prefix}u1/a/logo.zip", "u1")
+
+      assert {:error, error} =
+               AshBulkDurable.Core.StagedFiles.check(%{"logo" => "#{@prefix}u1/a.zip"}, "u1")
+
+      assert Exception.message(error) =~ ~s(must start with "my_app/staging/u1/")
+    end
+
     test "still runs, and keeps its keys, past a bulk action whose action is gone" do
       {parked, [key_parked]} = create_bulk_action!(["logo.zip"])
       finish!(parked, :completed_with_errors)

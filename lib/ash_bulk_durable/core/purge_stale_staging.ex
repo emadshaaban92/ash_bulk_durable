@@ -10,9 +10,10 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
 
   ## Daily sweep (`sweep/0`)
 
-  Lists every object under the `bulk-staging/` prefix, keeps only those
-  older than 24h, and decides per key against the set of keys that still
-  need preservation:
+  Lists every object under the staging prefix (`:staging_prefix`,
+  `bulk-staging/` by default; see `AshBulkDurable.Core.StagedFiles`), keeps
+  only those older than 24h, and decides per key against the set of keys
+  that still need preservation:
 
     * **Key referenced by a `:queued` / `:running` /
       `:completed_with_errors` bulk action** → KEEP. An active worker may
@@ -57,9 +58,8 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
   require Ash.Query
   require Logger
 
-  alias AshBulkDurable.Core.{BulkActionLock, Storage}
+  alias AshBulkDurable.Core.{BulkActionLock, StagedFiles, Storage}
 
-  @staging_prefix "bulk-staging/"
   @stale_after_seconds 24 * 60 * 60
 
   @doc """
@@ -96,7 +96,9 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
   and nothing is deleted until a later sweep lists.
   """
   def sweep do
-    case Storage.list_files(@staging_prefix) do
+    staging_prefix = StagedFiles.root()
+
+    case Storage.list_files(staging_prefix) do
       {:ok, objects} ->
         cutoff = DateTime.add(DateTime.utc_now(), -@stale_after_seconds, :second)
 
@@ -107,7 +109,7 @@ defmodule AshBulkDurable.Core.PurgeStaleStaging do
 
       {:error, term} ->
         Logger.warning(
-          "the staging sweep could not list #{@staging_prefix}, so it deleted nothing: " <>
+          "the staging sweep could not list #{staging_prefix}, so it deleted nothing: " <>
             inspect(term)
         )
 

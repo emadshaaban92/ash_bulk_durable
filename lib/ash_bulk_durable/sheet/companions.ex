@@ -4,7 +4,7 @@ defmodule AshBulkDurable.Sheet.Companions do
   action, whoever stages it.
 
     * **Every key is the owner's.** A key must start with
-      `bulk-staging/<owner>/` and be a plain key (no empty, `.` or `..`
+      `<staging_prefix><owner>/` and be a plain key (no empty, `.` or `..`
       segment, backslash or NUL), as the core requires
       of every bulk action (`AshBulkDurable.Core.StagedFiles`); checked here
       too so the refusal names the sheet's field. Keys are computed by the
